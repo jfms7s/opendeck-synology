@@ -1,7 +1,7 @@
 # OpenDeck Synology - Design
 
 Date: 2026-09-26
-Status: Approved in brainstorming, pending spec review
+Status: Approved (implementation plan: docs/superpowers/plans/2026-09-26-opendeck-synology.md)
 
 ## 1. Goal
 
@@ -63,7 +63,9 @@ src/
   render/
     key.rs           SVG key image
     dial.rs          touch-strip layout
-  actions/           one thin file per action: settings, endpoint, metric fn
+  instances.rs       per-key/dial render loops (redraw on new data, status or dial turn)
+  inspector.rs       settings-panel protocol
+  actions.rs         one generic MetricAction, instantiated per metric via marker types
 assets/
   manifest.json, icons/, layouts/, propertyInspector/
 tests/
@@ -102,7 +104,7 @@ clamped.
   account, temperature unit (°C/°F), pinned certificate fingerprint.
 - **System keyring (Secret Service via `keyring`):** password and the 2FA device token
   (`did`). If no keyring is available, the plugin stores both in the global settings and
-  logs a warning once.
+  logs a warning.
 - A shared **Connection** block at the top of every action's settings panel edits these
   and shows a live status line: `Connected as <user> - DSM <version>`, `Needs 2FA code`,
   `Wrong password`, `IP blocked by DSM`, `Certificate not trusted`, `Certificate changed`,
@@ -115,7 +117,7 @@ clamped.
 2. Call `SYNO.API.Auth` `login` with `account`, `passwd`, `session=OpenDeck`, `format=sid`,
    and `device_id=<did>` / `device_name` if a `did` is stored.
 3. **Error 403** (2FA code required): the status becomes `Needs 2FA code`. The panel shows
-   an OTP field, and keys and dials show a lock glyph with the text `2FA`. Pollers pause.
+   an OTP field, and keys and dials show `2FA` (amber). Pollers pause.
 4. When an OTP is submitted, the plugin calls `login` again with `otp_code`,
    `enable_device_token=yes` and `device_name=OpenDeck-<hostname>`. It stores the `did`
    from the response in the keyring and resumes the pollers.
@@ -125,8 +127,9 @@ clamped.
    again, the error is `Permission` and no further re-login happens for that endpoint
    until the next poll. Concurrent pollers share a single in-flight login (a mutex
    around the session plus a generation counter), so they never set off parallel logins.
-6. **No automatic retry** on 400 (bad credentials), 404 (bad OTP), 406 (2FA enforced but
-   not set up), 407 (IP blocked) or 410 (password expired). The plugin pauses the pollers,
+6. **No automatic retry** on 400 (bad credentials), 401/402 (account disabled or not
+   allowed), 403 (OTP needed), 404 (bad OTP), 406 (2FA enforced but not set up), 407 (IP
+   blocked) or 408-410 (password expired). The plugin pauses the pollers,
    shows the status, and waits for a settings change.
 7. When the plugin shuts down it makes a best-effort `SYNO.API.Auth` `logout` call, with a
    1 s timeout.
@@ -141,8 +144,8 @@ the `did` and goes back to step 3.
   - the SHA-256 fingerprint of its leaf certificate equals the pinned fingerprint. Hostname
     mismatches are ignored in this case, because the pin is the trust anchor.
 - If neither holds and no pin is stored, the connection fails with
-  `CertificateNotTrusted {fingerprint, subject}`. The panel shows both, plus a **Trust this
-  certificate** button that stores the fingerprint.
+  `CertificateNotTrusted {fingerprint}`. The panel shows the fingerprint (to compare with
+  DSM's certificate page), plus a **Trust this certificate** button that stores it.
 - If a pin is stored and doesn't match, the connection fails with `CertificateChanged`,
   which the panel shows the same way and which must be re-trusted explicitly.
 - Plain HTTP (port 5000) is allowed when `https=false`. The panel labels it "unencrypted".
@@ -185,10 +188,13 @@ plugin sends it to the panel when the panel opens.
 
 ### State-to-level mapping
 
-- Disk health: `normal` -> normal; `warning` or `abnormal` -> warn; `failing`, `crashed`
-  or any status other than normal -> crit. Unknown strings -> warn and are logged once.
-- Storage pool: `normal` -> normal; `repairing`, `expanding` or `verifying` (with
-  progress) -> warn; `degraded` or `crashed` -> crit. Unknown -> warn and are logged once.
+- Disk health: the worse of the S.M.A.R.T. verdict and the drive status. S.M.A.R.T.
+  `normal` -> normal, `failing`/`crashed`/`damage` -> crit, anything else -> warn. Drive
+  status `normal`/`initialized`/`not_initialized` -> normal, `crashed`/`failing`/
+  `system_partition_failed` -> crit, anything else -> warn. Unknown words count as warn
+  (a false alarm beats a silent failure).
+- Storage pool and volume status: `normal` -> normal; `degraded` or `crashed` -> crit;
+  anything else (`repairing`, `expanding`, `verifying`, unknown) -> warn.
 - DSM update: none available -> normal; available -> warn.
 
 ## 6. Rendering
@@ -199,7 +205,7 @@ plugin sends it to the panel when the panel opens.
 - **Key:** an icon at the top, the value large in the middle, the label/subject small at
   the bottom (e.g. `Drive 3`, `volume_1`).
 - **Dial touch strip:** the action name on top, the value, then a horizontal bar for
-  numeric metrics (filled to value / max, with threshold ticks) or a state pill for
+  numeric metrics (filled to the value's share) or a full bar in the level colour for
   state-based metrics. A `‹ n/m ›` hint shows when rotation has more views.
 - **Dial input:** rotating changes that instance's in-memory view only; it does not
   persist. Pressing forces an immediate poll of that endpoint. For keys, pressing does the
@@ -230,8 +236,9 @@ plugin sends it to the panel when the panel opens.
 - **Auth and TLS errors:** **all** pollers pause until the connection settings change or
   an OTP or trust action is taken. The status line and keys show why.
 - Every request has a 10 s timeout. The only host ever contacted is the configured one.
-- Logging goes through `simplelog` to OpenDeck's plugin log. Passwords, OTP codes, `sid`
-  and `did` are never logged; the request logger redacts those query parameters.
+- Logging goes through `simplelog` to OpenDeck's plugin log. Requests and settings-panel
+  payloads are never logged, so passwords, OTP codes, `sid` and `did` never reach it;
+  `Credentials`' `Debug` output redacts them as a second line of defence.
 
 ## 8. Testing
 
