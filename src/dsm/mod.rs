@@ -3,6 +3,9 @@
 
 pub mod api;
 pub mod error;
+#[cfg(test)]
+pub mod fake;
 pub mod model;
+pub mod session;
 pub mod tls;
 pub mod transport;
