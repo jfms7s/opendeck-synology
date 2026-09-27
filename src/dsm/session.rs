@@ -129,15 +129,21 @@ impl Session {
         self.login(&mut st, Some(code)).await
     }
 
-    /// Best effort; never takes more than a second.
+    /// Best effort; never takes more than a second. Forgets the sid (and
+    /// bumps `generation`) whether or not the logout request itself
+    /// succeeds, so the next `call()` logs in again instead of reusing a
+    /// session DSM no longer honours.
     pub async fn logout(&self) {
         let _ = tokio::time::timeout(Duration::from_secs(1), async {
-            let st = self.state.lock().await;
-            let (Some(apis), Some(sid)) = (&st.apis, &st.sid) else {
-                return;
+            let (path, version, sid) = {
+                let mut st = self.state.lock().await;
+                let Some(sid) = st.sid.take() else { return };
+                st.generation += 1;
+                let Some(info) = st.apis.as_ref().and_then(|apis| apis.get(AUTH)) else {
+                    return;
+                };
+                (info.path.clone(), info.version.to_string(), sid)
             };
-            let Some(info) = apis.get(AUTH) else { return };
-            let version = info.version.to_string();
             let form = [
                 ("api", AUTH),
                 ("version", version.as_str()),
@@ -145,7 +151,7 @@ impl Session {
                 ("session", SESSION_NAME),
                 ("_sid", sid.as_str()),
             ];
-            let _ = self.transport.call(&info.path, &form).await;
+            let _ = self.transport.call(&path, &form).await;
         })
         .await;
     }
@@ -508,6 +514,39 @@ mod tests {
         let last = fake.requests().pop().unwrap();
         assert_eq!(get(&last, "method").as_deref(), Some("logout"));
         assert_eq!(get(&last, "_sid").as_deref(), Some("s1"));
+    }
+
+    #[tokio::test]
+    async fn a_call_after_logout_logs_in_again() {
+        let logins = Arc::new(AtomicU32::new(0));
+        let l = logins.clone();
+        let fake = FakeDsm::new(move |r| match get(r, "method").as_deref() {
+            Some("login") => Ok(json!({ "sid": format!("s{}", l.fetch_add(1, SeqCst) + 1) })),
+            Some("logout") => Ok(json!({})),
+            // Any sid works here; the point is which sid the second `get` used.
+            _ => Ok(json!({ "ok": true })),
+        });
+        let (on_did, _) = did_log();
+        let s = Session::new(fake.clone(), creds(None), on_did);
+        s.call(UTILIZATION, "get", &[]).await.unwrap();
+        s.logout().await;
+        s.call(UTILIZATION, "get", &[]).await.unwrap();
+        assert_eq!(
+            fake.count("login"),
+            2,
+            "logout forces a fresh login on the next call"
+        );
+        let last_get = fake
+            .requests()
+            .into_iter()
+            .rev()
+            .find(|r| get(r, "method").as_deref() == Some("get"))
+            .unwrap();
+        assert_eq!(
+            get(&last_get, "_sid").as_deref(),
+            Some("s2"),
+            "used the fresh sid, not the dead one"
+        );
     }
 
     #[test]
