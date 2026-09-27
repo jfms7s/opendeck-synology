@@ -115,7 +115,8 @@ impl Services {
     }
 
     /// Saves the connection block of the settings panel. `password: None`
-    /// keeps the stored password.
+    /// keeps the stored password for the same account and host, while a new
+    /// account or host starts without one.
     pub async fn save_connection(self: &Arc<Self>, mut conn: Connection, password: Option<String>) {
         let mut g = self.global();
         // Another NAS has another certificate: the old pin must not carry over.
@@ -202,7 +203,7 @@ impl Services {
         if let Some(old) = old {
             tokio::spawn(async move { old.logout().await });
         }
-        let g = self.global();
+        let g = self.migrate_fallback_secrets().await;
         let password = self
             .read_secret(&g, Secret::Password)
             .await
@@ -231,6 +232,26 @@ impl Services {
         for e in Endpoint::ALL {
             self.poller(e).set_fetch(Some(self.fetch_for(e, &session)));
         }
+    }
+
+    /// Moves any secret that fell back to the settings file (because the
+    /// keyring was unavailable when it was saved) back into the keyring, now
+    /// that it might work again. `put_secret` clears a fallback slot on
+    /// success and leaves it - with a warning - if the keyring is still
+    /// unavailable.
+    async fn migrate_fallback_secrets(&self) -> GlobalSettings {
+        let mut g = self.global();
+        let before = g.clone();
+        if let Some(pw) = g.fallback_secrets.as_ref().and_then(|f| f.password.clone()) {
+            self.put_secret(&mut g, Secret::Password, Some(pw)).await;
+        }
+        if let Some(did) = g.fallback_secrets.as_ref().and_then(|f| f.did.clone()) {
+            self.put_secret(&mut g, Secret::Did, Some(did)).await;
+        }
+        if g != before {
+            self.persist(g.clone()).await;
+        }
+        g
     }
 
     fn go_idle(&self, status: ConnStatus) {
@@ -506,6 +527,28 @@ mod tests {
             Some("pw".into())
         );
         let _rx = s.poller(Endpoint::SystemInfo).subscribe("key-1", None);
+        wait_for(&s, connected).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fallback_secrets_move_into_the_keyring_once_it_works() {
+        let secrets = Arc::new(MemoryStore::default());
+        let (s, sink) = services_with(healthy_nas(), secrets.clone());
+        let g = GlobalSettings {
+            connection: conn(),
+            fallback_secrets: Some(FallbackSecrets {
+                password: Some("pw".into()),
+                did: None,
+            }),
+            ..GlobalSettings::default()
+        };
+        s.load_global(g).await;
+        assert_eq!(
+            secrets.get(&password_key(&conn().secret_scope())),
+            Ok(Some("pw".into()))
+        );
+        assert_eq!(sink.last().fallback_secrets.and_then(|f| f.password), None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
         wait_for(&s, connected).await;
     }
 
