@@ -1,0 +1,4 @@
+/target
+/dist
+*.sdPlugin.zip
+*.streamDeckPlugin
