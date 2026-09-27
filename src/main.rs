@@ -3,5 +3,8 @@
 #![allow(dead_code)]
 
 mod dsm;
+mod metric;
+mod settings;
+mod status;
 
 fn main() {}
