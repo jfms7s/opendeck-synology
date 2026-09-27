@@ -17,10 +17,11 @@ pub fn temperature(celsius: f64, unit: TempUnit) -> String {
 }
 
 /// (value scaled into the largest unit where it is >= 1, that unit's index)
+/// A value that rounds to 1024 in its current unit moves to the next unit.
 fn scale(n: u64) -> (f64, usize) {
     let mut v = n as f64;
     let mut i = 0;
-    while v >= 1024.0 && i < UNITS.len() - 1 {
+    while v >= 1023.5 && i < UNITS.len() - 1 {
         v /= 1024.0;
         i += 1;
     }
@@ -29,7 +30,7 @@ fn scale(n: u64) -> (f64, usize) {
 
 /// One decimal below 10 ("6.0"), none above ("16"); bytes never get decimals.
 fn number(v: f64, unit: usize) -> String {
-    if unit == 0 || v >= 10.0 {
+    if unit == 0 || v >= 9.95 {
         format!("{v:.0}")
     } else {
         format!("{v:.1}")
@@ -50,7 +51,7 @@ pub fn used_of_total(used: u64, total: u64) -> String {
 
 pub fn rate(bytes_per_sec: u64) -> String {
     let (v, i) = scale(bytes_per_sec);
-    let n = if i == 0 || v >= 100.0 {
+    let n = if i == 0 || v >= 99.95 {
         format!("{v:.0}")
     } else {
         format!("{v:.1}")
@@ -129,5 +130,12 @@ mod tests {
     fn load_averages_have_two_decimals() {
         assert_eq!(load(0.42), "0.42");
         assert_eq!(load(3.0), "3.00");
+    }
+
+    #[test]
+    fn values_that_round_up_to_a_threshold_take_the_next_format() {
+        assert_eq!(bytes(1_048_064), "1.0 MB");
+        assert_eq!(bytes(10_199), "10 KB");
+        assert_eq!(rate(102_349), "100 KB/s");
     }
 }
