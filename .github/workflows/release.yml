@@ -1,0 +1,25 @@
+name: Release
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --target x86_64-unknown-linux-gnu
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node build.mjs x86_64-unknown-linux-gnu
+      - name: Zip the plugin bundle
+        run: |
+          cd dist
+          zip -r ../opendeck-synology.streamDeckPlugin com.jfms7s.synology.sdPlugin
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: opendeck-synology.streamDeckPlugin

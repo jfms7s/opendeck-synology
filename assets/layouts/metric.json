@@ -1,0 +1,45 @@
+{
+	"$schema": "https://schemas.elgato.com/streamdeck/plugins/layout.json",
+	"id": "com.jfms7s.synology.metric-layout",
+	"items": [
+		{ "key": "icon", "type": "pixmap", "rect": [10, 6, 20, 20] },
+		{
+			"key": "title",
+			"type": "text",
+			"rect": [36, 4, 156, 24],
+			"alignment": "left",
+			"color": "#d1d5db",
+			"value": "",
+			"font": { "size": 14, "weight": 600 }
+		},
+		{
+			"key": "value",
+			"type": "text",
+			"rect": [4, 28, 192, 32],
+			"alignment": "center",
+			"color": "white",
+			"value": "--",
+			"font": { "size": 24, "weight": 700 }
+		},
+		{
+			"key": "bar",
+			"type": "bar",
+			"rect": [16, 62, 168, 10],
+			"value": 0,
+			"bar_bg_c": "#374151",
+			"bar_fill_c": "#22c55e",
+			"bar_border_c": "#111827",
+			"border_w": 1,
+			"subtype": 0
+		},
+		{
+			"key": "subject",
+			"type": "text",
+			"rect": [0, 76, 200, 22],
+			"alignment": "center",
+			"color": "#d1d5db",
+			"value": "",
+			"font": { "size": 13, "weight": 500 }
+		}
+	]
+}

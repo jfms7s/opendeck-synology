@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<style>
+		body { font: 12px system-ui, sans-serif; margin: 0; padding: 8px 12px; }
+		h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.7; margin: 14px 0 4px; }
+		label { display: block; margin-top: 8px; font-size: 11px; opacity: 0.8; }
+		input, select, button { box-sizing: border-box; margin-top: 2px; font: inherit; }
+		input, select { width: 100%; }
+		button { margin-top: 8px; }
+		.row { display: flex; gap: 6px; align-items: end; }
+		.row > * { flex: 1; }
+		.row > .narrow { flex: 0 0 5.5em; }
+		.check { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
+		.check input { width: auto; margin: 0; }
+		.check label { margin: 0; }
+		#status { margin-top: 10px; padding: 6px; border-radius: 4px; background: rgba(127, 127, 127, 0.15); }
+		#status.ok { background: rgba(34, 197, 94, 0.2); }
+		#status.bad { background: rgba(239, 68, 68, 0.2); }
+		.hint { font-size: 10px; opacity: 0.7; margin-top: 3px; }
+		.fingerprint { font-family: ui-monospace, monospace; font-size: 10px; word-break: break-all; margin-top: 4px; }
+		.hidden { display: none; }
+	</style>
+</head>
+<body>
+	<h2>NAS connection · shared by all keys</h2>
+	<label for="host">Host or IP address</label>
+	<input id="host" placeholder="nas.lan or 192.168.1.10" />
+	<div class="row">
+		<div><label for="account">Account</label><input id="account" autocomplete="username" /></div>
+		<div class="narrow"><label for="port">Port</label><input id="port" type="number" min="1" max="65535" /></div>
+	</div>
+	<label for="password">Password</label>
+	<input id="password" type="password" autocomplete="current-password" />
+	<div class="hint" id="password-hint"></div>
+	<div class="check"><input type="checkbox" id="https" /><label for="https">HTTPS</label></div>
+	<div class="hint hidden" id="http-warning">Unencrypted: your password crosses the network in the clear.</div>
+	<button id="save">Save and connect</button>
+
+	<div id="status">…</div>
+	<div id="otp-box" class="hidden">
+		<label for="otp">2FA code from your authenticator app</label>
+		<div class="row">
+			<input id="otp" inputmode="numeric" autocomplete="one-time-code" />
+			<button id="submit-otp" class="narrow">Verify</button>
+		</div>
+		<div class="hint">DSM then remembers this device (Personal › Security › Trusted devices), so you won't be asked again.</div>
+	</div>
+	<div id="cert-box" class="hidden">
+		<div class="hint">SHA-256 fingerprint of the certificate the NAS presented. Compare it with DSM › Control Panel › Security › Certificate before trusting it.</div>
+		<div class="fingerprint" id="fingerprint"></div>
+		<button id="trust">Trust this certificate</button>
+	</div>
+
+	<label for="temp-unit">Temperature unit</label>
+	<select id="temp-unit">
+		<option value="celsius">°C</option>
+		<option value="fahrenheit">°F</option>
+	</select>
+
+	<h2>This key</h2>
+	<div id="target-field" class="hidden">
+		<label for="target" id="target-label">Show</label>
+		<select id="target"></select>
+	</div>
+	<div id="cpu-field" class="hidden">
+		<label for="cpu_view">Show</label>
+		<select id="cpu_view">
+			<option value="total">Usage %</option>
+			<option value="load1">Load average, 1 min</option>
+			<option value="load5">Load average, 5 min</option>
+			<option value="load15">Load average, 15 min</option>
+		</select>
+	</div>
+	<div id="direction-field" class="hidden">
+		<label for="direction">Direction</label>
+		<select id="direction">
+			<option value="in">In (download)</option>
+			<option value="out">Out (upload)</option>
+			<option value="combined">Combined</option>
+		</select>
+	</div>
+	<div id="amount-field" class="hidden">
+		<label for="amount">Show as</label>
+		<select id="amount">
+			<option value="percent">Percent</option>
+			<option value="used">Used of total</option>
+		</select>
+	</div>
+	<div id="threshold-field" class="hidden">
+		<div class="row">
+			<div><label for="warn" id="warn-label">Warn at</label><input id="warn" type="number" step="any" /></div>
+			<div><label for="crit" id="crit-label">Critical at</label><input id="crit" type="number" step="any" /></div>
+		</div>
+	</div>
+	<label for="interval_secs">Refresh every (seconds)</label>
+	<input id="interval_secs" type="number" min="2" step="1" />
+	<div class="hint">Keys reading the same data share one request, at the fastest interval any of them asks for.</div>
+
+	<script>
+		window.connectOpenActionSocketData = new Promise((resolve) => {
+			window.connectOpenActionSocket = (...args) => resolve(args);
+			window.connectElgatoStreamDeckSocket = window.connectOpenActionSocket;
+		});
+
+		const $ = (id) => document.getElementById(id);
+		// Which fields each action shows, keyed by the last part of its UUID.
+		const FIELDS = {
+			cpu: { cpu: true, thresholds: "%" },
+			ram: { amount: true, thresholds: "%" },
+			network: { target: "Interface", direction: true, thresholds: "MB/s" },
+			systemp: { thresholds: "°C" },
+			uptime: {},
+			disktemp: { target: "Disk", thresholds: "°C" },
+			diskhealth: { target: "Disk" },
+			volume: { target: "Volume", amount: true, thresholds: "%" },
+			pool: { target: "Pool" },
+			update: {},
+		};
+		let websocket;
+		let uuid;
+		let action;
+		// Always sent whole: setSettings replaces the key's settings, so
+		// fields this action ignores must still round-trip untouched.
+		let settings = {};
+		let pollTimer;
+		let connectionShown = false;
+
+		window.connectOpenActionSocketData.then(([inPort, inUUID, inRegisterEvent, _inInfo, inActionInfo]) => {
+			uuid = inUUID;
+			const actionInfo = JSON.parse(inActionInfo);
+			action = actionInfo.action;
+			const fields = FIELDS[action.split(".").pop()] || {};
+			$("target-field").classList.toggle("hidden", !fields.target);
+			$("target-label").textContent = fields.target || "Show";
+			$("cpu-field").classList.toggle("hidden", !fields.cpu);
+			$("direction-field").classList.toggle("hidden", !fields.direction);
+			$("amount-field").classList.toggle("hidden", !fields.amount);
+			$("threshold-field").classList.toggle("hidden", !fields.thresholds);
+			$("warn-label").textContent = `Warn at (${fields.thresholds || ""})`;
+			$("crit-label").textContent = `Critical at (${fields.thresholds || ""})`;
+
+			websocket = new WebSocket(`ws://127.0.0.1:${inPort}`);
+			websocket.onopen = () => {
+				websocket.send(JSON.stringify({ event: inRegisterEvent, uuid: inUUID }));
+				applySettings(actionInfo.payload.settings || {});
+				toPlugin({ event: "getState" });
+				// The status changes on its own (a login finishing, the NAS
+				// going offline), so keep asking while the panel is open.
+				pollTimer = setInterval(() => toPlugin({ event: "getState" }), 2000);
+			};
+			websocket.onclose = () => clearInterval(pollTimer);
+			websocket.onmessage = (event) => {
+				const message = JSON.parse(event.data);
+				if (message.event === "didReceiveSettings") {
+					applySettings(message.payload.settings || {});
+				} else if (message.event === "sendToPropertyInspector" && message.payload.event === "state") {
+					applyState(message.payload);
+				}
+			};
+		});
+
+		function toPlugin(payload) {
+			websocket.send(JSON.stringify({ event: "sendToPlugin", action, context: uuid, payload }));
+		}
+
+		function sendSettings() {
+			websocket.send(JSON.stringify({ event: "setSettings", context: uuid, payload: settings }));
+		}
+
+		// An empty field must become null, never "": one field the plugin
+		// can't read makes it fall back to default settings for the key.
+		function numberOrNull(input) {
+			const n = input.valueAsNumber;
+			return Number.isFinite(n) ? n : null;
+		}
+
+		function secondsOrNull(input) {
+			const n = numberOrNull(input);
+			return n === null ? null : Math.max(2, Math.round(n));
+		}
+
+		function applySettings(s) {
+			settings = s;
+			$("cpu_view").value = s.cpu_view || "total";
+			$("direction").value = s.direction || "in";
+			$("amount").value = s.amount || "percent";
+			$("warn").value = s.warn ?? "";
+			$("crit").value = s.crit ?? "";
+			$("interval_secs").value = s.interval_secs ?? "";
+			$("target").value = s.target ?? "";
+		}
+
+		function applyState(st) {
+			// Fill the connection fields once, so polling never overwrites typing.
+			if (!connectionShown) {
+				connectionShown = true;
+				$("host").value = st.connection.host;
+				$("port").value = st.connection.port;
+				$("account").value = st.connection.account;
+				$("https").checked = st.connection.https;
+				$("temp-unit").value = st.tempUnit;
+			}
+			$("http-warning").classList.toggle("hidden", $("https").checked);
+			$("password").placeholder = st.hasPassword ? "•••••••• (in the system keyring)" : "";
+			$("password-hint").textContent = st.hasPassword ? "Leave empty to keep the saved password." : "";
+
+			const kind = st.status.kind;
+			$("status").textContent = st.status.text + (kind === "connected" && st.status.firmware ? ` · ${st.status.firmware}` : "");
+			$("status").className = kind === "connected" ? "ok" : ["auth", "certificate", "unreachable"].includes(kind) ? "bad" : "";
+			$("otp-box").classList.toggle("hidden", kind !== "needOtp");
+			$("cert-box").classList.toggle("hidden", kind !== "certificate");
+			$("fingerprint").textContent = st.status.fingerprint || "";
+
+			$("warn").placeholder = st.defaults.warn ?? "";
+			$("crit").placeholder = st.defaults.crit ?? "";
+			$("interval_secs").placeholder = st.defaults.interval;
+			fillTargets(st.targets);
+		}
+
+		function fillTargets(targets) {
+			const select = $("target");
+			const key = JSON.stringify(targets);
+			if (select.dataset.key === key) return; // unchanged: keep the open dropdown
+			select.dataset.key = key;
+			select.innerHTML = "";
+			for (const t of targets) {
+				const option = document.createElement("option");
+				option.value = t.id ?? "";
+				option.textContent = t.label;
+				select.appendChild(option);
+			}
+			if (targets.length === 0) {
+				const option = document.createElement("option");
+				option.value = settings.target ?? "";
+				option.textContent = "Waiting for data from the NAS…";
+				select.appendChild(option);
+			}
+			select.value = settings.target ?? (targets[0]?.id ?? "");
+		}
+
+		$("save").addEventListener("click", () => {
+			toPlugin({
+				event: "saveConnection",
+				host: $("host").value.trim(),
+				port: Number($("port").value) || 5001,
+				https: $("https").checked,
+				account: $("account").value.trim(),
+				password: $("password").value || null,
+			});
+			$("password").value = "";
+		});
+		$("https").addEventListener("change", () => {
+			$("http-warning").classList.toggle("hidden", $("https").checked);
+			$("port").value = $("https").checked ? 5001 : 5000;
+		});
+		$("submit-otp").addEventListener("click", () => {
+			toPlugin({ event: "submitOtp", code: $("otp").value });
+			$("otp").value = "";
+		});
+		$("otp").addEventListener("keydown", (e) => {
+			if (e.key === "Enter") $("submit-otp").click();
+		});
+		$("trust").addEventListener("click", () => toPlugin({ event: "trustCertificate" }));
+		$("temp-unit").addEventListener("change", () => toPlugin({ event: "setTempUnit", unit: $("temp-unit").value }));
+
+		$("target").addEventListener("change", () => {
+			settings.target = $("target").value || null;
+			sendSettings();
+		});
+		for (const id of ["cpu_view", "direction", "amount"]) {
+			$(id).addEventListener("change", () => {
+				settings[id] = $(id).value;
+				sendSettings();
+			});
+		}
+		for (const id of ["warn", "crit"]) {
+			$(id).addEventListener("change", () => {
+				settings[id] = numberOrNull($(id));
+				sendSettings();
+			});
+		}
+		$("interval_secs").addEventListener("change", () => {
+			settings.interval_secs = secondsOrNull($("interval_secs"));
+			sendSettings();
+		});
+	</script>
+</body>
+</html>

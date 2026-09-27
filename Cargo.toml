@@ -1,0 +1,31 @@
+[package]
+name = "opendeck-synology"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "OpenDeck plugin: live Synology DSM 7 status - CPU, RAM, temperatures, disks, volumes, storage pools, network, uptime and updates - on Stream Deck keys and dials"
+repository = "https://github.com/jfms7s/opendeck-synology"
+
+[dependencies]
+openaction = "2.7"
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "time", "sync"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+async-trait = "0.1"
+thiserror = "2"
+dashmap = "6"
+futures = "0.3"
+log = "0.4"
+simplelog = "0.12"
+base64 = "0.22"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "form"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-native-certs = "0.8"
+sha2 = "0.10"
+keyring = { version = "3.6", default-features = false, features = ["async-secret-service", "tokio", "crypto-rust"] }
+gethostname = "1"
+
+[dev-dependencies]
+tokio = { version = "1.48", features = ["test-util", "macros", "rt", "rt-multi-thread", "net", "io-util"] }
+rcgen = "0.14"
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }

@@ -1,0 +1,113 @@
+{
+	"Name": "Synology",
+	"Author": "jfms7s",
+	"Version": "0.1.0",
+	"Category": "Synology",
+	"Description": "Live, read-only status of a Synology NAS running DSM 7 - CPU, RAM, temperatures, disk health, volumes, storage pools, network, uptime and updates - on keys and dials. Talks only to your NAS; works with 2FA accounts.",
+	"Icon": "icons/icon",
+	"OS": [{ "Platform": "linux" }],
+	"CodePaths": { "x86_64-unknown-linux-gnu": "opendeck-synology-x86_64-unknown-linux-gnu" },
+	"CodePathLin": "opendeck-synology-x86_64-unknown-linux-gnu",
+	"Actions": [
+		{
+			"UUID": "com.jfms7s.synology.cpu",
+			"Name": "CPU",
+			"Icon": "icons/cpu",
+			"Tooltip": "CPU usage. On a dial, rotate for the 1, 5 and 15 minute load averages. Press to refresh",
+			"Controllers": ["Keypad", "Encoder"],
+			"PropertyInspectorPath": "propertyInspector/index.html",
+			"States": [{ "Image": "icons/cpu" }],
+			"Encoder": { "layout": "layouts/metric.json", "TriggerDescription": { "Rotate": "Usage / load averages", "Push": "Refresh", "Touch": "Refresh" } }
+		},
+		{
+			"UUID": "com.jfms7s.synology.ram",
+			"Name": "RAM",
+			"Icon": "icons/ram",
+			"Tooltip": "Memory in use. On a dial, rotate between percent and used of total. Press to refresh",
+			"Controllers": ["Keypad", "Encoder"],
+			"PropertyInspectorPath": "propertyInspector/index.html",
+			"States": [{ "Image": "icons/ram" }],
+			"Encoder": { "layout": "layouts/metric.json", "TriggerDescription": { "Rotate": "Percent / used of total", "Push": "Refresh", "Touch": "Refresh" } }
+		},
+		{
+			"UUID": "com.jfms7s.synology.network",
+			"Name": "Network",
+			"Icon": "icons/network",
+			"Tooltip": "Network throughput, in, out or combined. On a dial, rotate to switch direction. Press to refresh",
+			"Controllers": ["Keypad", "Encoder"],
+			"PropertyInspectorPath": "propertyInspector/index.html",
+			"States": [{ "Image": "icons/network" }],
+			"Encoder": { "layout": "layouts/metric.json", "TriggerDescription": { "Rotate": "In / out / combined", "Push": "Refresh", "Touch": "Refresh" } }
+		},
+		{
+			"UUID": "com.jfms7s.synology.systemp",
+			"Name": "System Temperature",
+			"Icon": "icons/systemp",
+			"Tooltip": "The NAS's system temperature. Press to refresh",
+			"Controllers": ["Keypad", "Encoder"],
+			"PropertyInspectorPath": "propertyInspector/index.html",
+			"States": [{ "Image": "icons/systemp" }],
+			"Encoder": { "layout": "layouts/metric.json", "TriggerDescription": { "Push": "Refresh", "Touch": "Refresh" } }
+		},
+		{
+			"UUID": "com.jfms7s.synology.uptime",
+			"Name": "Uptime",
+			"Icon": "icons/uptime",
+			"Tooltip": "How long the NAS has been running. Press to refresh",
+			"Controllers": ["Keypad", "Encoder"],
+			"PropertyInspectorPath": "propertyInspector/index.html",
+			"States": [{ "Image": "icons/uptime" }],
+			"Encoder": { "layout": "layouts/metric.json", "TriggerDescription": { "Push": "Refresh", "Touch": "Refresh" } }
+		},
+		{
+			"UUID": "com.jfms7s.synology.disktemp",
+			"Name": "Disk Temperature",
+			"Icon": "icons/disktemp",
+			"Tooltip": "One disk's temperature, or the hottest disk's. On a dial, rotate through the disks. Press to refresh",
+			"Controllers": ["Keypad", "Encoder"],
+			"PropertyInspectorPath": "propertyInspector/index.html",
+			"States": [{ "Image": "icons/disktemp" }],
+			"Encoder": { "layout": "layouts/metric.json", "TriggerDescription": { "Rotate": "Next disk", "Push": "Refresh", "Touch": "Refresh" } }
+		},
+		{
+			"UUID": "com.jfms7s.synology.diskhealth",
+			"Name": "Disk Health",
+			"Icon": "icons/diskhealth",
+			"Tooltip": "S.M.A.R.T. health of one disk, or the worst disk. On a dial, rotate through the disks. Press to refresh",
+			"Controllers": ["Keypad", "Encoder"],
+			"PropertyInspectorPath": "propertyInspector/index.html",
+			"States": [{ "Image": "icons/diskhealth" }],
+			"Encoder": { "layout": "layouts/metric.json", "TriggerDescription": { "Rotate": "Next disk", "Push": "Refresh", "Touch": "Refresh" } }
+		},
+		{
+			"UUID": "com.jfms7s.synology.volume",
+			"Name": "Volume",
+			"Icon": "icons/volume",
+			"Tooltip": "How full a volume is. On a dial, rotate through the volumes. Press to refresh",
+			"Controllers": ["Keypad", "Encoder"],
+			"PropertyInspectorPath": "propertyInspector/index.html",
+			"States": [{ "Image": "icons/volume" }],
+			"Encoder": { "layout": "layouts/metric.json", "TriggerDescription": { "Rotate": "Next volume", "Push": "Refresh", "Touch": "Refresh" } }
+		},
+		{
+			"UUID": "com.jfms7s.synology.pool",
+			"Name": "Storage Pool",
+			"Icon": "icons/pool",
+			"Tooltip": "Storage pool / RAID state: normal, degraded, or rebuild progress. On a dial, rotate through the pools. Press to refresh",
+			"Controllers": ["Keypad", "Encoder"],
+			"PropertyInspectorPath": "propertyInspector/index.html",
+			"States": [{ "Image": "icons/pool" }],
+			"Encoder": { "layout": "layouts/metric.json", "TriggerDescription": { "Rotate": "Next pool", "Push": "Refresh", "Touch": "Refresh" } }
+		},
+		{
+			"UUID": "com.jfms7s.synology.update",
+			"Name": "DSM Update",
+			"Icon": "icons/update",
+			"Tooltip": "Whether a DSM update is available. Press to check now",
+			"Controllers": ["Keypad", "Encoder"],
+			"PropertyInspectorPath": "propertyInspector/index.html",
+			"States": [{ "Image": "icons/update" }],
+			"Encoder": { "layout": "layouts/metric.json", "TriggerDescription": { "Push": "Check now", "Touch": "Check now" } }
+		}
+	]
+}
