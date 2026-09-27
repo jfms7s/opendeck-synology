@@ -7,6 +7,7 @@ mod format;
 mod metric;
 mod metrics;
 mod poller;
+mod secrets;
 mod settings;
 mod status;
 
