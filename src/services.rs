@@ -2,7 +2,7 @@
 //! session, the four endpoint pollers every key and dial subscribes to, and
 //! the connection status they all watch.
 
-use crate::dsm::api::{STORAGE, SYSTEM, UPGRADE, UTILIZATION};
+use crate::dsm::api::{AUTH, STORAGE, SYSTEM, UPGRADE, UTILIZATION};
 use crate::dsm::error::DsmError;
 use crate::dsm::model::{self, Payload};
 use crate::dsm::session::{Credentials, DidListener, Session};
@@ -17,6 +17,9 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
+
+/// The discovery API; its errors come before any login.
+const INFO: &str = "SYNO.API.Info";
 
 #[async_trait]
 pub trait SettingsSink: Send + Sync {
@@ -298,10 +301,14 @@ impl Services {
         if !current {
             return;
         }
+        let connected = || ConnStatus::Connected {
+            account: self.global().connection.account.trim().to_string(),
+        };
         let next = match result {
-            Ok(_) => ConnStatus::Connected {
-                account: self.global().connection.account.trim().to_string(),
-            },
+            Ok(_) => connected(),
+            // DSM answered an endpoint call with a working session, e.g. an
+            // account without admin rights (every endpoint says 105).
+            Err(e) if endpoint_answered(e) => connected(),
             Err(e) => match ConnStatus::from_error(e) {
                 Some(s) => s,
                 None => return,
@@ -402,6 +409,16 @@ impl Services {
         {
             g.fallback_secrets = None;
         }
+    }
+}
+
+/// An error from a data endpoint itself, which proves the login worked -
+/// unlike one from logging in (`SYNO.API.Auth`) or API discovery.
+fn endpoint_answered(e: &DsmError) -> bool {
+    match e {
+        DsmError::Permission { .. } => true,
+        DsmError::Api { api, .. } | DsmError::Parse { api, .. } => api != AUTH && api != INFO,
+        _ => false,
     }
 }
 
@@ -708,6 +725,19 @@ mod tests {
         })
         .await
         .expect("device token stored in the keyring");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_account_without_permissions_still_counts_as_connected() {
+        let nas = FakeDsm::new(|r| match r.get("method").map(String::as_str) {
+            Some("login") => Ok(json!({ "sid": "s1" })),
+            _ => Err(105),
+        });
+        let (s, _) = services_with(nas, Arc::new(MemoryStore::default()));
+        s.load_global(GlobalSettings::default()).await;
+        s.save_connection(conn(), Some("pw".into())).await;
+        let _rx = s.poller(Endpoint::Storage).subscribe("key-1", None);
+        wait_for(&s, connected).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
