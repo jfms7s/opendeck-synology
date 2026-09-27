@@ -93,17 +93,26 @@ impl Session {
             api: api.into(),
             code: NO_SUCH_API,
         })?;
-        match self.request(info, api, method, &sid, params).await? {
+        let code = match self.request(info, api, method, &sid, params).await? {
             Ok(data) => return Ok(data),
-            Err(code) if SESSION_LOST.contains(&code) || code == NO_PERMISSION => {}
+            Err(code) if SESSION_LOST.contains(&code) || code == NO_PERMISSION => code,
             Err(code) => {
                 return Err(DsmError::Api {
                     api: api.into(),
                     code,
                 });
             }
+        };
+        let (sid, superseded) = self.relogin(generation).await?;
+        // After 105 the old session may well still be alive in DSM: end it,
+        // or every backoff period would leave one more behind. (After 106,
+        // 107 or 119 DSM has already ended it.)
+        if code == NO_PERMISSION
+            && let Some(old) = superseded.filter(|old| *old != sid)
+            && let Some(auth) = apis.get(AUTH)
+        {
+            self.send_logout(auth, &old).await;
         }
-        let sid = self.relogin(generation).await?;
         match self.request(info, api, method, &sid, params).await? {
             Ok(data) => Ok(data),
             Err(NO_PERMISSION) => Err(DsmError::Permission { api: api.into() }),
@@ -135,24 +144,35 @@ impl Session {
     /// session DSM no longer honours.
     pub async fn logout(&self) {
         let _ = tokio::time::timeout(Duration::from_secs(1), async {
-            let (path, version, sid) = {
+            let (info, sid) = {
                 let mut st = self.state.lock().await;
                 let Some(sid) = st.sid.take() else { return };
                 st.generation += 1;
                 let Some(info) = st.apis.as_ref().and_then(|apis| apis.get(AUTH)) else {
                     return;
                 };
-                (info.path.clone(), info.version.to_string(), sid)
+                (info.clone(), sid)
             };
-            let form = [
-                ("api", AUTH),
-                ("version", version.as_str()),
-                ("method", "logout"),
-                ("session", SESSION_NAME),
-                ("_sid", sid.as_str()),
-            ];
-            let _ = self.transport.call(&path, &form).await;
+            self.send_logout(&info, &sid).await;
         })
+        .await;
+    }
+
+    /// Ends DSM session `sid`; best effort, at most a second. Never call it
+    /// while holding the state lock.
+    async fn send_logout(&self, auth: &ApiInfo, sid: &str) {
+        let version = auth.version.to_string();
+        let form = [
+            ("api", AUTH),
+            ("version", version.as_str()),
+            ("method", "logout"),
+            ("session", SESSION_NAME),
+            ("_sid", sid),
+        ];
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            self.transport.call(&auth.path, &form),
+        )
         .await;
     }
 
@@ -199,16 +219,18 @@ impl Session {
 
     /// Replaces the session the caller saw expire - unless another caller
     /// already did (the generation moved on), in which case its sid is reused.
-    async fn relogin(&self, seen_generation: u64) -> Result<String, DsmError> {
+    /// Returns the new sid and, if this call replaced one, the old sid.
+    async fn relogin(&self, seen_generation: u64) -> Result<(String, Option<String>), DsmError> {
         let mut st = self.state.lock().await;
         if let Some(e) = st.blocked {
             return Err(e.into());
         }
+        let mut superseded = None;
         if st.generation == seen_generation || st.sid.is_none() {
-            st.sid = None;
+            superseded = st.sid.take();
             self.login(&mut st, None).await?;
         }
-        Ok(st.sid.clone().expect("logged in above"))
+        Ok((st.sid.clone().expect("logged in above"), superseded))
     }
 
     async fn login(&self, st: &mut State, otp: Option<&str>) -> Result<(), DsmError> {
@@ -481,6 +503,45 @@ mod tests {
             2,
             "one re-login to rule out a lost session"
         );
+    }
+
+    #[tokio::test]
+    async fn a_relogin_after_105_logs_out_the_superseded_session() {
+        let logins = Arc::new(AtomicU32::new(0));
+        let l = logins.clone();
+        let fake = FakeDsm::new(move |r| match get(r, "method").as_deref() {
+            Some("login") => Ok(json!({ "sid": format!("s{}", l.fetch_add(1, SeqCst) + 1) })),
+            Some("logout") => Ok(json!({})),
+            _ => Err(105),
+        });
+        let (on_did, _) = did_log();
+        let s = Session::new(fake.clone(), creds(None), on_did);
+        assert!(matches!(
+            s.call(crate::dsm::api::STORAGE, "load_info", &[]).await,
+            Err(DsmError::Permission { .. })
+        ));
+        let logouts: Vec<_> = fake
+            .requests()
+            .into_iter()
+            .filter(|r| get(r, "method").as_deref() == Some("logout"))
+            .map(|r| get(&r, "_sid"))
+            .collect();
+        assert_eq!(logouts, [Some("s1".to_string())], "the replaced sid, only");
+    }
+
+    #[tokio::test]
+    async fn a_relogin_after_a_lost_session_sends_no_logout() {
+        let logins = Arc::new(AtomicU32::new(0));
+        let l = logins.clone();
+        let fake = FakeDsm::new(move |r| match get(r, "method").as_deref() {
+            Some("login") => Ok(json!({ "sid": format!("s{}", l.fetch_add(1, SeqCst) + 1) })),
+            _ if get(r, "_sid").as_deref() == Some("s2") => Ok(json!({ "ok": true })),
+            _ => Err(119),
+        });
+        let (on_did, _) = did_log();
+        let s = Session::new(fake.clone(), creds(None), on_did);
+        assert!(s.call(UTILIZATION, "get", &[]).await.is_ok());
+        assert_eq!(fake.count("logout"), 0, "DSM already ended that session");
     }
 
     #[tokio::test]
