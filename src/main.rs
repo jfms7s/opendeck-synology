@@ -2,8 +2,10 @@
 // everything together (Task 16).
 #![allow(dead_code)]
 
+mod actions;
 mod dsm;
 mod format;
+mod instances;
 mod metric;
 mod metrics;
 mod poller;
