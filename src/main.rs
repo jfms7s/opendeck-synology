@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 mod dsm;
+mod format;
 mod metric;
 mod poller;
 mod settings;
