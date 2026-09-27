@@ -7,6 +7,12 @@
 # The password is read from the terminal and handed to curl on stdin, so
 # it never appears in the process list. Serial numbers, MAC/IP addresses,
 # UUIDs and hostnames are replaced with "REDACTED" before anything is written.
+#
+# With a 2FA code the login asks DSM to remember this device (like the
+# plugin does), so the names of the fields it answers with - the device
+# token's included - end up in login_keys.json. Only the key names are
+# written, never the sid or device token. DSM then lists an
+# "OpenDeckCapture" trusted device you can remove in your personal settings.
 set -euo pipefail
 
 host=${1:?usage: $0 <host[:port]> <account>}
@@ -44,7 +50,8 @@ login_args=(--data-urlencode "api=SYNO.API.Auth" --data-urlencode "version=6"
 	--data-urlencode "method=login" --data-urlencode "account=$account"
 	--data-urlencode "passwd@-" --data-urlencode "session=OpenDeckCapture"
 	--data-urlencode "format=sid")
-[[ -n $otp ]] && login_args+=(--data-urlencode "otp_code=$otp")
+[[ -n $otp ]] && login_args+=(--data-urlencode "otp_code=$otp"
+	--data-urlencode "enable_device_token=yes" --data-urlencode "device_name=OpenDeckCapture")
 
 login=$(printf %s "$password" | post entry.cgi "${login_args[@]}")
 unset password
@@ -52,6 +59,9 @@ if ! sid=$(jq -er '.data.sid' <<<"$login"); then
 	echo "login failed: $(jq -c '.error' <<<"$login")" >&2
 	exit 1
 fi
+# Field names only (e.g. ["did","sid",...]): never the values.
+jq '.data | keys' <<<"$login" >"$out/login_keys.json"
+echo "wrote $out/login_keys.json"
 
 logout() {
 	post entry.cgi --data-urlencode "api=SYNO.API.Auth" --data-urlencode "version=6" \
