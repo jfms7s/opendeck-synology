@@ -150,11 +150,13 @@ pub fn parse_utilization(data: &Value) -> Result<Utilization, String> {
         .as_array()
         .map(|list| {
             list.iter()
+                // An interface without both rates is left out (its key shows
+                // "Missing"): a zero must never stand in for missing data.
                 .filter_map(|n| {
                     Some(NetIf {
                         device: text(&n["device"])?,
-                        rx: num(&n["rx"]).unwrap_or(0.0) as u64,
-                        tx: num(&n["tx"]).unwrap_or(0.0) as u64,
+                        rx: num(&n["rx"])? as u64,
+                        tx: num(&n["tx"])? as u64,
                     })
                 })
                 .collect()
@@ -295,6 +297,35 @@ mod tests {
                 rx: 13_002_342,
                 tx: 524_288
             }
+        );
+    }
+
+    fn utilization_with(network: Value, cpu: Value) -> Value {
+        let mut u = fixture("utilization.json");
+        u["network"] = network;
+        u["cpu"] = cpu;
+        u
+    }
+
+    #[test]
+    fn an_interface_without_rx_or_tx_is_skipped_not_zero() {
+        let cpu = fixture("utilization.json")["cpu"].clone();
+        let u = parse_utilization(&utilization_with(
+            json!([
+                { "device": "total", "rx": "100", "tx": 200 },
+                { "device": "eth0", "tx": 5 },
+                { "device": "eth1", "rx": 7, "tx": "n/a" }
+            ]),
+            cpu,
+        ))
+        .unwrap();
+        assert_eq!(
+            u.network,
+            [NetIf {
+                device: "total".into(),
+                rx: 100,
+                tx: 200
+            }]
         );
     }
 
