@@ -169,6 +169,13 @@ impl Services {
                 if let Some(s) = ConnStatus::from_error(e) {
                     self.set_status(s);
                 }
+                if !matches!(e, DsmError::Auth(_)) {
+                    // The session still wants a code; let the (paused)
+                    // pollers report that, so the 2FA box comes back.
+                    for e in Endpoint::ALL {
+                        self.poller(e).refresh_now();
+                    }
+                }
             }
         }
         result
@@ -749,6 +756,42 @@ mod tests {
         s.save_connection(conn(), Some("pw".into())).await;
         let _rx = s.poller(Endpoint::Storage).subscribe("key-1", None);
         wait_for(&s, connected).await;
+    }
+
+    /// A NAS that wants a 2FA code, reached over a link that drops the
+    /// request carrying the code.
+    struct OtpLost(Arc<FakeDsm>);
+    #[async_trait]
+    impl Transport for OtpLost {
+        async fn call(&self, p: &str, f: &[(&str, &str)]) -> Result<Result<Value, i64>, DsmError> {
+            if f.iter().any(|(k, _)| *k == "otp_code") {
+                return Err(DsmError::Transport("connection reset".into()));
+            }
+            self.0.call(p, f).await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lost_2fa_submit_asks_for_the_code_again() {
+        let nas = FakeDsm::new(|r| match r.get("method").map(String::as_str) {
+            Some("login") => Err(403),
+            _ => Ok(json!({})),
+        });
+        let transports: TransportFactory =
+            Arc::new(move |_| Ok(Arc::new(OtpLost(nas.clone())) as Arc<dyn Transport>));
+        let s = Services::new(
+            Arc::new(MemoryStore::default()),
+            Arc::new(RecordingSink::default()),
+            transports,
+            "t".into(),
+        );
+        s.load_global(GlobalSettings::default()).await;
+        s.save_connection(conn(), Some("pw".into())).await;
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let need_otp = |st: &ConnStatus| *st == ConnStatus::Auth(AuthError::NeedOtp);
+        wait_for(&s, need_otp).await;
+        assert!(s.submit_otp("123456").await.is_err());
+        wait_for(&s, need_otp).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

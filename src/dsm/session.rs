@@ -127,15 +127,24 @@ impl Session {
     /// device token goes to `on_did` for safekeeping.
     pub async fn submit_otp(&self, code: &str) -> Result<(), DsmError> {
         let mut st = self.state.lock().await;
-        match st.blocked.take() {
-            None | Some(AuthError::NeedOtp | AuthError::BadOtp) => {}
+        let waiting = match st.blocked.take() {
+            None => false,
+            Some(AuthError::NeedOtp | AuthError::BadOtp) => true,
             Some(other) => {
                 st.blocked = Some(other); // a code can't fix a wrong password
                 return Err(other.into());
             }
+        };
+        let result = match self.discover_once(&mut st).await {
+            Ok(()) => self.login(&mut st, Some(code)).await,
+            Err(e) => Err(e),
+        };
+        // The code never reached DSM's verdict (network, API error): still
+        // waiting for one, rather than logging in again without it.
+        if waiting && matches!(&result, Err(e) if !matches!(e, DsmError::Auth(_))) {
+            st.blocked = Some(AuthError::NeedOtp);
         }
-        self.discover_once(&mut st).await?;
-        self.login(&mut st, Some(code)).await
+        result
     }
 
     /// Best effort; never takes more than a second. Forgets the sid (and
@@ -409,6 +418,52 @@ mod tests {
             get(&last_login, "device_name").as_deref(),
             Some("OpenDeck-desk")
         );
+    }
+
+    /// The fake NAS, except that a login with a 2FA code never gets through.
+    struct OtpLoginUnreachable(Arc<FakeDsm>);
+
+    #[async_trait::async_trait]
+    impl Transport for OtpLoginUnreachable {
+        async fn call(
+            &self,
+            path: &str,
+            form: &[(&str, &str)],
+        ) -> Result<Result<Value, i64>, DsmError> {
+            if form.iter().any(|(k, _)| *k == "otp_code") {
+                return Err(DsmError::Transport("connection reset".into()));
+            }
+            self.0.call(path, form).await
+        }
+    }
+
+    #[tokio::test]
+    async fn an_otp_submit_that_never_arrives_still_waits_for_a_code() {
+        let fake = FakeDsm::new(|r| match get(r, "method").as_deref() {
+            Some("login") => Err(403),
+            _ => Ok(json!({})),
+        });
+        let (on_did, _) = did_log();
+        let s = Session::new(
+            Arc::new(OtpLoginUnreachable(fake.clone())),
+            creds(None),
+            on_did,
+        );
+        assert_eq!(
+            s.call(UTILIZATION, "get", &[]).await,
+            Err(DsmError::Auth(AuthError::NeedOtp))
+        );
+        assert!(matches!(
+            s.submit_otp("123456").await,
+            Err(DsmError::Transport(_))
+        ));
+        let sent = fake.requests().len();
+        assert_eq!(
+            s.call(UTILIZATION, "get", &[]).await,
+            Err(DsmError::Auth(AuthError::NeedOtp)),
+            "still waiting for a code"
+        );
+        assert_eq!(fake.requests().len(), sent, "without contacting DSM");
     }
 
     #[tokio::test]
