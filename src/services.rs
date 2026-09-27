@@ -162,6 +162,9 @@ impl Services {
             Ok(()) => {
                 self.set_status(ConnStatus::Connecting);
                 for e in Endpoint::ALL {
+                    // The keys' "Login" error is solved; don't show it
+                    // until the next poll lands.
+                    self.poller(e).clear_error();
                     self.poller(e).refresh_now();
                 }
             }
@@ -792,6 +795,31 @@ mod tests {
         wait_for(&s, need_otp).await;
         assert!(s.submit_otp("123456").await.is_err());
         wait_for(&s, need_otp).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_good_2fa_code_clears_the_keys_login_error_at_once() {
+        let nas =
+            FakeDsm::new(
+                |r| match (r.get("method").map(String::as_str), r.get("otp_code")) {
+                    (Some("login"), Some(_)) => Ok(json!({ "sid": "s1", "did": "dev-1" })),
+                    (Some("login"), None) => Err(403),
+                    _ => {
+                        // A slow NAS: the next poll can't land before the check.
+                        std::thread::sleep(Duration::from_millis(300));
+                        Ok(json!({}))
+                    }
+                },
+            );
+        let (s, _) = services_with(nas, Arc::new(MemoryStore::default()));
+        s.load_global(GlobalSettings::default()).await;
+        s.save_connection(conn(), Some("pw".into())).await;
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        wait_for(&s, |st| *st == ConnStatus::Auth(AuthError::NeedOtp)).await;
+        assert!(s.poller(Endpoint::Utilization).latest().error.is_some());
+        s.submit_otp("123456").await.unwrap();
+        let st = s.poller(Endpoint::Utilization).latest();
+        assert_eq!((st.error, st.failures), (None, 0), "no red \"Login\" key");
     }
 
     #[tokio::test(flavor = "multi_thread")]

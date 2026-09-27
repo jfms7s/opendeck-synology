@@ -138,6 +138,18 @@ impl<T: Send + Sync + 'static> Poller<T> {
         self.wake_if(running);
     }
 
+    /// Forgets the last attempt's error (and the failure count) but keeps the
+    /// value - for when the cause was just fixed (a 2FA code accepted), so
+    /// keys stop showing it before the next poll lands.
+    pub fn clear_error(&self) {
+        self.inner.tx.send_if_modified(|st| {
+            let changed = st.error.is_some() || st.failures > 0;
+            st.error = None;
+            st.failures = 0;
+            changed
+        });
+    }
+
     /// Polls now instead of waiting out the interval or a pause.
     pub fn refresh_now(&self) {
         let running = self.inner.registry.lock().unwrap().running;
@@ -359,6 +371,26 @@ mod tests {
         p.refresh_now();
         tokio::time::sleep(Duration::from_millis(1)).await;
         assert_eq!(n.load(SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clearing_the_error_keeps_the_value() {
+        let p = Poller::new(S(5));
+        let n = Arc::new(AtomicU32::new(0));
+        p.set_fetch(Some(counting(n.clone())));
+        let _a = p.subscribe("a", None);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let fail = failing(n.clone(), DsmError::Auth(AuthError::NeedOtp));
+        p.inner.registry.lock().unwrap().fetch = Some(fail);
+        p.refresh_now();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(p.latest().failures, 1);
+        p.clear_error();
+        let st = p.latest();
+        assert_eq!(
+            (st.value.as_deref(), st.error, st.failures),
+            (Some(&1), None, 0)
+        );
     }
 
     #[tokio::test(start_paused = true)]
