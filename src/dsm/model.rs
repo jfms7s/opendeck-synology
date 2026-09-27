@@ -10,9 +10,10 @@ use serde_json::Value;
 pub struct Cpu {
     /// user + system + other load, 0-100.
     pub total_pct: f64,
-    pub load1: f64,
-    pub load5: f64,
-    pub load15: f64,
+    /// Load averages; `None` when DSM left one out (only that view is lost).
+    pub load1: Option<f64>,
+    pub load5: Option<f64>,
+    pub load15: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -133,9 +134,9 @@ pub fn parse_utilization(data: &Value) -> Result<Utilization, String> {
         total_pct: req_num(c, "user_load")?
             + req_num(c, "system_load")?
             + num(&c["other_load"]).unwrap_or(0.0),
-        load1: req_num(c, "1min_load")? / 100.0,
-        load5: req_num(c, "5min_load")? / 100.0,
-        load15: req_num(c, "15min_load")? / 100.0,
+        load1: num(&c["1min_load"]).map(|l| l / 100.0),
+        load5: num(&c["5min_load"]).map(|l| l / 100.0),
+        load15: num(&c["15min_load"]).map(|l| l / 100.0),
     };
     let m = &data["memory"];
     // Memory sizes are in KiB.
@@ -284,8 +285,8 @@ mod tests {
     fn parses_utilization() {
         let u = parse_utilization(&fixture("utilization.json")).unwrap();
         assert_eq!(u.cpu.total_pct, 37.0);
-        assert_eq!(u.cpu.load1, 0.42);
-        assert_eq!(u.cpu.load15, 0.35);
+        assert_eq!(u.cpu.load1, Some(0.42));
+        assert_eq!(u.cpu.load15, Some(0.35));
         assert_eq!(u.memory.used_pct, 37.0);
         assert_eq!(u.memory.total_bytes, 17_179_869_184);
         assert_eq!(u.memory.used_bytes, 6_442_450_944);
@@ -327,6 +328,18 @@ mod tests {
                 tx: 200
             }]
         );
+    }
+
+    #[test]
+    fn a_missing_load_average_leaves_the_rest_of_the_payload() {
+        let mut cpu = fixture("utilization.json")["cpu"].clone();
+        cpu.as_object_mut().unwrap().remove("5min_load");
+        let network = fixture("utilization.json")["network"].clone();
+        let u = parse_utilization(&utilization_with(network, cpu)).unwrap();
+        assert_eq!(u.cpu.total_pct, 37.0);
+        assert_eq!((u.cpu.load1, u.cpu.load5), (Some(0.42), None));
+        assert_eq!(u.memory.used_pct, 37.0);
+        assert_eq!(u.network.len(), 3);
     }
 
     #[test]

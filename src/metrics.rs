@@ -168,11 +168,15 @@ fn missing(metric: Metric, what: &str) -> Reading {
 
 fn cpu(u: &Utilization, v: &ActionSettings) -> Reading {
     let c = &u.cpu;
+    let pager = (index_of(&CPU_VIEWS, &v.cpu_view), CPU_VIEWS.len());
     let (value, subject) = match v.cpu_view {
-        CpuView::Total => (format::percent(c.total_pct), "Usage"),
-        CpuView::Load1 => (format::load(c.load1), "Load 1 min"),
-        CpuView::Load5 => (format::load(c.load5), "Load 5 min"),
-        CpuView::Load15 => (format::load(c.load15), "Load 15 min"),
+        CpuView::Total => (Some(format::percent(c.total_pct)), "Usage"),
+        CpuView::Load1 => (c.load1.map(format::load), "Load 1 min"),
+        CpuView::Load5 => (c.load5.map(format::load), "Load 5 min"),
+        CpuView::Load15 => (c.load15.map(format::load), "Load 15 min"),
+    };
+    let Some(value) = value else {
+        return missing(Metric::Cpu, subject).pager(pager.0, pager.1);
     };
     Reading::new(
         Metric::Cpu,
@@ -181,7 +185,7 @@ fn cpu(u: &Utilization, v: &ActionSettings) -> Reading {
     )
     .subject(subject)
     .bar(c.total_pct)
-    .pager(index_of(&CPU_VIEWS, &v.cpu_view), CPU_VIEWS.len())
+    .pager(pager.0, pager.1)
 }
 
 fn ram(u: &Utilization, v: &ActionSettings) -> Reading {
@@ -590,6 +594,25 @@ mod tests {
             (r.value.as_str(), r.subject.as_str(), r.pager),
             ("0.42", "Load 1 min", Some((1, 4)))
         );
+    }
+
+    #[test]
+    fn a_missing_load_average_shows_missing_on_that_view_only() {
+        let Payload::Utilization(mut u) = util() else {
+            unreachable!()
+        };
+        u.cpu.load5 = None;
+        let v = ActionSettings {
+            cpu_view: CpuView::Load5,
+            ..view()
+        };
+        let r = read_as(Metric::Cpu, Payload::Utilization(u.clone()), &v);
+        assert_eq!(
+            (r.value.as_str(), r.subject.as_str(), r.level, r.pager),
+            ("Missing", "Load 5 min", Level::Crit, Some((2, 4)))
+        );
+        let r = read_as(Metric::Cpu, Payload::Utilization(u), &view());
+        assert_eq!(r.value, "37%");
     }
 
     #[test]
