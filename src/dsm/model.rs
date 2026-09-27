@@ -141,11 +141,14 @@ pub fn parse_utilization(data: &Value) -> Result<Utilization, String> {
     let m = &data["memory"];
     // Memory sizes are in KiB.
     let total_kib = req_num(m, "total_real")?;
-    let avail_kib = req_num(m, "avail_real")?;
+    // Page cache and buffers count as free, as in DSM's own `real_usage`.
+    let free_kib = req_num(m, "avail_real")?
+        + num(&m["buffer"]).unwrap_or(0.0)
+        + num(&m["cached"]).unwrap_or(0.0);
     let memory = Memory {
         used_pct: req_num(m, "real_usage")?,
         total_bytes: (total_kib * 1024.0) as u64,
-        used_bytes: ((total_kib - avail_kib).max(0.0) * 1024.0) as u64,
+        used_bytes: ((total_kib - free_kib).max(0.0) * 1024.0) as u64,
     };
     let network = data["network"]
         .as_array()
@@ -279,6 +282,21 @@ mod tests {
     fn fixture(name: &str) -> Value {
         let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+    }
+
+    /// DSM's `real_usage` counts page cache and buffers as free; used bytes
+    /// must agree with it. Numbers recorded from a DS920+ on DSM 7.4.1.
+    #[test]
+    fn used_memory_leaves_out_cache_and_buffers() {
+        let mut v = fixture("utilization.json");
+        v["memory"] = json!({
+            "total_real": 3_856_556, "avail_real": 143_596, "buffer": 11_648,
+            "cached": 2_272_688, "real_usage": 37
+        });
+        let m = parse_utilization(&v).unwrap().memory;
+        assert_eq!(m.used_bytes, 1_428_624 * 1024);
+        let pct = m.used_bytes as f64 / m.total_bytes as f64 * 100.0;
+        assert_eq!(pct.round(), m.used_pct);
     }
 
     #[test]
