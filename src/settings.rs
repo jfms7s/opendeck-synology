@@ -3,6 +3,7 @@
 //! system keyring is unavailable. `ActionSettings` belongs to one key or dial.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -81,7 +82,8 @@ pub enum TempUnit {
 }
 
 /// Secrets kept in the settings file only when no system keyring works.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// `Debug` redacts the password and device token.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FallbackSecrets {
     pub password: Option<String>,
@@ -90,6 +92,16 @@ pub struct FallbackSecrets {
     /// account or NAS never gets them. `None` in files written before the
     /// scope was recorded: those belong to the connection saved with them.
     pub scope: Option<String>,
+}
+
+impl fmt::Debug for FallbackSecrets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FallbackSecrets")
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("did", &self.did.as_ref().map(|_| "<redacted>"))
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 impl FallbackSecrets {
@@ -244,6 +256,21 @@ mod tests {
         };
         assert!(scoped.belongs_to("jf@nas.lan"));
         assert!(!scoped.belongs_to("jf@other.lan"));
+    }
+
+    #[test]
+    fn debug_output_hides_fallback_secrets() {
+        let g = GlobalSettings {
+            fallback_secrets: Some(FallbackSecrets {
+                password: Some("p&ss=w+rd".into()),
+                did: Some("dev-1".into()),
+                scope: Some("jf@nas.lan".into()),
+            }),
+            ..GlobalSettings::default()
+        };
+        let text = format!("{g:?}");
+        assert!(!text.contains("p&ss") && !text.contains("dev-1"), "{text}");
+        assert!(text.contains("jf@nas.lan"), "{text}");
     }
 
     #[test]
