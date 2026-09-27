@@ -99,6 +99,7 @@ impl ServerCertVerifier for PinningVerifier {
         // The pin is the trust anchor, so the hostname isn't checked for it:
         // users reach their NAS by IP as often as by name.
         if self.pinned.as_deref() == Some(fp.as_str()) {
+            *self.rejected.lock().unwrap() = None;
             return Ok(ServerCertVerified::assertion());
         }
         if let Some(roots) = &self.roots
@@ -106,6 +107,7 @@ impl ServerCertVerifier for PinningVerifier {
                 .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
                 .is_ok()
         {
+            *self.rejected.lock().unwrap() = None;
             return Ok(ServerCertVerified::assertion());
         }
         let rejection = if self.pinned.is_some() {
@@ -220,5 +222,16 @@ mod tests {
             v.take_rejection(),
             Some(Rejection::Changed(fingerprint(other.as_ref())))
         );
+    }
+
+    #[test]
+    fn a_successful_handshake_clears_an_earlier_rejection() {
+        let pinned_cert = self_signed();
+        let pinned = fingerprint(pinned_cert.as_ref());
+        let other = self_signed();
+        let v = verifier(Some(pinned));
+        assert!(verify(&v, &other).is_err());
+        assert!(verify(&v, &pinned_cert).is_ok());
+        assert_eq!(v.take_rejection(), None);
     }
 }
