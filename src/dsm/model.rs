@@ -96,7 +96,7 @@ pub enum Payload {
     Update(UpdateStatus),
 }
 
-fn num(v: &Value) -> Option<f64> {
+pub(crate) fn num(v: &Value) -> Option<f64> {
     match v {
         Value::Number(n) => n.as_f64(),
         Value::String(s) => s.trim().parse().ok(),

@@ -2,6 +2,7 @@
 //! `SYNO.API.Info` tells us, since paths and versions vary between releases.
 
 use crate::dsm::error::DsmError;
+use crate::dsm::model::num;
 use crate::dsm::transport::Transport;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -33,6 +34,16 @@ pub struct ApiInfo {
 
 pub type ApiMap = HashMap<String, ApiInfo>;
 
+/// DSM sometimes sends API versions as strings; reject negative or
+/// fractional values rather than silently truncating them.
+fn version_num(v: &Value) -> Option<u64> {
+    let n = num(v)?;
+    if n.is_sign_negative() || n.fract() != 0.0 {
+        return None;
+    }
+    Some(n as u64)
+}
+
 pub async fn discover(t: &dyn Transport) -> Result<ApiMap, DsmError> {
     let names = WANTED.map(|(name, _)| name).join(",");
     let form = [
@@ -56,8 +67,8 @@ pub fn parse_api_info(data: &Value) -> Result<ApiMap, DsmError> {
         let e = &data[name];
         let (Some(path), Some(min), Some(max)) = (
             e["path"].as_str(),
-            e["minVersion"].as_u64(),
-            e["maxVersion"].as_u64(),
+            version_num(&e["minVersion"]),
+            version_num(&e["maxVersion"]),
         ) else {
             if name == AUTH {
                 return Err(DsmError::Parse {
@@ -121,6 +132,16 @@ mod tests {
         v["SYNO.API.Auth"]["maxVersion"] = json!(4);
         let err = parse_api_info(&v).unwrap_err();
         assert!(err.to_string().contains("DSM 7"), "{err}");
+    }
+
+    #[test]
+    fn versions_sent_as_strings_are_accepted() {
+        let numeric = parse_api_info(&info()).unwrap();
+        let mut v = info();
+        v["SYNO.API.Auth"]["maxVersion"] = json!("7");
+        v["SYNO.API.Auth"]["minVersion"] = json!("1");
+        let map = parse_api_info(&v).unwrap();
+        assert_eq!(map[AUTH].version, numeric[AUTH].version);
     }
 
     #[test]
