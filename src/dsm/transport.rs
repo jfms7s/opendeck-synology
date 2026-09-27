@@ -56,7 +56,7 @@ impl HttpTransport {
                 DsmError::CertificateNotTrusted { fingerprint }
             }
             Some(Rejection::Changed(fingerprint)) => DsmError::CertificateChanged { fingerprint },
-            None => DsmError::Transport(e.without_url().to_string()),
+            None => DsmError::Transport(reason(e)),
         }
     }
 }
@@ -78,14 +78,34 @@ impl Transport for HttpTransport {
             .map_err(|e| self.send_error(e))?;
         let response = response
             .error_for_status()
-            .map_err(|e| DsmError::Transport(e.without_url().to_string()))?;
-        let text = response.text().await.map_err(|e| {
-            DsmError::Transport(format!("unreadable response: {}", e.without_url()))
-        })?;
+            .map_err(|e| DsmError::Transport(reason(e)))?;
+        let text = response
+            .text()
+            .await
+            .map_err(|e| DsmError::Transport(format!("unreadable response: {}", reason(e))))?;
         let body: Value = serde_json::from_str(&text)
             .map_err(|e| DsmError::Transport(format!("unreadable response: {e}")))?;
         unwrap_envelope(body)
     }
+}
+
+/// Why a request failed, e.g. "error sending request: client error
+/// (Connect): tcp connect error: Connection refused (os error 111)" -
+/// reqwest's own message says only the first part. The URL is dropped
+/// (URLs carry no secrets anyway; form bodies never appear in errors).
+fn reason(e: reqwest::Error) -> String {
+    let e = e.without_url();
+    let mut msg = e.to_string();
+    let mut source = std::error::Error::source(&e);
+    while let Some(s) = source {
+        let part = s.to_string();
+        if !msg.contains(&part) {
+            msg.push_str(": ");
+            msg.push_str(&part);
+        }
+        source = s.source();
+    }
+    msg
 }
 
 pub fn unwrap_envelope(body: Value) -> Result<Result<Value, i64>, DsmError> {
@@ -230,6 +250,28 @@ mod tests {
         let t = HttpTransport::new(&conn(port, false, None)).unwrap();
         let err = t.call("query.cgi", &[]).await.unwrap_err();
         assert!(matches!(err, DsmError::Transport(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_says_why_without_the_url() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let t = HttpTransport::new(&conn(port, false, None)).unwrap();
+        let DsmError::Transport(msg) = t
+            .call("query.cgi", &[("passwd", "p&ss")])
+            .await
+            .unwrap_err()
+        else {
+            panic!("not a transport error");
+        };
+        assert!(msg.to_lowercase().contains("refused"), "{msg}");
+        assert!(
+            !msg.contains("webapi") && !msg.contains(&port.to_string()) && !msg.contains("p&ss"),
+            "{msg}"
+        );
     }
 
     #[tokio::test]
