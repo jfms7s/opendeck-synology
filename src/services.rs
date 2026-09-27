@@ -536,6 +536,16 @@ mod tests {
         .unwrap_or_else(|_| panic!("status stuck at {:?}", s.current_status()));
     }
 
+    async fn wait_for_value(rx: &mut watch::Receiver<crate::poller::PollState<Payload>>) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rx.borrow_and_update().value.is_none() {
+                rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the poller never delivered a value");
+    }
+
     fn connected(s: &ConnStatus) -> bool {
         matches!(s, ConnStatus::Connected { .. })
     }
@@ -560,9 +570,10 @@ mod tests {
         );
         assert_eq!(sink.last().fallback_secrets, None);
         assert!(s.has_password());
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let mut rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
         wait_for(&s, connected).await;
-        assert!(s.poller(Endpoint::Utilization).latest().value.is_some());
+        // The status is published before the poller's value: wait for it.
+        wait_for_value(&mut rx).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
