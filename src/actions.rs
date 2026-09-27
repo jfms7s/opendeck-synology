@@ -2,6 +2,7 @@
 //! generic `MetricAction` is instantiated per metric through a marker type;
 //! everything metric-specific lives in `metrics`.
 
+use crate::inspector;
 use crate::instances::Instances;
 use crate::metric::Metric;
 use crate::services::Services;
@@ -126,13 +127,21 @@ impl<K: MetricKind> Action for MetricAction<K> {
         Ok(())
     }
 
+    async fn property_inspector_did_appear(
+        &self,
+        instance: &Instance,
+        _: &ActionSettings,
+    ) -> OpenActionResult<()> {
+        inspector::send_state(&self.services, K::METRIC, instance).await
+    }
+
     async fn send_to_plugin(
         &self,
-        _: &Instance,
+        instance: &Instance,
         _: &ActionSettings,
-        _: &Value,
+        payload: &Value,
     ) -> OpenActionResult<()> {
-        Ok(()) // the settings panel protocol arrives in Task 15
+        inspector::handle(&self.services, K::METRIC, instance, payload).await
     }
 }
 

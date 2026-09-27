@@ -5,6 +5,7 @@
 mod actions;
 mod dsm;
 mod format;
+mod inspector;
 mod instances;
 mod metric;
 mod metrics;
