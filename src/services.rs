@@ -218,9 +218,17 @@ impl Services {
     /// Replaces the session and points every poller at it.
     async fn reconnect(self: &Arc<Self>) {
         let old = self.session.lock().unwrap().take();
+        self.connect().await;
+        // Only now that no poller uses the old session can it be logged out:
+        // a poller still on it would just log it in again.
         if let Some(old) = old {
             tokio::spawn(async move { old.logout().await });
         }
+    }
+
+    /// Makes a session for the current settings and gives every poller a
+    /// new fetch (`None` when it can't connect).
+    async fn connect(self: &Arc<Self>) {
         let g = self.migrate_fallback_secrets().await;
         let password = self
             .read_secret(&g, Secret::Password)
