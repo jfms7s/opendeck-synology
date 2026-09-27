@@ -86,6 +86,17 @@ pub enum TempUnit {
 pub struct FallbackSecrets {
     pub password: Option<String>,
     pub did: Option<String>,
+    /// The `Connection::secret_scope` these secrets belong to, so another
+    /// account or NAS never gets them. `None` in files written before the
+    /// scope was recorded: those belong to the connection saved with them.
+    pub scope: Option<String>,
+}
+
+impl FallbackSecrets {
+    /// Whether these secrets may be used for the connection with `scope`.
+    pub fn belongs_to(&self, scope: &str) -> bool {
+        self.scope.as_deref().is_none_or(|s| s == scope)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -212,6 +223,27 @@ mod tests {
             out.get("fallback_secrets").is_none(),
             "no secrets key unless needed"
         );
+    }
+
+    #[test]
+    fn fallback_secrets_without_a_scope_still_load() {
+        let g: GlobalSettings =
+            serde_json::from_value(json!({ "fallback_secrets": { "password": "pw" } })).unwrap();
+        let f = g.fallback_secrets.unwrap();
+        assert_eq!(
+            (f.password.as_deref(), f.scope.as_deref()),
+            (Some("pw"), None)
+        );
+        assert!(
+            f.belongs_to("jf@nas.lan"),
+            "older files: the saved connection's"
+        );
+        let scoped = FallbackSecrets {
+            scope: Some("jf@nas.lan".into()),
+            ..f
+        };
+        assert!(scoped.belongs_to("jf@nas.lan"));
+        assert!(!scoped.belongs_to("jf@other.lan"));
     }
 
     #[test]

@@ -126,6 +126,11 @@ impl Services {
         } else {
             None
         };
+        // Secrets that fell back to the settings file belong to the old
+        // account and host: never send them to, or file them under, a new one.
+        if conn.secret_scope() != g.connection.secret_scope() {
+            g.fallback_secrets = None;
+        }
         g.connection = conn;
         if let Some(pw) = password {
             self.put_secret(&mut g, Secret::Password, Some(pw)).await;
@@ -226,7 +231,11 @@ impl Services {
             did: self.read_secret(&g, Secret::Did).await,
             device_name: self.device_name.clone(),
         };
-        let session = Arc::new(Session::new(transport, creds, self.did_listener()));
+        let session = Arc::new(Session::new(
+            transport,
+            creds,
+            self.did_listener(g.connection.secret_scope()),
+        ));
         *self.session.lock().unwrap() = Some(session.clone());
         self.set_status(ConnStatus::Connecting);
         for e in Endpoint::ALL {
@@ -242,10 +251,11 @@ impl Services {
     async fn migrate_fallback_secrets(&self) -> GlobalSettings {
         let mut g = self.global();
         let before = g.clone();
-        if let Some(pw) = g.fallback_secrets.as_ref().and_then(|f| f.password.clone()) {
+        let fallback = Self::fallback_for(&g).cloned().unwrap_or_default();
+        if let Some(pw) = fallback.password {
             self.put_secret(&mut g, Secret::Password, Some(pw)).await;
         }
-        if let Some(did) = g.fallback_secrets.as_ref().and_then(|f| f.did.clone()) {
+        if let Some(did) = fallback.did {
             self.put_secret(&mut g, Secret::Did, Some(did)).await;
         }
         if g != before {
@@ -300,17 +310,23 @@ impl Services {
         self.set_status(next);
     }
 
-    fn did_listener(self: &Arc<Self>) -> DidListener {
+    /// `scope` is the connection the session was made for: a device token
+    /// arriving after the settings moved to another account or NAS is dropped.
+    fn did_listener(self: &Arc<Self>, scope: String) -> DidListener {
         let this = Arc::downgrade(self);
         Arc::new(move |did| {
             if let Some(s) = this.upgrade() {
-                tokio::spawn(async move { s.store_did(did).await });
+                let scope = scope.clone();
+                tokio::spawn(async move { s.store_did(&scope, did).await });
             }
         })
     }
 
-    async fn store_did(&self, did: Option<String>) {
+    async fn store_did(&self, scope: &str, did: Option<String>) {
         let mut g = self.global();
+        if g.connection.secret_scope() != scope {
+            return;
+        }
         let before = g.clone();
         self.put_secret(&mut g, Secret::Did, did).await;
         if g != before {
@@ -335,7 +351,7 @@ impl Services {
             .and_then(Result::ok)
             .flatten();
         from_keyring.or_else(|| {
-            let f = g.fallback_secrets.as_ref()?;
+            let f = Self::fallback_for(g)?;
             match which {
                 Secret::Password => f.password.clone(),
                 Secret::Did => f.did.clone(),
@@ -343,9 +359,20 @@ impl Services {
         })
     }
 
+    /// The settings-file secrets, if they belong to the current connection.
+    fn fallback_for(g: &GlobalSettings) -> Option<&FallbackSecrets> {
+        let scope = g.connection.secret_scope();
+        g.fallback_secrets.as_ref().filter(|f| f.belongs_to(&scope))
+    }
+
     /// Stores (or with `None`, deletes) a secret in the keyring, falling back
     /// to the settings file - with a warning - when there is no keyring.
     async fn put_secret(&self, g: &mut GlobalSettings, which: Secret, value: Option<String>) {
+        let scope = g.connection.secret_scope();
+        if Self::fallback_for(g).is_none() {
+            // Nothing there, or another connection's secrets: start afresh.
+            g.fallback_secrets = None;
+        }
         let key = Self::secret_key(g, which);
         let store = self.secrets.clone();
         let v = value.clone();
@@ -355,6 +382,7 @@ impl Services {
         let fallback = g
             .fallback_secrets
             .get_or_insert_with(FallbackSecrets::default);
+        fallback.scope = Some(scope);
         let slot = match which {
             Secret::Password => &mut fallback.password,
             Secret::Did => &mut fallback.did,
@@ -368,7 +396,10 @@ impl Services {
                 *slot = value;
             }
         }
-        if g.fallback_secrets == Some(FallbackSecrets::default()) {
+        if g.fallback_secrets
+            .as_ref()
+            .is_some_and(|f| f.password.is_none() && f.did.is_none())
+        {
             g.fallback_secrets = None;
         }
     }
@@ -538,7 +569,7 @@ mod tests {
             connection: conn(),
             fallback_secrets: Some(FallbackSecrets {
                 password: Some("pw".into()),
-                did: None,
+                ..FallbackSecrets::default()
             }),
             ..GlobalSettings::default()
         };
@@ -578,6 +609,38 @@ mod tests {
         )
         .await;
         assert_eq!(s.global().connection.pinned_sha256, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_host_never_gets_the_old_hosts_fallback_secrets() {
+        let nas = healthy_nas();
+        let (s, sink) = services_with(nas.clone(), Arc::new(MemoryStore::broken()));
+        s.load_global(GlobalSettings::default()).await;
+        s.save_connection(conn(), Some("pw".into())).await;
+        assert!(s.has_password());
+        let logins_before = nas.count("login");
+        s.save_connection(
+            Connection {
+                host: "other.lan".into(),
+                ..conn()
+            },
+            None,
+        )
+        .await;
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!s.has_password(), "other.lan has no password of its own");
+        assert_eq!(s.current_status(), ConnStatus::NotConfigured);
+        assert_eq!(
+            nas.count("login"),
+            logins_before,
+            "nothing sent to other.lan"
+        );
+        assert_eq!(
+            sink.last().fallback_secrets.and_then(|f| f.password),
+            None,
+            "the old host's password is not filed under the new one"
+        );
     }
 
     /// Refuses the certificate until one is pinned.
