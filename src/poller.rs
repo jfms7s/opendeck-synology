@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Notify, watch};
+use tokio::time::Instant;
 
 pub const MIN_INTERVAL: Duration = Duration::from_secs(2);
 pub const MAX_BACKOFF: Duration = Duration::from_secs(300);
@@ -62,6 +63,11 @@ struct Registry<T> {
     /// can't overwrite the new connection's state when it finishes.
     generation: u64,
     running: bool,
+    /// When the current connection last returned a value: data younger than
+    /// the interval is not fetched again just because a key appeared.
+    last_ok: Option<Instant>,
+    /// Set by `refresh_now`: the next round polls even if the data is fresh.
+    force: bool,
 }
 
 struct Inner<T> {
@@ -86,6 +92,8 @@ impl<T: Send + Sync + 'static> Poller<T> {
                     fetch: None,
                     generation: 0,
                     running: false,
+                    last_ok: None,
+                    force: false,
                 }),
                 tx,
                 wake: Notify::new(),
@@ -95,7 +103,9 @@ impl<T: Send + Sync + 'static> Poller<T> {
 
     /// Registers (or re-registers) a subscriber, starting the poll loop if
     /// it isn't running. `interval: None` means the endpoint's default.
-    /// Also triggers an immediate poll, so a new key gets fresh data.
+    /// Polls right away unless the last value is younger than the (new)
+    /// effective interval; fresh data is shared as is, and the next poll is
+    /// rescheduled for the new interval.
     pub fn subscribe(&self, id: &str, interval: Option<Duration>) -> watch::Receiver<PollState<T>> {
         let interval = interval
             .unwrap_or(self.inner.default_interval)
@@ -132,6 +142,7 @@ impl<T: Send + Sync + 'static> Poller<T> {
             let mut reg = self.inner.registry.lock().unwrap();
             reg.fetch = fetch;
             reg.generation += 1;
+            reg.last_ok = None;
             reg.running
         };
         self.inner.tx.send_replace(PollState::default());
@@ -150,9 +161,14 @@ impl<T: Send + Sync + 'static> Poller<T> {
         });
     }
 
-    /// Polls now instead of waiting out the interval or a pause.
+    /// Polls now instead of waiting out the interval or a pause - even when
+    /// the data is fresh.
     pub fn refresh_now(&self) {
-        let running = self.inner.registry.lock().unwrap().running;
+        let running = {
+            let mut reg = self.inner.registry.lock().unwrap();
+            reg.force = reg.running;
+            reg.running
+        };
         self.wake_if(running);
     }
 
@@ -192,21 +208,44 @@ async fn run<T: Send + Sync + 'static>(inner: Arc<Inner<T>>) {
         // permit already sitting here is redundant and would otherwise fire
         // the `select!` below immediately, causing a spurious extra poll.
         let _ = inner.wake.notified().now_or_never();
-        let (interval, fetch, generation) = {
+        let failed = inner.tx.borrow().error.is_some();
+        let (interval, fetch, generation, fresh_for) = {
             let mut reg = inner.registry.lock().unwrap();
             let Some(interval) = reg.subscribers.values().min().copied() else {
                 reg.running = false;
                 return;
             };
-            (interval, reg.fetch.clone(), reg.generation)
+            let force = std::mem::take(&mut reg.force);
+            // How much longer the last good value stays fresh, if it does.
+            let fresh_for = reg
+                .last_ok
+                .filter(|_| !force && !failed)
+                .and_then(|t| interval.checked_sub(t.elapsed()))
+                .filter(|rest| !rest.is_zero());
+            (interval, reg.fetch.clone(), reg.generation, fresh_for)
         };
+        // Woken by a new subscriber or a changed interval while the data is
+        // still fresh: just re-plan the next poll.
+        if let (Some(_), Some(rest)) = (&fetch, fresh_for) {
+            tokio::select! {
+                _ = tokio::time::sleep(rest) => {}
+                _ = inner.wake.notified() => {}
+            }
+            continue;
+        }
         // `None` = wait until woken (unconfigured, or an error only the user can fix).
         let wait = match fetch {
             None => None,
             Some(fetch) => {
                 let result = fetch().await;
-                if inner.registry.lock().unwrap().generation != generation {
-                    continue; // the connection changed mid-request; discard
+                {
+                    let mut reg = inner.registry.lock().unwrap();
+                    if reg.generation != generation {
+                        continue; // the connection changed mid-request; discard
+                    }
+                    if result.is_ok() {
+                        reg.last_ok = Some(Instant::now());
+                    }
                 }
                 let mut next = inner.tx.borrow().clone();
                 let wait = match result {
@@ -290,8 +329,52 @@ mod tests {
         let _b = p.subscribe("b", Some(S(5)));
         assert_eq!(p.effective_interval(), Some(S(5)));
         tokio::time::sleep(Duration::from_millis(20_500)).await;
-        // One immediate poll for the new subscriber, then every 5 s.
-        assert_eq!(n.load(SeqCst), 6);
+        // No extra poll for the new subscriber (the data is fresh), but the
+        // schedule tightens to every 5 s: at 5, 10, 15 and 20 s.
+        assert_eq!(n.load(SeqCst), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_subscriber_reuses_fresh_data() {
+        let p = Poller::new(S(60));
+        let n = Arc::new(AtomicU32::new(0));
+        p.set_fetch(Some(counting(n.clone())));
+        let _a = p.subscribe("a", None);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(n.load(SeqCst), 1);
+        tokio::time::sleep(S(30)).await;
+        let _b = p.subscribe("b", None);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(
+            n.load(SeqCst),
+            1,
+            "30 s old data is fresh at a 60 s interval"
+        );
+        tokio::time::sleep(S(30)).await;
+        assert_eq!(n.load(SeqCst), 2, "the schedule is unchanged");
+        p.refresh_now();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(n.load(SeqCst), 3, "refresh_now still forces a poll");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_within_the_interval_waits_out_the_rest_of_it() {
+        let p = Poller::new(S(60));
+        let n = Arc::new(AtomicU32::new(0));
+        p.set_fetch(Some(counting(n.clone())));
+        let _a = p.subscribe("a", None);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        p.unsubscribe("a");
+        tokio::time::sleep(S(10)).await;
+        let _b = p.subscribe("b", None);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(
+            n.load(SeqCst),
+            1,
+            "a page switch doesn't re-poll fresh data"
+        );
+        tokio::time::sleep(S(50)).await;
+        assert_eq!(n.load(SeqCst), 2);
     }
 
     #[tokio::test(start_paused = true)]
