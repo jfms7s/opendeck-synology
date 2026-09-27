@@ -4,6 +4,7 @@
 
 mod dsm;
 mod metric;
+mod poller;
 mod settings;
 mod status;
 
