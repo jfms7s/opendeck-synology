@@ -1387,6 +1387,7 @@ dependencies = [
  "simplelog",
  "thiserror",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

@@ -26,5 +26,6 @@ keyring = { version = "3.6", default-features = false, features = ["async-secret
 gethostname = "1"
 
 [dev-dependencies]
-tokio = { version = "1.48", features = ["test-util", "macros", "rt", "rt-multi-thread"] }
+tokio = { version = "1.48", features = ["test-util", "macros", "rt", "rt-multi-thread", "net", "io-util"] }
 rcgen = "0.14"
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
