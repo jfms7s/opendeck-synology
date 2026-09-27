@@ -37,11 +37,6 @@ fn number(v: f64, unit: usize) -> String {
     }
 }
 
-pub fn bytes(n: u64) -> String {
-    let (v, i) = scale(n);
-    format!("{} {}", number(v, i), UNITS[i])
-}
-
 /// "5.0/7.0 TB": both numbers in the unit of the total.
 pub fn used_of_total(used: u64, total: u64) -> String {
     let (t, i) = scale(total);
@@ -94,14 +89,6 @@ mod tests {
     }
 
     #[test]
-    fn bytes_use_binary_multiples_with_dsm_labels() {
-        assert_eq!(bytes(512), "512 B");
-        assert_eq!(bytes(6 * GIB), "6.0 GB");
-        assert_eq!(bytes(16 * GIB), "16 GB");
-        assert_eq!(bytes(7 * TIB + TIB / 2), "7.5 TB");
-    }
-
-    #[test]
     fn used_of_total_shares_the_totals_unit() {
         assert_eq!(used_of_total(6 * GIB, 16 * GIB), "6.0/16 GB");
         assert_eq!(
@@ -134,8 +121,8 @@ mod tests {
 
     #[test]
     fn values_that_round_up_to_a_threshold_take_the_next_format() {
-        assert_eq!(bytes(1_048_064), "1.0 MB");
-        assert_eq!(bytes(10_199), "10 KB");
+        assert_eq!(rate(1_048_064), "1.0 MB/s");
+        assert_eq!(used_of_total(10_199, 10_199), "10/10 KB");
         assert_eq!(rate(102_349), "100 KB/s");
     }
 }

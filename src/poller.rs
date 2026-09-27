@@ -153,6 +153,7 @@ impl<T: Send + Sync + 'static> Poller<T> {
         }
     }
 
+    #[cfg(test)]
     pub fn effective_interval(&self) -> Option<Duration> {
         self.inner
             .registry

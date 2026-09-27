@@ -44,6 +44,7 @@ pub enum Metric {
 }
 
 impl Metric {
+    #[cfg(test)]
     pub const ALL: [Metric; 10] = [
         Self::Cpu,
         Self::Ram,

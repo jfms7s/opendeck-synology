@@ -91,6 +91,7 @@ impl Instances {
         l.redraw.notify_one();
     }
 
+    #[cfg(test)]
     pub fn view(&self, id: &str) -> Option<ActionSettings> {
         self.live.get(id).map(|l| l.view.lock().unwrap().clone())
     }
