@@ -8,6 +8,7 @@ mod metric;
 mod metrics;
 mod poller;
 mod secrets;
+mod services;
 mod settings;
 mod status;
 
