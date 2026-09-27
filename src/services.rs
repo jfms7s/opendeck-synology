@@ -822,9 +822,16 @@ mod tests {
         let (s, _) = services_with(nas, Arc::new(MemoryStore::default()));
         s.load_global(GlobalSettings::default()).await;
         s.save_connection(conn(), Some("pw".into())).await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let mut rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
         wait_for(&s, |st| *st == ConnStatus::Auth(AuthError::NeedOtp)).await;
-        assert!(s.poller(Endpoint::Utilization).latest().error.is_some());
+        // The status is published just before the poller stores its error.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rx.borrow_and_update().error.is_none() {
+                rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the poller never reported the login error");
         s.submit_otp("123456").await.unwrap();
         let st = s.poller(Endpoint::Utilization).latest();
         assert_eq!((st.error, st.failures), (None, 0), "no red \"Login\" key");
