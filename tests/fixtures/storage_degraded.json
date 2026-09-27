@@ -1,0 +1,13 @@
+{
+  "disks": [
+    { "id": "sata1", "longName": "Drive 1", "temp": 38, "smart_status": "normal", "status": "normal" },
+    { "id": "sata2", "longName": "Drive 2", "temp": 61, "smart_status": "failing", "status": "crashed" }
+  ],
+  "volumes": [
+    { "id": "volume_1", "vol_path": "/volume1", "status": "degraded", "size": { "total": "1000", "used": "950" } }
+  ],
+  "storagePools": [
+    { "id": "reuse_1", "device_type": "raid_1", "status": "degraded", "progress": { "percent": "-1" } },
+    { "id": "reuse_2", "device_type": "raid_5", "status": "repairing", "progress": { "percent": "43", "step": "resync" } }
+  ]
+}

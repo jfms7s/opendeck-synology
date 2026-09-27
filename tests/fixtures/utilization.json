@@ -1,0 +1,10 @@
+{
+  "cpu": { "15min_load": 35, "1min_load": 42, "5min_load": 38, "device": "System", "other_load": 1, "system_load": 7, "user_load": 29 },
+  "memory": { "avail_real": 10485760, "total_real": 16777216, "real_usage": 37, "memory_size": 16777216 },
+  "network": [
+    { "device": "total", "rx": 13002342, "tx": 524288 },
+    { "device": "eth0", "rx": 13000000, "tx": 520000 },
+    { "device": "eth1", "rx": 2342, "tx": 4288 }
+  ],
+  "time": 1790000000
+}

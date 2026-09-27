@@ -1,0 +1,13 @@
+{
+  "disks": [
+    { "id": "sata1", "name": "Drive 1", "longName": "Drive 1", "temp": 38, "smart_status": "normal", "status": "normal" },
+    { "id": "sata2", "name": "Drive 2", "longName": "Drive 2", "temp": 44, "smart_status": "normal", "status": "normal" },
+    { "id": "nvme0n1", "name": "M.2 Drive 1", "longName": "M.2 Drive 1", "temp": 0, "smart_status": "normal", "status": "normal" }
+  ],
+  "volumes": [
+    { "id": "volume_1", "vol_path": "/volume1", "status": "normal", "size": { "total": "7680000000000", "used": "5452800000000" } }
+  ],
+  "storagePools": [
+    { "id": "reuse_1", "device_type": "shr_with_1_disk_protect", "status": "normal", "progress": { "percent": "-1", "step": "none" } }
+  ]
+}

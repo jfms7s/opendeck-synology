@@ -2,4 +2,6 @@
 // everything together (Task 16).
 #![allow(dead_code)]
 
+mod dsm;
+
 fn main() {}
