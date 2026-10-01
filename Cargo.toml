@@ -1,6 +1,6 @@
 [package]
 name = "opendeck-synology"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "OpenDeck plugin: live Synology DSM 7 status - CPU, RAM, temperatures, disks, volumes, storage pools, network, uptime and updates - on Stream Deck keys and dials"
