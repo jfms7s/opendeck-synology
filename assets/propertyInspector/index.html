@@ -3,101 +3,125 @@
 <head>
 	<meta charset="utf-8" />
 	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<link rel="stylesheet" href="pi.css" />
 	<style>
-		body { font: 12px system-ui, sans-serif; margin: 0; padding: 8px 12px; }
-		h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.7; margin: 14px 0 4px; }
-		label { display: block; margin-top: 8px; font-size: 11px; opacity: 0.8; }
-		input, select, button { box-sizing: border-box; margin-top: 2px; font: inherit; }
-		input, select { width: 100%; }
-		button { margin-top: 8px; }
-		.row { display: flex; gap: 6px; align-items: end; }
-		.row > * { flex: 1; }
-		.row > .narrow { flex: 0 0 5.5em; }
-		.check { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
-		.check input { width: auto; margin: 0; }
-		.check label { margin: 0; }
-		#status { margin-top: 10px; padding: 6px; border-radius: 4px; background: rgba(127, 127, 127, 0.15); }
-		#status.ok { background: rgba(34, 197, 94, 0.2); }
-		#status.bad { background: rgba(239, 68, 68, 0.2); }
-		.hint { font-size: 10px; opacity: 0.7; margin-top: 3px; }
-		.fingerprint { font-family: ui-monospace, monospace; font-size: 10px; word-break: break-all; margin-top: 4px; }
-		.hidden { display: none; }
+		/* Buttons keep their natural width instead of stretching across the card. */
+		.card > button,
+		.field > button {
+			align-self: flex-start;
+		}
+		#http-warning {
+			color: var(--pi-warn);
+		}
 	</style>
 </head>
 <body>
-	<h2>NAS connection · shared by all keys</h2>
-	<label for="host">Host or IP address</label>
-	<input id="host" placeholder="nas.lan or 192.168.1.10" />
-	<div class="row">
-		<div><label for="account">Account</label><input id="account" autocomplete="username" /></div>
-		<div class="narrow"><label for="port">Port</label><input id="port" type="number" min="1" max="65535" /></div>
-	</div>
-	<label for="password">Password</label>
-	<input id="password" type="password" autocomplete="current-password" />
-	<div class="hint" id="password-hint"></div>
-	<div class="check"><input type="checkbox" id="https" /><label for="https">HTTPS</label></div>
-	<div class="hint hidden" id="http-warning">Unencrypted: your password crosses the network in the clear.</div>
-	<button id="save">Save and connect</button>
+	<main class="pi">
+		<section class="card">
+			<h2>NAS connection · all keys</h2>
+			<div class="field">
+				<label for="host">Host or IP address</label>
+				<input id="host" placeholder="nas.lan or 192.168.1.10" />
+			</div>
+			<div class="row">
+				<div class="field">
+					<label for="account">Account</label>
+					<input id="account" autocomplete="username" />
+				</div>
+				<div class="field narrow">
+					<label for="port">Port</label>
+					<input id="port" type="number" min="1" max="65535" />
+				</div>
+			</div>
+			<div class="field">
+				<label for="password">Password</label>
+				<input id="password" type="password" autocomplete="current-password" />
+				<p class="hint" id="password-hint"></p>
+			</div>
+			<div class="field">
+				<label class="check"><input type="checkbox" id="https" /> HTTPS</label>
+				<p class="hint hidden" id="http-warning">Unencrypted: your password crosses the network in the clear.</p>
+			</div>
+			<button id="save" class="primary">Save and connect</button>
+		</section>
 
-	<div id="status">…</div>
-	<div id="otp-box" class="hidden">
-		<label for="otp">2FA code from your authenticator app</label>
-		<div class="row">
-			<input id="otp" inputmode="numeric" autocomplete="one-time-code" />
-			<button id="submit-otp" class="narrow">Verify</button>
-		</div>
-		<div class="hint">DSM then remembers this device (Personal › Security › Trusted devices), so you won't be asked again.</div>
-	</div>
-	<div id="cert-box" class="hidden">
-		<div class="hint">SHA-256 fingerprint of the certificate the NAS presented. Compare it with DSM › Control Panel › Security › Certificate before trusting it.</div>
-		<div class="fingerprint" id="fingerprint"></div>
-		<button id="trust">Trust this certificate</button>
-	</div>
+		<section class="card">
+			<h2>Sign-in</h2>
+			<div id="status" class="status">…</div>
+			<div id="otp-box" class="field hidden">
+				<label for="otp">2FA code</label>
+				<div class="row">
+					<input id="otp" inputmode="numeric" autocomplete="one-time-code" />
+					<button id="submit-otp">Verify</button>
+				</div>
+				<p class="hint">From your authenticator app. DSM then remembers this device (Personal › Security › Trusted devices), so you won't be asked again.</p>
+			</div>
+			<div id="cert-box" class="field hidden">
+				<span class="label">Certificate fingerprint (SHA-256)</span>
+				<p class="mono" id="fingerprint"></p>
+				<p class="hint">The certificate the NAS presented. Compare it with DSM › Control Panel › Security › Certificate before trusting it.</p>
+				<button id="trust">Trust this certificate</button>
+			</div>
+		</section>
 
-	<label for="temp-unit">Temperature unit</label>
-	<select id="temp-unit">
-		<option value="celsius">°C</option>
-		<option value="fahrenheit">°F</option>
-	</select>
+		<section class="card">
+			<h2>Display · all keys</h2>
+			<div class="field">
+				<label for="temp-unit">Temperature unit</label>
+				<select id="temp-unit">
+					<option value="celsius">°C</option>
+					<option value="fahrenheit">°F</option>
+				</select>
+			</div>
+		</section>
 
-	<h2>This key</h2>
-	<div id="target-field" class="hidden">
-		<label for="target" id="target-label">Show</label>
-		<select id="target"></select>
-	</div>
-	<div id="cpu-field" class="hidden">
-		<label for="cpu_view">Show</label>
-		<select id="cpu_view">
-			<option value="total">Usage %</option>
-			<option value="load1">Load average, 1 min</option>
-			<option value="load5">Load average, 5 min</option>
-			<option value="load15">Load average, 15 min</option>
-		</select>
-	</div>
-	<div id="direction-field" class="hidden">
-		<label for="direction">Direction</label>
-		<select id="direction">
-			<option value="in">In (download)</option>
-			<option value="out">Out (upload)</option>
-			<option value="combined">Combined</option>
-		</select>
-	</div>
-	<div id="amount-field" class="hidden">
-		<label for="amount">Show as</label>
-		<select id="amount">
-			<option value="percent">Percent</option>
-			<option value="used">Used of total</option>
-		</select>
-	</div>
-	<div id="threshold-field" class="hidden">
-		<div class="row">
-			<div><label for="warn" id="warn-label">Warn at</label><input id="warn" type="number" step="any" /></div>
-			<div><label for="crit" id="crit-label">Critical at</label><input id="crit" type="number" step="any" /></div>
-		</div>
-	</div>
-	<label for="interval_secs">Refresh every (seconds)</label>
-	<input id="interval_secs" type="number" min="2" step="1" />
-	<div class="hint">Keys reading the same data share one request, at the fastest interval any of them asks for.</div>
+		<section class="card">
+			<h2>This key</h2>
+			<div id="target-field" class="field hidden">
+				<label for="target" id="target-label">Show</label>
+				<select id="target"></select>
+			</div>
+			<div id="cpu-field" class="field hidden">
+				<label for="cpu_view">Show</label>
+				<select id="cpu_view">
+					<option value="total">Usage %</option>
+					<option value="load1">Load average, 1 min</option>
+					<option value="load5">Load average, 5 min</option>
+					<option value="load15">Load average, 15 min</option>
+				</select>
+			</div>
+			<div id="direction-field" class="field hidden">
+				<label for="direction">Direction</label>
+				<select id="direction">
+					<option value="in">In (download)</option>
+					<option value="out">Out (upload)</option>
+					<option value="combined">Combined</option>
+				</select>
+			</div>
+			<div id="amount-field" class="field hidden">
+				<label for="amount">Show as</label>
+				<select id="amount">
+					<option value="percent">Percent</option>
+					<option value="used">Used of total</option>
+				</select>
+			</div>
+			<div id="threshold-field" class="row hidden">
+				<div class="field">
+					<label for="warn" id="warn-label">Warn at</label>
+					<input id="warn" type="number" step="any" />
+				</div>
+				<div class="field">
+					<label for="crit" id="crit-label">Critical at</label>
+					<input id="crit" type="number" step="any" />
+				</div>
+			</div>
+			<div class="field">
+				<label for="interval_secs">Refresh every (seconds)</label>
+				<input id="interval_secs" type="number" min="2" step="1" />
+				<p class="hint">Keys reading the same data share one request, at the fastest interval any of them asks for.</p>
+			</div>
+		</section>
+	</main>
 
 	<script>
 		window.connectOpenActionSocketData = new Promise((resolve) => {
@@ -209,7 +233,8 @@
 
 			const kind = st.status.kind;
 			$("status").textContent = st.status.text + (kind === "connected" && st.status.firmware ? ` · ${st.status.firmware}` : "");
-			$("status").className = kind === "connected" ? "ok" : ["auth", "certificate", "unreachable"].includes(kind) ? "bad" : "";
+			$("status").classList.toggle("ok", kind === "connected");
+			$("status").classList.toggle("bad", ["auth", "certificate", "unreachable"].includes(kind));
 			$("otp-box").classList.toggle("hidden", kind !== "needOtp");
 			$("cert-box").classList.toggle("hidden", kind !== "certificate");
 			$("fingerprint").textContent = st.status.fingerprint || "";
