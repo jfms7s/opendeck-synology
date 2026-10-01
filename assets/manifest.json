@@ -6,7 +6,10 @@
 	"Description": "Live, read-only status of a Synology NAS running DSM 7 - CPU, RAM, temperatures, disk health, volumes, storage pools, network, uptime and updates - on keys and dials. Talks only to your NAS; works with 2FA accounts.",
 	"Icon": "icons/icon",
 	"OS": [{ "Platform": "linux" }],
-	"CodePaths": { "x86_64-unknown-linux-gnu": "opendeck-synology-x86_64-unknown-linux-gnu" },
+	"CodePaths": {
+		"x86_64-unknown-linux-gnu": "opendeck-synology-x86_64-unknown-linux-gnu",
+		"aarch64-unknown-linux-gnu": "opendeck-synology-aarch64-unknown-linux-gnu"
+	},
 	"CodePathLin": "opendeck-synology-x86_64-unknown-linux-gnu",
 	"Actions": [
 		{

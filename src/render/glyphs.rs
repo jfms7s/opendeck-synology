@@ -59,7 +59,7 @@ mod tests {
     #[test]
     #[ignore]
     fn write_icon_sources() {
-        let dir = format!("{}/assets/icons/source", env!("CARGO_MANIFEST_DIR"));
+        let dir = format!("{}/assets/icon-src", env!("CARGO_MANIFEST_DIR"));
         std::fs::create_dir_all(&dir).unwrap();
         for m in Metric::ALL {
             let name = m.uuid().rsplit('.').next().unwrap();

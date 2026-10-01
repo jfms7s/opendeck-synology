@@ -68,7 +68,7 @@ Download the latest `.streamDeckPlugin` from
 it (if your file manager associates the extension with OpenDeck) or unzip it into
 `~/.config/opendeck/plugins/` and restart OpenDeck.
 
-## Developing
+## Development
 
 ```bash
 cargo test                                  # unit tests, no NAS needed
@@ -100,3 +100,7 @@ before cutting a release:
 - [ ] Switching °C/°F redraws temperature keys immediately.
 - [ ] `~/.config/opendeck/` contains no password (grep for it), unless the log warned that
       no keyring was available.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
