@@ -25,11 +25,28 @@ pub fn paths(metric: Metric) -> &'static str {
     }
 }
 
+/// The glyph's paths in its stroke style - defined once for every use.
+fn group(metric: Metric) -> String {
+    format!(
+        r#"<g fill="none" stroke="{TEXT}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">{}</g>"#,
+        paths(metric)
+    )
+}
+
 /// A standalone SVG of the glyph, as a dial `pixmap` item accepts it.
 pub fn svg(metric: Metric) -> String {
     format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><g fill="none" stroke="{TEXT}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">{}</g></svg>"#,
-        paths(metric)
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">{}</svg>"#,
+        group(metric)
+    )
+}
+
+/// The glyph as a nested SVG, `size` units square at (`x`, `y`) of the
+/// enclosing image.
+pub fn placed(metric: Metric, x: u32, y: u32, size: u32) -> String {
+    format!(
+        r#"<svg x="{x}" y="{y}" width="{size}" height="{size}" viewBox="0 0 24 24">{}</svg>"#,
+        group(metric)
     )
 }
 
@@ -49,9 +66,31 @@ mod tests {
     /// A 144×144 action icon: the glyph, white on the plugin's dark tile.
     fn icon_svg(metric: Metric) -> String {
         format!(
-            r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 144 144"><rect width="144" height="144" rx="24" fill="#111827"/><svg x="30" y="30" width="84" height="84" viewBox="0 0 24 24"><g fill="none" stroke="{TEXT}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">{}</g></svg></svg>"##,
-            paths(metric)
+            r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 144 144"><rect width="144" height="144" rx="24" fill="#111827"/>{}</svg>"##,
+            placed(metric, 30, 30, 84)
         )
+    }
+
+    fn icon_name(m: Metric) -> &'static str {
+        m.uuid().rsplit('.').next().unwrap()
+    }
+
+    /// The committed icon sources match the glyphs, so a glyph edit can't
+    /// leave the shipped key icons behind (run `scripts/render-icons.sh`).
+    #[test]
+    fn committed_icon_sources_match_the_glyphs() {
+        let dir = format!("{}/assets/icon-src", env!("CARGO_MANIFEST_DIR"));
+        for m in Metric::ALL {
+            let path = format!("{dir}/{}.svg", icon_name(m));
+            let committed = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                committed,
+                icon_svg(m),
+                "{path} is stale - run scripts/render-icons.sh"
+            );
+        }
+        let plugin = std::fs::read_to_string(format!("{dir}/icon.svg")).unwrap();
+        assert_eq!(plugin, icon_svg(Metric::Pool));
     }
 
     /// Writes the SVG sources of the PNG icons. Use `scripts/render-icons.sh`,
@@ -62,8 +101,7 @@ mod tests {
         let dir = format!("{}/assets/icon-src", env!("CARGO_MANIFEST_DIR"));
         std::fs::create_dir_all(&dir).unwrap();
         for m in Metric::ALL {
-            let name = m.uuid().rsplit('.').next().unwrap();
-            std::fs::write(format!("{dir}/{name}.svg"), icon_svg(m)).unwrap();
+            std::fs::write(format!("{dir}/{}.svg", icon_name(m)), icon_svg(m)).unwrap();
         }
         // The plugin's own icon: a NAS is, above all, its storage pool.
         std::fs::write(format!("{dir}/icon.svg"), icon_svg(Metric::Pool)).unwrap();

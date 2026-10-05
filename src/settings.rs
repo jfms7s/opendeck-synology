@@ -2,7 +2,9 @@
 //! settings file - plain JSON on disk, so it carries no secrets unless the
 //! system keyring is unavailable. `ActionSettings` belongs to one key or dial.
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,9 +68,22 @@ impl Connection {
         !self.host().is_empty() && !self.account.trim().is_empty() && self.port != 0
     }
 
-    /// Namespaces keyring entries, so another NAS or account never reuses a
-    /// password or device token.
+    /// The one identity of "this NAS": scheme, host and port. The certificate
+    /// pin and the secrets both belong to it.
+    pub fn same_nas(&self, other: &Connection) -> bool {
+        self.base_url() == other.base_url()
+    }
+
+    /// Namespaces keyring entries by account, scheme, host and port, so a
+    /// password or device token saved for one NAS - or for HTTPS - is never
+    /// sent to another one, or over plain HTTP.
     pub fn secret_scope(&self) -> String {
+        format!("{}@{}", self.account.trim(), self.base_url())
+    }
+
+    /// The scope used up to v0.2.1 (`account@host`, no scheme or port).
+    /// Secrets filed under it are only adopted by an HTTPS connection.
+    pub fn legacy_secret_scope(&self) -> String {
         format!("{}@{}", self.account.trim(), self.host())
     }
 }
@@ -105,9 +120,16 @@ impl fmt::Debug for FallbackSecrets {
 }
 
 impl FallbackSecrets {
-    /// Whether these secrets may be used for the connection with `scope`.
-    pub fn belongs_to(&self, scope: &str) -> bool {
-        self.scope.as_deref().is_none_or(|s| s == scope)
+    /// Whether these secrets may be used for `conn`. Secrets from before
+    /// the scope included the scheme and port (no scope, or the legacy
+    /// `account@host` one) are only trusted over HTTPS: they may have been
+    /// saved for an HTTPS connection, and must not leak over plain HTTP.
+    pub fn belongs_to(&self, conn: &Connection) -> bool {
+        match self.scope.as_deref() {
+            Some(s) if s == conn.secret_scope() => true,
+            None => conn.https,
+            Some(s) => conn.https && s == conn.legacy_secret_scope(),
+        }
     }
 }
 
@@ -118,6 +140,60 @@ pub struct GlobalSettings {
     pub temp_unit: TempUnit,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_secrets: Option<FallbackSecrets>,
+}
+
+/// Reads `obj[name]`, or the default (noting `name` in `bad`) when it is
+/// there but unreadable.
+fn field<T: DeserializeOwned + Default>(obj: &Value, name: &str, bad: &mut Vec<String>) -> T {
+    match obj.get(name) {
+        None | Some(Value::Null) => T::default(),
+        Some(v) => serde_json::from_value(v.clone()).unwrap_or_else(|_| {
+            bad.push(name.to_string());
+            T::default()
+        }),
+    }
+}
+
+impl GlobalSettings {
+    /// Reads OpenDeck's settings file field by field: one unreadable value
+    /// (say a hand-edited `"port": "5001"`) costs that value, not the whole
+    /// configuration - which the next save would otherwise overwrite with
+    /// defaults. Returns the names of the fields that were dropped.
+    pub fn from_value_lenient(v: &Value) -> (Self, Vec<String>) {
+        if let Ok(g) = serde_json::from_value(v.clone()) {
+            return (g, Vec::new());
+        }
+        let mut bad = Vec::new();
+        let c = v.get("connection").cloned().unwrap_or(Value::Null);
+        let d = Connection::default();
+        let mut conn_bad = Vec::new();
+        let connection = Connection {
+            host: field(&c, "host", &mut conn_bad),
+            port: match c.get("port") {
+                None | Some(Value::Null) => d.port,
+                Some(p) => serde_json::from_value(p.clone()).unwrap_or_else(|_| {
+                    conn_bad.push("port".into());
+                    d.port
+                }),
+            },
+            https: match c.get("https") {
+                None | Some(Value::Null) => d.https,
+                Some(h) => h.as_bool().unwrap_or_else(|| {
+                    conn_bad.push("https".into());
+                    d.https
+                }),
+            },
+            account: field(&c, "account", &mut conn_bad),
+            pinned_sha256: field(&c, "pinned_sha256", &mut conn_bad),
+        };
+        bad.extend(conn_bad.into_iter().map(|f| format!("connection.{f}")));
+        let g = GlobalSettings {
+            connection,
+            temp_unit: field(v, "temp_unit", &mut bad),
+            fallback_secrets: field(v, "fallback_secrets", &mut bad),
+        };
+        (g, bad)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -218,10 +294,45 @@ mod tests {
     }
 
     #[test]
-    fn secret_scope_uses_normalised_host_and_account() {
+    fn secret_scope_uses_normalised_account_scheme_host_and_port() {
         let mut c = conn("https://nas.lan:5001/", 5001, true);
         c.account = " jf ".into();
-        assert_eq!(c.secret_scope(), "jf@nas.lan");
+        assert_eq!(c.secret_scope(), "jf@https://nas.lan:5001");
+        assert_eq!(c.legacy_secret_scope(), "jf@nas.lan");
+        let http = conn("nas.lan", 5001, false);
+        assert_ne!(
+            http.secret_scope(),
+            c.secret_scope(),
+            "HTTP never shares HTTPS secrets"
+        );
+        let other_port = conn("nas.lan", 5002, true);
+        assert_ne!(other_port.secret_scope(), c.secret_scope());
+    }
+
+    #[test]
+    fn same_nas_means_same_scheme_host_and_port() {
+        let a = conn("nas.lan", 5001, true);
+        assert!(a.same_nas(&conn("https://nas.lan:5001/", 5001, true)));
+        assert!(!a.same_nas(&conn("nas.lan", 5002, true)));
+        assert!(!a.same_nas(&conn("nas.lan", 5001, false)));
+        assert!(!a.same_nas(&conn("other.lan", 5001, true)));
+    }
+
+    #[test]
+    fn one_unreadable_field_costs_only_that_field() {
+        let v = json!({
+            "connection": { "host": "nas.lan", "port": "5001x", "account": "jf", "pinned_sha256": "ab" },
+            "temp_unit": "kelvin",
+        });
+        let (g, bad) = GlobalSettings::from_value_lenient(&v);
+        assert_eq!(g.connection.host, "nas.lan");
+        assert_eq!(g.connection.account, "jf");
+        assert_eq!(g.connection.pinned_sha256.as_deref(), Some("ab"));
+        assert_eq!(g.connection.port, 5001, "the default");
+        assert_eq!(g.temp_unit, TempUnit::Celsius);
+        assert_eq!(bad, ["connection.port", "temp_unit"]);
+        let (_, bad) = GlobalSettings::from_value_lenient(&json!({}));
+        assert!(bad.is_empty());
     }
 
     #[test]
@@ -246,16 +357,26 @@ mod tests {
             (f.password.as_deref(), f.scope.as_deref()),
             (Some("pw"), None)
         );
-        assert!(
-            f.belongs_to("jf@nas.lan"),
-            "older files: the saved connection's"
-        );
-        let scoped = FallbackSecrets {
+        let https = conn("nas.lan", 5001, true);
+        let http = conn("nas.lan", 5000, false);
+        assert!(f.belongs_to(&https), "older files: the saved connection's");
+        assert!(!f.belongs_to(&http), "but never over plain HTTP");
+        let legacy = FallbackSecrets {
             scope: Some("jf@nas.lan".into()),
+            ..f.clone()
+        };
+        assert!(legacy.belongs_to(&https));
+        assert!(!legacy.belongs_to(&http));
+        assert!(!legacy.belongs_to(&conn("other.lan", 5001, true)));
+        let scoped = FallbackSecrets {
+            scope: Some(http.secret_scope()),
             ..f
         };
-        assert!(scoped.belongs_to("jf@nas.lan"));
-        assert!(!scoped.belongs_to("jf@other.lan"));
+        assert!(
+            scoped.belongs_to(&http),
+            "typed in for this HTTP connection"
+        );
+        assert!(!scoped.belongs_to(&https));
     }
 
     #[test]

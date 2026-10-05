@@ -1,32 +1,21 @@
 //! The catalogue: which metrics exist, which DSM endpoint feeds each, and
 //! their defaults.
 
-use std::time::Duration;
+pub use crate::dsm::endpoint::Endpoint;
+use serde::Serialize;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Endpoint {
-    Utilization,
-    SystemInfo,
-    Storage,
-    Update,
-}
-
-impl Endpoint {
-    pub const ALL: [Endpoint; 4] = [
-        Self::Utilization,
-        Self::SystemInfo,
-        Self::Storage,
-        Self::Update,
-    ];
-
-    pub fn default_interval(self) -> Duration {
-        Duration::from_secs(match self {
-            Self::Utilization => 5,
-            Self::SystemInfo => 30,
-            Self::Storage => 60,
-            Self::Update => 6 * 3600,
-        })
-    }
+/// Which per-key settings a metric has, for the settings panel - so the
+/// panel's controls come from the same catalogue as everything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Fields {
+    /// Label of the "which one" dropdown (disk, volume, interface...).
+    pub target: Option<&'static str>,
+    pub cpu_view: bool,
+    pub direction: bool,
+    pub amount: bool,
+    /// Unit of the warn/critical thresholds, if the metric has them.
+    pub threshold_unit: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -99,6 +88,52 @@ impl Metric {
         }
     }
 
+    pub fn fields(self) -> Fields {
+        let none = Fields::default();
+        match self {
+            Self::Cpu => Fields {
+                cpu_view: true,
+                threshold_unit: Some("%"),
+                ..none
+            },
+            Self::Ram => Fields {
+                amount: true,
+                threshold_unit: Some("%"),
+                ..none
+            },
+            Self::Network => Fields {
+                target: Some("Interface"),
+                direction: true,
+                threshold_unit: Some("MB/s"),
+                ..none
+            },
+            Self::SysTemp => Fields {
+                threshold_unit: Some("°C"),
+                ..none
+            },
+            Self::DiskTemp => Fields {
+                target: Some("Disk"),
+                threshold_unit: Some("°C"),
+                ..none
+            },
+            Self::DiskHealth => Fields {
+                target: Some("Disk"),
+                ..none
+            },
+            Self::Volume => Fields {
+                target: Some("Volume"),
+                amount: true,
+                threshold_unit: Some("%"),
+                ..none
+            },
+            Self::Pool => Fields {
+                target: Some("Pool"),
+                ..none
+            },
+            Self::Uptime | Self::Update => none,
+        }
+    }
+
     /// (warn, crit) for numeric metrics. Temperatures are in °C. `None` =
     /// state-based, or no thresholds unless the user sets some (network).
     pub fn default_thresholds(self) -> Option<(f64, f64)> {
@@ -141,11 +176,15 @@ mod tests {
     }
 
     #[test]
-    fn default_intervals_match_the_spec() {
-        assert_eq!(Endpoint::Utilization.default_interval().as_secs(), 5);
-        assert_eq!(Endpoint::SystemInfo.default_interval().as_secs(), 30);
-        assert_eq!(Endpoint::Storage.default_interval().as_secs(), 60);
-        assert_eq!(Endpoint::Update.default_interval().as_secs(), 6 * 3600);
+    fn metrics_with_thresholds_say_in_which_unit() {
+        for m in Metric::ALL {
+            if m.default_thresholds().is_some() {
+                assert!(m.fields().threshold_unit.is_some(), "{m:?}");
+            }
+        }
+        assert_eq!(Metric::Network.fields().threshold_unit, Some("MB/s"));
+        assert_eq!(Metric::Pool.fields().target, Some("Pool"));
+        assert_eq!(Metric::Update.fields(), Fields::default());
     }
 
     #[test]

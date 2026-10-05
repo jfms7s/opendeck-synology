@@ -2,6 +2,7 @@
 //! responses.
 
 pub mod api;
+pub mod endpoint;
 pub mod error;
 #[cfg(test)]
 pub mod fake;

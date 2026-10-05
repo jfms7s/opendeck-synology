@@ -1,27 +1,32 @@
 //! Which DSM web APIs we use, at which version, and where they live.
 //! `SYNO.API.Info` tells us, since paths and versions vary between releases.
 
+use crate::dsm::endpoint::Endpoint;
 use crate::dsm::error::DsmError;
 use crate::dsm::model::num;
 use crate::dsm::transport::Transport;
 use serde_json::Value;
 use std::collections::HashMap;
 
+/// The discovery API; its errors come before any login.
+pub const INFO: &str = "SYNO.API.Info";
 pub const AUTH: &str = "SYNO.API.Auth";
 pub const UTILIZATION: &str = "SYNO.Core.System.Utilization";
 pub const SYSTEM: &str = "SYNO.Core.System";
 pub const STORAGE: &str = "SYNO.Storage.CGI.Storage";
 pub const UPGRADE: &str = "SYNO.Core.Upgrade.Server";
 
-/// (api, version this plugin is written against). The version actually used
-/// is clamped into the range the NAS offers.
-const WANTED: [(&str, u64); 5] = [
-    (AUTH, 6),
-    (UTILIZATION, 1),
-    (SYSTEM, 1),
-    (STORAGE, 1),
-    (UPGRADE, 1),
-];
+/// The Auth version this plugin is written against.
+const AUTH_VERSION: u64 = 6;
+
+/// (api, version this plugin is written against): Auth plus one per data
+/// endpoint. The version actually used is clamped into the range the NAS
+/// offers.
+pub fn wanted() -> Vec<(&'static str, u64)> {
+    std::iter::once((AUTH, AUTH_VERSION))
+        .chain(Endpoint::ALL.map(|e| (e.api(), e.version())))
+        .collect()
+}
 
 /// Device tokens (2FA "remember this device") need Auth v6, i.e. DSM 7.
 const MIN_AUTH_VERSION: u64 = 6;
@@ -45,9 +50,13 @@ fn version_num(v: &Value) -> Option<u64> {
 }
 
 pub async fn discover(t: &dyn Transport) -> Result<ApiMap, DsmError> {
-    let names = WANTED.map(|(name, _)| name).join(",");
+    let names = wanted()
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(",");
     let form = [
-        ("api", "SYNO.API.Info"),
+        ("api", INFO),
         ("version", "1"),
         ("method", "query"),
         ("query", names.as_str()),
@@ -55,25 +64,31 @@ pub async fn discover(t: &dyn Transport) -> Result<ApiMap, DsmError> {
     match t.call("query.cgi", &form).await? {
         Ok(data) => parse_api_info(&data),
         Err(code) => Err(DsmError::Api {
-            api: "SYNO.API.Info".into(),
+            api: INFO.into(),
             code,
         }),
     }
 }
 
+/// One API's (path, min, max), if the entry is usable: both versions
+/// readable, `min <= max`, and small enough to send.
+fn entry(e: &Value) -> Option<(&str, u64, u64)> {
+    let path = e["path"].as_str()?;
+    let (min, max) = (
+        version_num(&e["minVersion"])?,
+        version_num(&e["maxVersion"])?,
+    );
+    (min <= max && u32::try_from(max).is_ok()).then_some((path, min, max))
+}
+
 pub fn parse_api_info(data: &Value) -> Result<ApiMap, DsmError> {
     let mut map = ApiMap::new();
-    for (name, wanted) in WANTED {
-        let e = &data[name];
-        let (Some(path), Some(min), Some(max)) = (
-            e["path"].as_str(),
-            version_num(&e["minVersion"]),
-            version_num(&e["maxVersion"]),
-        ) else {
+    for (name, wanted) in wanted() {
+        let Some((path, min, max)) = entry(&data[name]) else {
             if name == AUTH {
                 return Err(DsmError::Parse {
-                    api: "SYNO.API.Info".into(),
-                    detail: "the NAS offers no SYNO.API.Auth".into(),
+                    api: INFO.into(),
+                    detail: "the NAS offers no usable SYNO.API.Auth".into(),
                 });
             }
             continue; // that endpoint's keys will show the error when polled
@@ -86,11 +101,12 @@ pub fn parse_api_info(data: &Value) -> Result<ApiMap, DsmError> {
                 ),
             });
         }
+        let version = u32::try_from(wanted.clamp(min, max)).expect("max fits in u32, see entry()");
         map.insert(
             name.to_string(),
             ApiInfo {
                 path: path.to_string(),
-                version: wanted.clamp(min, max) as u32,
+                version,
             },
         );
     }
@@ -154,16 +170,50 @@ mod tests {
     }
 
     #[test]
-    fn recorded_api_info_parses() {
+    fn an_inverted_version_range_is_treated_as_missing_not_a_panic() {
+        let mut v = info();
+        v[UTILIZATION]["minVersion"] = json!(3);
+        v[UTILIZATION]["maxVersion"] = json!(1);
+        let map = parse_api_info(&v).unwrap();
+        assert!(!map.contains_key(UTILIZATION));
+        let mut v = info();
+        v[AUTH]["minVersion"] = json!(9);
+        assert!(parse_api_info(&v).is_err(), "no usable SYNO.API.Auth");
+    }
+
+    #[test]
+    fn a_version_beyond_u32_is_refused_rather_than_truncated() {
+        let mut v = info();
+        v[UTILIZATION]["minVersion"] = json!(4_294_967_297_u64);
+        v[UTILIZATION]["maxVersion"] = json!(4_294_967_297_u64);
+        assert!(!parse_api_info(&v).unwrap().contains_key(UTILIZATION));
+    }
+
+    /// The real `SYNO.API.Info` answer (see `model::tests::recorded`).
+    #[test]
+    fn recorded_api_info_offers_every_api() {
         let path = format!(
             "{}/tests/fixtures/real/api_info.json",
             env!("CARGO_MANIFEST_DIR")
         );
         let Ok(raw) = std::fs::read_to_string(&path) else {
+            assert!(
+                std::env::var_os("REQUIRE_REAL_FIXTURES").is_none(),
+                "{path} missing and REQUIRE_REAL_FIXTURES is set"
+            );
             eprintln!("skipping: api_info.json not recorded");
             return;
         };
         let map = parse_api_info(&serde_json::from_str(&raw).unwrap()).unwrap();
-        assert!(map.contains_key(AUTH));
+        for (api, _) in wanted() {
+            assert!(map.contains_key(api), "{api}");
+        }
+        assert!(map[AUTH].version >= 6);
+    }
+
+    #[test]
+    fn the_fake_nas_offers_what_we_want() {
+        let map = parse_api_info(&crate::dsm::fake::api_info()).unwrap();
+        assert_eq!(map.len(), wanted().len());
     }
 }

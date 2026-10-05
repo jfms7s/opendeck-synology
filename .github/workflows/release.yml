@@ -1,37 +1,87 @@
+# Pushing a version tag (vX.Y.Z, matching Cargo.toml and manifest.json)
+# checks, builds and creates a *draft* release with the bundle and its
+# SHA256SUMS attached. Review the draft and publish it by hand: a release is
+# never visible without its asset.
 name: Release
 on:
-  release:
-    types: [published]
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  verify:
+    runs-on: ubuntu-24.04
     permissions:
-      contents: write
-    runs-on: ubuntu-latest
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - run: node build.mjs --check-version --tag "$GITHUB_REF_NAME"
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: 1.98.1
           targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
-      - name: Install cross-compilation linker (aarch64)
+      - name: Install the aarch64 linker and emulator
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-      - run: cargo build --release --target x86_64-unknown-linux-gnu
-      - run: cargo build --release --target aarch64-unknown-linux-gnu
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - run: node build.mjs x86_64-unknown-linux-gnu
-      - name: Assemble a universal bundle (both architectures, one manifest)
+      - run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+      - run: cargo build --release --locked --target aarch64-unknown-linux-gnu
+      - name: Start each binary once
         run: |
-          cp target/aarch64-unknown-linux-gnu/release/opendeck-synology \
-             dist/com.jfms7s.synology.sdPlugin/opendeck-synology-aarch64-unknown-linux-gnu
-      - name: Zip the plugin bundle
-        run: |
-          cd dist
-          zip -r ../opendeck-synology.streamDeckPlugin com.jfms7s.synology.sdPlugin
-      - uses: softprops/action-gh-release@v2
+          target/x86_64-unknown-linux-gnu/release/opendeck-synology --version
+          qemu-aarch64 -L /usr/aarch64-linux-gnu target/aarch64-unknown-linux-gnu/release/opendeck-synology --version
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          files: opendeck-synology.streamDeckPlugin
+          node-version: 24
+      - run: node build.mjs --require-all --tag "$GITHUB_REF_NAME"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bundle
+          path: |
+            dist/opendeck-synology.streamDeckPlugin
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  # The only job that can write to the repository, and it runs no build.
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bundle
+          path: dist
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          draft: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/opendeck-synology.streamDeckPlugin
+            dist/SHA256SUMS

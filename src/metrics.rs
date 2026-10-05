@@ -107,22 +107,27 @@ fn connection_reading(metric: Metric, status: &ConnStatus) -> Option<Reading> {
         }
         ConnStatus::Auth(_) => ("Login", "Check settings", Level::Error),
         ConnStatus::Certificate { .. } => ("Cert", "Check settings", Level::Error),
-        _ => return None,
+        ConnStatus::Keyring(_) => ("Keyring", "Open settings", Level::Error),
+        ConnStatus::Connecting | ConnStatus::Connected { .. } | ConnStatus::Unreachable(_) => {
+            return None;
+        }
     };
     Some(Reading::new(metric, value, level).subject(subject))
 }
 
+/// A poll's error. One about the connection (credentials, certificate,
+/// settings) reads exactly like the connection status it implies; only
+/// errors about this endpoint have their own wording.
 fn error_reading(metric: Metric, e: &DsmError) -> Reading {
+    if let Some(r) = ConnStatus::from_error(e).and_then(|s| connection_reading(metric, &s)) {
+        return r;
+    }
     let (value, subject) = match e {
-        DsmError::NotConfigured => ("Set up", "Open settings".to_string()),
-        DsmError::Transport(_) => ("Offline", String::new()),
-        DsmError::Auth(_) => ("Login", "Check settings".to_string()),
-        DsmError::CertificateNotTrusted { .. } | DsmError::CertificateChanged { .. } => {
-            ("Cert", "Check settings".to_string())
-        }
         DsmError::Permission { .. } => ("Denied", "No permission".to_string()),
         DsmError::Api { code, .. } => ("Error", format!("DSM {code}")),
         DsmError::Parse { .. } => ("Error", "Bad data".to_string()),
+        // Transport, and anything connection-level not drawn above.
+        _ => ("Offline", String::new()),
     };
     Reading::new(metric, value, Level::Error).subject(subject)
 }
@@ -178,14 +183,19 @@ fn cpu(u: &Utilization, v: &ActionSettings) -> Reading {
     let Some(value) = value else {
         return missing(Metric::Cpu, subject).pager(pager.0, pager.1);
     };
-    Reading::new(
-        Metric::Cpu,
-        value,
-        level_for(c.total_pct, thresholds(Metric::Cpu, v)),
-    )
-    .subject(subject)
-    .bar(c.total_pct)
-    .pager(pager.0, pager.1)
+    let r = Reading::new(Metric::Cpu, value, Level::Normal)
+        .subject(subject)
+        .pager(pager.0, pager.1);
+    // The thresholds and the bar are about CPU %; a load average has no
+    // 0-100 scale, so the load views show the number alone.
+    match v.cpu_view {
+        CpuView::Total => Reading {
+            level: level_for(c.total_pct, thresholds(Metric::Cpu, v)),
+            ..r
+        }
+        .bar(c.total_pct),
+        CpuView::Load1 | CpuView::Load5 | CpuView::Load15 => r,
+    }
 }
 
 fn ram(u: &Utilization, v: &ActionSettings) -> Reading {
@@ -398,11 +408,15 @@ fn volume(s: &Storage, v: &ActionSettings) -> Reading {
             }
         },
     };
-    let pct = if vol.total_bytes == 0 {
-        0.0
-    } else {
-        vol.used_bytes as f64 / vol.total_bytes as f64 * 100.0
-    };
+    // No size yet (a volume being created, a crashed one): a zero must never
+    // stand in for missing data.
+    if vol.total_bytes == 0 {
+        let subject = format!("{} · {}", vol.name, capitalize(&vol.status));
+        return Reading::new(Metric::Volume, "N/A", state_level(&vol.status))
+            .subject(subject)
+            .pager(pos, count);
+    }
+    let pct = vol.used_bytes as f64 / vol.total_bytes as f64 * 100.0;
     let value = match v.amount {
         Amount::Percent => format::percent(pct),
         Amount::Used => format::used_of_total(vol.used_bytes, vol.total_bytes),
@@ -529,14 +543,11 @@ pub fn target_options(metric: Metric, p: &Payload) -> Vec<(Option<String>, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dsm::fake::fixture;
     use crate::dsm::model::{parse_storage, parse_system_info, parse_update, parse_utilization};
     use serde_json::{Value, json};
     use std::sync::Arc;
 
-    fn fixture(name: &str) -> Value {
-        let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
-        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
-    }
     fn util() -> Payload {
         Payload::Utilization(parse_utilization(&fixture("utilization.json")).unwrap())
     }
@@ -593,6 +604,22 @@ mod tests {
         assert_eq!(
             (r.value.as_str(), r.subject.as_str(), r.pager),
             ("0.42", "Load 1 min", Some((1, 4)))
+        );
+    }
+
+    #[test]
+    fn a_load_view_is_not_coloured_by_cpu_percent() {
+        // 37 % is over a 10 % warn threshold, but the key shows a load
+        // average, which the % thresholds don't apply to.
+        let v = ActionSettings {
+            cpu_view: CpuView::Load5,
+            warn: Some(10.0),
+            ..view()
+        };
+        let r = read_as(Metric::Cpu, util(), &v);
+        assert_eq!(
+            (r.value.as_str(), r.level, r.bar),
+            ("0.38", Level::Normal, None)
         );
     }
 
@@ -799,6 +826,68 @@ mod tests {
     }
 
     #[test]
+    fn a_volume_without_a_size_shows_na_not_zero() {
+        let Payload::Storage(mut s) = storage("storage.json") else {
+            unreachable!()
+        };
+        s.volumes[0].total_bytes = 0;
+        s.volumes[0].status = "creating".into();
+        let r = read_as(Metric::Volume, Payload::Storage(s), &view());
+        assert_eq!(
+            (r.value.as_str(), r.subject.as_str(), r.level, r.bar),
+            ("N/A", "Volume 1 · Creating", Level::Warn, None)
+        );
+    }
+
+    fn disk(id: &str, smart: &str, status: &str) -> Disk {
+        Disk {
+            id: id.into(),
+            name: format!("Drive {id}"),
+            temp_c: None,
+            smart_status: smart.into(),
+            status: status.into(),
+        }
+    }
+
+    #[test]
+    fn unknown_disk_words_are_a_warning_not_ok() {
+        assert_eq!(
+            disk_level(&disk("1", "something_new", "normal")),
+            Level::Warn
+        );
+        assert_eq!(
+            disk_level(&disk("1", "normal", "something_new")),
+            Level::Warn
+        );
+        assert_eq!(
+            disk_level(&disk("1", "normal", "initialized")),
+            Level::Normal
+        );
+        assert_eq!(disk_level(&disk("1", "damage", "normal")), Level::Crit);
+        assert_eq!(
+            disk_level(&disk("1", "normal", "system_partition_failed")),
+            Level::Crit
+        );
+    }
+
+    #[test]
+    fn among_equally_bad_disks_the_first_is_named() {
+        let s = Storage {
+            disks: vec![
+                disk("1", "normal", "normal"),
+                disk("2", "failing", "normal"),
+                disk("3", "failing", "normal"),
+            ],
+            ..Storage::default()
+        };
+        let r = read_as(Metric::DiskHealth, Payload::Storage(s), &view());
+        assert_eq!(
+            (r.value.as_str(), r.subject.as_str()),
+            ("Failing", "Drive 2")
+        );
+    }
+
+    #[test]
     fn pool_states() {
         let r = read_as(Metric::Pool, storage("storage.json"), &view());
         assert_eq!(
@@ -818,6 +907,43 @@ mod tests {
         assert_eq!(
             (r.value.as_str(), r.level, r.bar),
             ("Rebuild 43%", Level::Warn, Some(43.0))
+        );
+    }
+
+    #[test]
+    fn dsm7_shaped_alarm_states_reach_the_keys() {
+        let degraded = || storage("dsm7/storage_degraded.json");
+        let r = read_as(Metric::DiskHealth, degraded(), &view());
+        assert_eq!(
+            (r.value.as_str(), r.subject.as_str(), r.level),
+            ("Failing", "Drive 2", Level::Crit)
+        );
+        let r = read_as(Metric::Pool, degraded(), &view());
+        assert_eq!(
+            (r.value.as_str(), r.level, r.bar),
+            ("Degraded", Level::Crit, None)
+        );
+        assert_eq!(
+            read_as(Metric::Volume, degraded(), &view()).level,
+            Level::Crit
+        );
+        let repairing = || storage("dsm7/storage_repairing.json");
+        let r = read_as(Metric::Pool, repairing(), &view());
+        assert_eq!(
+            (r.value.as_str(), r.level, r.bar),
+            ("Rebuild 43%", Level::Warn, Some(43.0))
+        );
+        let v = ActionSettings {
+            target: Some("reuse_2".into()),
+            ..view()
+        };
+        let r = read_as(Metric::Pool, repairing(), &v);
+        assert_eq!((r.value.as_str(), r.level), ("Check 7%", Level::Warn));
+        let p = Payload::Update(parse_update(&fixture("dsm7/update_available.json")).unwrap());
+        let r = read_as(Metric::Update, p, &view());
+        assert_eq!(
+            (r.value.as_str(), r.subject.as_str(), r.level),
+            ("Update", "DSM 7.4.2-80000", Level::Warn)
         );
     }
 
@@ -874,6 +1000,50 @@ mod tests {
             (r.value.as_str(), r.subject.as_str(), r.level),
             ("Denied", "No permission", Level::Error)
         );
+    }
+
+    #[test]
+    fn an_endpoint_error_about_the_connection_reads_like_the_connection_status() {
+        let status = connected();
+        let ctx = Context {
+            status: &status,
+            unit: TempUnit::Celsius,
+        };
+        // E.g. the poller saw "2FA needed" a moment before the status did.
+        for (e, want) in [
+            (DsmError::Auth(AuthError::NeedOtp), ("2FA", Level::Warn)),
+            (
+                DsmError::Auth(AuthError::BadCredentials),
+                ("Login", Level::Error),
+            ),
+            (DsmError::NotConfigured, ("Set up", Level::Normal)),
+        ] {
+            let st = PollState {
+                value: None,
+                error: Some(e.clone()),
+                failures: 1,
+            };
+            let r = read(Metric::Cpu, &st, &view(), &ctx);
+            assert_eq!(
+                (r.value.as_str(), r.level),
+                want,
+                "{e:?} must match connection_reading"
+            );
+            let as_status = ConnStatus::from_error(&e).unwrap();
+            let r2 = connection_reading(Metric::Cpu, &as_status).unwrap();
+            assert_eq!(r, r2);
+        }
+    }
+
+    #[test]
+    fn an_unreadable_keyring_shows_on_every_key() {
+        let status = ConnStatus::Keyring("locked".into());
+        let ctx = Context {
+            status: &status,
+            unit: TempUnit::Celsius,
+        };
+        let r = read(Metric::Cpu, &state(util()), &view(), &ctx);
+        assert_eq!((r.value.as_str(), r.level), ("Keyring", Level::Error));
     }
 
     #[test]

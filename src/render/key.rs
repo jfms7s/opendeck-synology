@@ -46,7 +46,7 @@ fn text_line(y: f64, size: f64, bold: bool, color: &str, content: &str) -> Strin
 
 pub fn key_svg(metric: Metric, r: &Reading) -> String {
     let bg = background(r.level);
-    let glyph = glyphs::paths(metric);
+    let glyph = glyphs::placed(metric, 6, 6, 20);
     let title = format!(
         r#"<text x="30" y="21" font-family="sans-serif" font-size="14" font-weight="600" fill="{MUTED}">{}</text>"#,
         escape_xml(r.title)
@@ -62,7 +62,7 @@ pub fn key_svg(metric: Metric, r: &Reading) -> String {
         String::new()
     };
     format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="{bg}"/><svg x="6" y="6" width="20" height="20" viewBox="0 0 24 24"><g fill="none" stroke="{TEXT}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">{glyph}</g></svg>{title}{value}{subject}{badge}</svg>"#
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="{bg}"/>{glyph}{title}{value}{subject}{badge}</svg>"#
     )
 }
 

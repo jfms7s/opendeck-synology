@@ -10,7 +10,10 @@
 		.field > button {
 			align-self: flex-start;
 		}
-		#http-warning {
+		#http-warning,
+		#storage-warning,
+		#cert-changed,
+		#notice {
 			color: var(--pi-warn);
 		}
 	</style>
@@ -37,12 +40,14 @@
 				<label for="password">Password</label>
 				<input id="password" type="password" autocomplete="current-password" />
 				<p class="hint" id="password-hint"></p>
+				<p class="hint" id="storage-warning"></p>
 			</div>
 			<div class="field">
 				<label class="check"><input type="checkbox" id="https" /> HTTPS</label>
-				<p class="hint hidden" id="http-warning">Unencrypted: your password crosses the network in the clear.</p>
+				<p class="hint hidden" id="http-warning">Unencrypted: the password you type crosses the network in the clear at every sign-in. A password saved for HTTPS is never reused here, and with 2FA a code is asked for at every sign-in, since this computer can't be remembered without HTTPS.</p>
 			</div>
 			<button id="save" class="primary">Save and connect</button>
+			<p class="hint" id="notice" role="status"></p>
 		</section>
 
 		<section class="card">
@@ -57,6 +62,7 @@
 				<p class="hint">From your authenticator app. DSM then remembers this device (Personal › Security › Trusted devices), so you won't be asked again.</p>
 			</div>
 			<div id="cert-box" class="field hidden">
+				<p class="hint hidden" id="cert-changed"><strong>The NAS's certificate changed since you trusted it.</strong> If you didn't replace it in DSM, someone may be intercepting the connection: don't trust it until you have checked it on the NAS itself.</p>
 				<span class="label">Certificate fingerprint (SHA-256)</span>
 				<p class="mono" id="fingerprint"></p>
 				<p class="hint">The certificate the NAS presented. Compare it with DSM › Control Panel › Security › Certificate before trusting it.</p>
@@ -130,19 +136,6 @@
 		});
 
 		const $ = (id) => document.getElementById(id);
-		// Which fields each action shows, keyed by the last part of its UUID.
-		const FIELDS = {
-			cpu: { cpu: true, thresholds: "%" },
-			ram: { amount: true, thresholds: "%" },
-			network: { target: "Interface", direction: true, thresholds: "MB/s" },
-			systemp: { thresholds: "°C" },
-			uptime: {},
-			disktemp: { target: "Disk", thresholds: "°C" },
-			diskhealth: { target: "Disk" },
-			volume: { target: "Volume", amount: true, thresholds: "%" },
-			pool: { target: "Pool" },
-			update: {},
-		};
 		let websocket;
 		let uuid;
 		let action;
@@ -156,15 +149,6 @@
 			uuid = inUUID;
 			const actionInfo = JSON.parse(inActionInfo);
 			action = actionInfo.action;
-			const fields = FIELDS[action.split(".").pop()] || {};
-			$("target-field").classList.toggle("hidden", !fields.target);
-			$("target-label").textContent = fields.target || "Show";
-			$("cpu-field").classList.toggle("hidden", !fields.cpu);
-			$("direction-field").classList.toggle("hidden", !fields.direction);
-			$("amount-field").classList.toggle("hidden", !fields.amount);
-			$("threshold-field").classList.toggle("hidden", !fields.thresholds);
-			$("warn-label").textContent = `Warn at (${fields.thresholds || ""})`;
-			$("crit-label").textContent = `Critical at (${fields.thresholds || ""})`;
 
 			websocket = new WebSocket(`ws://127.0.0.1:${inPort}`);
 			websocket.onopen = () => {
@@ -185,6 +169,18 @@
 				}
 			};
 		});
+
+		// Which of "This key"'s controls apply: the plugin says, per action.
+		function applyFields(fields) {
+			$("target-field").classList.toggle("hidden", !fields.target);
+			$("target-label").textContent = fields.target || "Show";
+			$("cpu-field").classList.toggle("hidden", !fields.cpuView);
+			$("direction-field").classList.toggle("hidden", !fields.direction);
+			$("amount-field").classList.toggle("hidden", !fields.amount);
+			$("threshold-field").classList.toggle("hidden", !fields.thresholdUnit);
+			$("warn-label").textContent = `Warn at (${fields.thresholdUnit || ""})`;
+			$("crit-label").textContent = `Critical at (${fields.thresholdUnit || ""})`;
+		}
 
 		function toPlugin(payload) {
 			websocket.send(JSON.stringify({ event: "sendToPlugin", action, context: uuid, payload }));
@@ -227,16 +223,36 @@
 				$("https").checked = st.connection.https;
 				$("temp-unit").value = st.tempUnit;
 			}
+			applyFields(st.fields || {});
 			$("http-warning").classList.toggle("hidden", $("https").checked);
-			$("password").placeholder = st.hasPassword ? "•••••••• (in the system keyring)" : "";
+			// Say where the password really is - never claim a keyring the
+			// plugin couldn't use.
+			const where = {
+				keyring: "saved in the system keyring",
+				settingsFile: "saved in OpenDeck's settings file",
+			}[st.passwordStorage];
+			$("password").placeholder = st.hasPassword ? `•••••••• (${where || "saved"})` : "";
 			$("password-hint").textContent = st.hasPassword ? "Leave empty to keep the saved password." : "";
+			const flatpakHint = st.flatpak
+				? " OpenDeck runs as a Flatpak, which can't reach the keyring until you allow it: flatpak override --user --talk-name=org.freedesktop.secrets me.amankhanna.opendeck - then restart OpenDeck and save the password again."
+				: "";
+			$("storage-warning").textContent =
+				st.passwordStorage === "settingsFile"
+					? "No system keyring could be used, so the password is stored unencrypted in OpenDeck's settings file. The 2FA device token is not stored at all: a code is asked for again after each restart." + flatpakHint
+					: st.status.kind === "keyring"
+						? "The system keyring can't be read right now; the plugin retries a few times. Unlock it, or type the password again to store it in OpenDeck's settings file instead." + flatpakHint
+						: "";
+			// A notice answers one request; the 2 s refreshes don't clear it.
+			if (st.notice) $("notice").textContent = st.notice;
 
 			const kind = st.status.kind;
-			$("status").textContent = st.status.text + (kind === "connected" && st.status.firmware ? ` · ${st.status.firmware}` : "");
-			$("status").classList.toggle("ok", kind === "connected");
-			$("status").classList.toggle("bad", ["auth", "certificate", "unreachable"].includes(kind));
+			$("status").textContent = st.status.text + (st.status.firmware ? ` · ${st.status.firmware}` : "");
+			$("status").classList.toggle("ok", st.status.severity === "ok");
+			$("status").classList.toggle("bad", st.status.severity === "bad");
 			$("otp-box").classList.toggle("hidden", kind !== "needOtp");
 			$("cert-box").classList.toggle("hidden", kind !== "certificate");
+			$("cert-changed").classList.toggle("hidden", !st.status.changed);
+			$("trust").textContent = st.status.changed ? "Trust the new certificate anyway" : "Trust this certificate";
 			$("fingerprint").textContent = st.status.fingerprint || "";
 
 			$("warn").placeholder = st.defaults.warn ?? "";
@@ -267,28 +283,45 @@
 		}
 
 		$("save").addEventListener("click", () => {
+			const port = $("port").value.trim() === "" ? ($("https").checked ? 5001 : 5000) : Number($("port").value);
+			if (!Number.isInteger(port) || port < 1 || port > 65535) {
+				// Keep what was typed (the password too) and say why.
+				$("notice").textContent = "The port must be a whole number from 1 to 65535.";
+				return;
+			}
 			toPlugin({
 				event: "saveConnection",
 				host: $("host").value.trim(),
-				port: Number($("port").value) || 5001,
+				port,
 				https: $("https").checked,
 				account: $("account").value.trim(),
 				password: $("password").value || null,
 			});
 			$("password").value = "";
+			$("notice").textContent = "";
 		});
 		$("https").addEventListener("change", () => {
 			$("http-warning").classList.toggle("hidden", $("https").checked);
 			$("port").value = $("https").checked ? 5001 : 5000;
 		});
 		$("submit-otp").addEventListener("click", () => {
-			toPlugin({ event: "submitOtp", code: $("otp").value });
+			const code = $("otp").value.replace(/\s/g, "");
+			// An empty or malformed code would only count as a failed sign-in.
+			if (!/^[0-9]{6,8}$/.test(code)) {
+				$("notice").textContent = "Enter the 6-digit code from your authenticator app.";
+				return;
+			}
+			toPlugin({ event: "submitOtp", code });
 			$("otp").value = "";
 		});
 		$("otp").addEventListener("keydown", (e) => {
 			if (e.key === "Enter") $("submit-otp").click();
 		});
-		$("trust").addEventListener("click", () => toPlugin({ event: "trustCertificate" }));
+		// Trust exactly the fingerprint on screen: if the NAS presents another
+		// one by now, the plugin pins nothing.
+		$("trust").addEventListener("click", () =>
+			toPlugin({ event: "trustCertificate", fingerprint: $("fingerprint").textContent }),
+		);
 		$("temp-unit").addEventListener("change", () => toPlugin({ event: "setTempUnit", unit: $("temp-unit").value }));
 
 		$("target").addEventListener("change", () => {

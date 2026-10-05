@@ -13,7 +13,7 @@ mod settings;
 mod status;
 
 use async_trait::async_trait;
-use dsm::transport::{HttpTransport, Transport};
+use dsm::transport::{HttpTransport, Target, Transport};
 use instances::Instances;
 use openaction::global_events::{
     DidReceiveGlobalSettingsEvent, GlobalEventHandler, set_global_event_handler,
@@ -21,7 +21,7 @@ use openaction::global_events::{
 use openaction::{OpenActionResult, run};
 use secrets::KeyringStore;
 use services::{Services, SettingsSink, TransportFactory};
-use settings::{Connection, GlobalSettings};
+use settings::GlobalSettings;
 use std::sync::Arc;
 
 /// Persists plugin-wide settings through OpenDeck.
@@ -50,23 +50,33 @@ impl GlobalEventHandler for GlobalEvents {
         &self,
         event: DidReceiveGlobalSettingsEvent,
     ) -> OpenActionResult<()> {
-        let settings = serde_json::from_value(event.payload.settings).unwrap_or_else(|e| {
-            log::warn!("unreadable plugin settings, starting from defaults: {e}");
-            GlobalSettings::default()
-        });
+        let (settings, unreadable) = GlobalSettings::from_value_lenient(&event.payload.settings);
+        if !unreadable.is_empty() {
+            log::warn!(
+                "unreadable plugin settings {unreadable:?}: using their defaults, keeping the rest"
+            );
+        }
         self.services.load_global(settings).await;
         Ok(())
     }
 }
 
-#[tokio::main]
+// Two workers are plenty for one NAS connection and a handful of keys;
+// keyring calls run on the blocking pool.
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> OpenActionResult<()> {
+    // A start-and-exit check that needs no OpenDeck (the release workflow
+    // runs the aarch64 build this way under emulation).
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     simplelog::SimpleLogger::init(log::LevelFilter::Info, simplelog::Config::default())
         .expect("logger init");
 
     let device_name = format!("OpenDeck-{}", gethostname::gethostname().to_string_lossy());
     let transports: TransportFactory =
-        Arc::new(|conn: &Connection| Ok(Arc::new(HttpTransport::new(conn)?) as Arc<dyn Transport>));
+        Arc::new(|t: &Target| Ok(Arc::new(HttpTransport::new(t)?) as Arc<dyn Transport>));
     let services = Services::new(
         Arc::new(KeyringStore),
         Arc::new(OpenDeckSettings),

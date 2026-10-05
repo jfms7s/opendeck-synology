@@ -17,6 +17,8 @@ pub enum ConnStatus {
         changed: bool,
     },
     Unreachable(String),
+    /// The keyring holds the password (or might) but can't be read now.
+    Keyring(String),
 }
 
 impl ConnStatus {
@@ -56,6 +58,7 @@ impl ConnStatus {
             Self::Certificate { changed: false, .. } => "Certificate not trusted".into(),
             Self::Certificate { changed: true, .. } => "Certificate changed".into(),
             Self::Unreachable(msg) => format!("Unreachable: {msg}"),
+            Self::Keyring(msg) => format!("Can't read the password from the system keyring: {msg}"),
         }
     }
 
@@ -69,6 +72,19 @@ impl ConnStatus {
             Self::Auth(_) => "auth",
             Self::Certificate { .. } => "certificate",
             Self::Unreachable(_) => "unreachable",
+            Self::Keyring(_) => "keyring",
+        }
+    }
+
+    /// How the settings panel colours the status line: "ok", "bad" or
+    /// "neutral" - decided here, next to the states, not in the panel.
+    pub fn severity(&self) -> &'static str {
+        match self {
+            Self::Connected { .. } => "ok",
+            Self::NotConfigured | Self::Connecting | Self::Auth(AuthError::NeedOtp) => "neutral",
+            Self::Auth(_) | Self::Certificate { .. } | Self::Unreachable(_) | Self::Keyring(_) => {
+                "bad"
+            }
         }
     }
 }
@@ -132,5 +148,18 @@ mod tests {
                 .describe()
                 .contains("blocked")
         );
+        assert_eq!(ConnStatus::Keyring("locked".into()).kind(), "keyring");
+    }
+
+    #[test]
+    fn severity_tells_the_panel_how_to_colour_the_status() {
+        let connected = ConnStatus::Connected {
+            account: "jf".into(),
+        };
+        assert_eq!(connected.severity(), "ok");
+        assert_eq!(ConnStatus::Auth(AuthError::NeedOtp).severity(), "neutral");
+        assert_eq!(ConnStatus::Auth(AuthError::BadOtp).severity(), "bad");
+        assert_eq!(ConnStatus::Keyring("x".into()).severity(), "bad");
+        assert_eq!(ConnStatus::Connecting.severity(), "neutral");
     }
 }
