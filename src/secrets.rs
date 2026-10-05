@@ -251,6 +251,17 @@ pub struct MemoryStore {
     unreadable: std::sync::atomic::AtomicBool,
     /// How long each write takes.
     write_delay: std::time::Duration,
+    /// While closed, reads wait (an access or unlock prompt nobody has
+    /// answered yet).
+    gate: Gate,
+}
+
+/// Holds keyring reads until opened.
+#[cfg(test)]
+#[derive(Default)]
+struct Gate {
+    closed: std::sync::Mutex<bool>,
+    opened: std::sync::Condvar,
 }
 
 #[cfg(test)]
@@ -275,6 +286,23 @@ impl MemoryStore {
             s.map.lock().unwrap().insert(k.to_string(), v.to_string());
         }
         s
+    }
+
+    /// A keyring that holds `entries` but whose reads wait until
+    /// `open_gate()` - like macOS waiting on its Keychain access prompt.
+    pub fn gated(entries: &[(&str, &str)]) -> Self {
+        let s = Self::default();
+        *s.gate.closed.lock().unwrap() = true;
+        for (k, v) in entries {
+            s.map.lock().unwrap().insert(k.to_string(), v.to_string());
+        }
+        s
+    }
+
+    /// Answers the prompt: waiting and later reads go through.
+    pub fn open_gate(&self) {
+        *self.gate.closed.lock().unwrap() = false;
+        self.gate.opened.notify_all();
     }
 
     pub fn set_readable(&self, readable: bool) {
@@ -306,6 +334,15 @@ impl SecretStore for MemoryStore {
         if self.unreadable.load(std::sync::atomic::Ordering::SeqCst) {
             return Err("org.freedesktop.secrets was not provided".into());
         }
+        // Bounded, so a failing test can't hang on a blocked reader thread
+        // (the runtime waits for blocking tasks when it shuts down).
+        let closed = self.gate.closed.lock().unwrap();
+        let (closed, _) = self
+            .gate
+            .opened
+            .wait_timeout_while(closed, std::time::Duration::from_secs(10), |c| *c)
+            .unwrap();
+        drop(closed);
         Ok(self.map.lock().unwrap().get(key).cloned())
     }
 
@@ -347,6 +384,19 @@ mod tests {
         assert_eq!(s.get("k"), Ok(Some("v".into())));
         s.set("k", None).unwrap();
         assert_eq!(s.get("k"), Ok(None));
+    }
+
+    #[test]
+    fn a_gated_store_holds_reads_until_opened() {
+        let s = Arc::new(MemoryStore::gated(&[("k", "v")]));
+        let reader = {
+            let s = s.clone();
+            std::thread::spawn(move || s.get("k"))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!reader.is_finished(), "the read waits for the gate");
+        s.open_gate();
+        assert_eq!(reader.join().unwrap(), Ok(Some("v".into())));
     }
 
     #[test]
