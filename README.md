@@ -44,10 +44,12 @@ first successful refresh.
    stored in the system keyring (GNOME Keyring / KWallet via Secret Service on Linux,
    the login Keychain on macOS), not in OpenDeck's settings file. The panel says where
    it actually is (see [Without a keyring](#without-a-keyring-flatpak)).
-   On macOS, the first time the plugin reads the Keychain it asks to use your
-   confidential information: choose **Always Allow**. Each new release is a new binary
-   (signed ad hoc, not by a registered developer), so the prompt comes back once after
-   every update.
+   On macOS, the build that saved a secret can read it back without asking. Each new
+   release is a new binary (signed ad hoc, not by a registered developer), so after an
+   update macOS asks once per saved secret - the password and, with 2FA, the device
+   token - whether `opendeck-synology` may use it: choose **Always Allow**. Until you
+   answer, the plugin waits: its keys don't update and its settings panel doesn't
+   respond. If you choose Deny, keys show `Keyring` and the plugin asks again later.
 3. **Self-signed certificate** (the DSM default): the panel shows the certificate's SHA-256
    fingerprint. Compare it with DSM › Control Panel › Security › Certificate, then
    **Trust this certificate**. Only that exact fingerprint is trusted: if the NAS presents
@@ -184,9 +186,13 @@ On a Mac (Apple Silicon), with the release bundle installed through OpenDeck:
 
 - [ ] `xattr -l` on the installed `opendeck-synology-aarch64-apple-darwin` shows no
       `com.apple.quarantine`.
-- [ ] Saving the connection shows the Keychain prompt. While it is unanswered, keys stay
-      responsive and show `Keyring`; after **Always Allow** they connect, and the panel
-      says the password is in the keyring.
+- [ ] On a fresh install, saving the connection stores the password in the Keychain
+      (note whether a prompt appears); the panel says the password is in the keyring.
+- [ ] Update path: build the plugin locally (`cargo build --release && node build.mjs`),
+      install that, save the connection, then install the draft over it and restart
+      OpenDeck. One Keychain prompt per saved secret appears; until it is answered the
+      keys don't update. After **Always Allow** they connect, and another restart shows
+      no prompt. (Record the prompt count and correct the setup notes if it differs.)
 - [ ] Keychain Access lists the password and device token under `com.jfms7s.synology`.
 - [ ] Self-signed certificate: trusting the fingerprint works as on Linux.
 - [ ] After a 2FA login, restarting OpenDeck reconnects without a code and without a

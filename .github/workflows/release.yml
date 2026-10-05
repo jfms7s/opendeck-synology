@@ -50,7 +50,8 @@ jobs:
         run: |
           bin=target/aarch64-apple-darwin/release/opendeck-synology
           file "$bin"
-          file "$bin" | grep -q 'Mach-O 64-bit executable arm64'
+          # macOS's file says "executable arm64", Linux's "arm64 executable".
+          file -b "$bin" | grep -Eq '^Mach-O 64-bit (arm64 executable|executable arm64)'
           # Apple Silicon kills unsigned binaries; the linker's ad-hoc
           # signature must survive `strip = true`.
           codesign --verify --verbose "$bin"
@@ -99,7 +100,8 @@ jobs:
           tar -xf macos-bin.tar -C target/aarch64-apple-darwin/release
           bin=target/aarch64-apple-darwin/release/opendeck-synology
           test -x "$bin"
-          file "$bin" | grep -q 'Mach-O 64-bit executable arm64'
+          # macOS's file says "executable arm64", Linux's "arm64 executable".
+          file -b "$bin" | grep -Eq '^Mach-O 64-bit (arm64 executable|executable arm64)'
       - run: node build.mjs --require-all --tag "$GITHUB_REF_NAME"
       - name: Check the bundle holds an executable macOS binary
         run: unzip -Z dist/opendeck-synology.streamDeckPlugin | grep -E '^-rwx.*opendeck-synology-aarch64-apple-darwin$'

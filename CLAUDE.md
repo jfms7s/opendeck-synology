@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Rust [OpenDeck](https://github.com/nekename/OpenDeck) plugin (Linux x86_64 + aarch64, on the `openaction` crate) showing live, read-only status of one Synology NAS running DSM 7 on Stream Deck keys and dials: ten actions (CPU, RAM, network, temperatures, disks, volumes, pools, uptime, DSM update). It signs in with 2FA (device token), pins self-signed certificates, and keeps secrets in the Secret Service keyring. The README is the user-facing spec and holds the manual smoke-test checklist.
+A Rust [OpenDeck](https://github.com/nekename/OpenDeck) plugin (Linux x86_64 + aarch64 and Apple Silicon macOS, on the `openaction` crate) showing live, read-only status of one Synology NAS running DSM 7 on Stream Deck keys and dials: ten actions (CPU, RAM, network, temperatures, disks, volumes, pools, uptime, DSM update). It signs in with 2FA (device token), pins self-signed certificates, and keeps secrets in the system keyring (Secret Service on Linux, the login Keychain on macOS). The README is the user-facing spec and holds the manual smoke-test checklist.
 
 ## Commands
 
@@ -27,6 +27,7 @@ REQUIRE_REAL_FIXTURES=1 cargo test recorded         # parsers vs. local real NAS
 - **One session, one connection epoch.** Every late callback (poll result, device token, firmware lookup) checks `Services::is_current(epoch)`; the poller's `generation` guards its own state. Log the old session out only after the pollers moved off it.
 - **No secret in a URL, a log line or `Debug` output.** All DSM parameters go in the POST body; settings-panel payloads are never logged; `Credentials` and `FallbackSecrets` redact `Debug`; error text drops URLs.
 - **Secrets are scoped to account + scheme + host + port** (`Connection::secret_scope`). A secret saved for HTTPS is never sent over HTTP; over HTTP no device token is sent or stored. Without a keyring the password may go to the settings file (the panel must say so), the device token never does.
+- **Keep `keyring`'s `apple-native` feature.** keyring enables backends per OS; without it a macOS build silently uses an in-memory mock store and loses every secret.
 - **Certificates:** trust only the fingerprint the user saw (`trust_certificate(fp)`); never add an "accept any certificate" path. Redirects are never followed.
 - **No zero for missing data**: an absent field shows `N/A`/`Missing`, unknown DSM state words count as a warning.
 - Version lives in `Cargo.toml`, `Cargo.lock` and `assets/manifest.json`; `build.mjs` refuses a mismatch. Releases: push a `vX.Y.Z` tag → draft release with bundle + `SHA256SUMS` → publish by hand after the smoke checklist.
@@ -36,5 +37,5 @@ REQUIRE_REAL_FIXTURES=1 cargo test recorded         # parsers vs. local real NAS
 
 - Conventional Commits; PRs squash-merged to `master`; CI actions are pinned to commit SHAs.
 - Project docs (specs, plans, reviews, issues) live in the Obsidian vault at `~/git/obsidian-vault/personal/projects/opendeck-synology/`, not in this repo; follow the vault's `CLAUDE.md`.
-- Behaviour bugs get a failing test first (fake NAS: `dsm::fake::FakeDsm`, fake keyring: `secrets::MemoryStore`; never the real keyring or a real NAS in tests).
+- Behaviour bugs get a failing test first (fake NAS: `dsm::fake::FakeDsm`, fake keyring: `secrets::MemoryStore`; never the real keyring or a real NAS in tests). The one exception is the `#[ignore]`d `keyring_round_trip`, which CI runs on its throwaway macOS runner to prove secrets really persist.
 - User-visible changes go in the README (actions, setup, smoke-test checklist).

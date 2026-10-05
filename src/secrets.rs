@@ -249,7 +249,7 @@ pub struct MemoryStore {
     map: std::sync::Mutex<std::collections::HashMap<String, String>>,
     broken: bool,
     /// Reads fail while set (Secret Service not up yet, a locked collection,
-    /// an unanswered Keychain prompt).
+    /// a denied Keychain prompt).
     unreadable: std::sync::atomic::AtomicBool,
     /// How long each write takes.
     write_delay: std::time::Duration,
@@ -267,7 +267,7 @@ impl MemoryStore {
 
     /// A keyring that holds `entries` but can't be read until
     /// `set_readable(true)` (Secret Service not on D-Bus yet, a locked
-    /// collection, an unanswered Keychain prompt).
+    /// collection, a denied Keychain prompt).
     pub fn unreadable(entries: &[(&str, &str)]) -> Self {
         let s = Self {
             unreadable: true.into(),
