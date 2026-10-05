@@ -24,7 +24,10 @@ reqwest = { version = "0.13.5", default-features = false, features = ["rustls", 
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-native-certs = "0.8"
 sha2 = "0.10"
-keyring = { version = "3.6", default-features = false, features = ["async-secret-service", "tokio", "crypto-rust"] }
+# keyring enables each backend only on its own OS: Secret Service on Linux,
+# the Keychain on macOS. Without a backend for the OS it silently falls back
+# to an in-memory mock store.
+keyring = { version = "3.6", default-features = false, features = ["apple-native", "async-secret-service", "tokio", "crypto-rust"] }
 gethostname = "1"
 
 [dev-dependencies]

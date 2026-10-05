@@ -1,5 +1,6 @@
 //! Where the password and the 2FA device token live: the system keyring
-//! (Secret Service), keeping them out of OpenDeck's plain-JSON settings file.
+//! (Secret Service on Linux, the login Keychain on macOS), keeping them out
+//! of OpenDeck's plain-JSON settings file.
 //!
 //! `Vault` adds the fallbacks for a machine without a usable keyring (e.g.
 //! OpenDeck as a Flatpak without access to it): the password goes to the
@@ -247,7 +248,8 @@ impl SecretStore for KeyringStore {
 pub struct MemoryStore {
     map: std::sync::Mutex<std::collections::HashMap<String, String>>,
     broken: bool,
-    /// Reads fail while set (Secret Service not up yet, a locked collection).
+    /// Reads fail while set (Secret Service not up yet, a locked collection,
+    /// an unanswered Keychain prompt).
     unreadable: std::sync::atomic::AtomicBool,
     /// How long each write takes.
     write_delay: std::time::Duration,
@@ -265,7 +267,7 @@ impl MemoryStore {
 
     /// A keyring that holds `entries` but can't be read until
     /// `set_readable(true)` (Secret Service not on D-Bus yet, a locked
-    /// collection).
+    /// collection, an unanswered Keychain prompt).
     pub fn unreadable(entries: &[(&str, &str)]) -> Self {
         let s = Self {
             unreadable: true.into(),
@@ -356,7 +358,8 @@ mod tests {
         assert!(s.set("k", Some("v")).is_err());
     }
 
-    /// Talks to the real Secret Service. Run by hand on a desktop session:
+    /// Talks to the real system keyring (Secret Service or the Keychain).
+    /// CI runs it on macOS; on Linux, run it by hand in a desktop session:
     /// `cargo test keyring_round_trip -- --ignored`
     #[test]
     #[ignore]
