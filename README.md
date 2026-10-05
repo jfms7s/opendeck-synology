@@ -48,8 +48,8 @@ first successful refresh.
    release is a new binary (signed ad hoc, not by a registered developer), so after an
    update macOS asks once per saved secret - the password and, with 2FA, the device
    token - whether `opendeck-synology` may use it: choose **Always Allow**. Until you
-   answer, the plugin waits: its keys don't update and its settings panel doesn't
-   respond. If you choose Deny, keys show `Keyring` and the plugin asks again later.
+   answer, keys show `Keyring` / `Allow access` and the settings panel keeps
+   responding. If you choose Deny, keys show `Keyring` and the plugin asks again later.
 3. **Self-signed certificate** (the DSM default): the panel shows the certificate's SHA-256
    fingerprint. Compare it with DSM › Control Panel › Security › Certificate, then
    **Trust this certificate**. Only that exact fingerprint is trusted: if the NAS presents
@@ -195,9 +195,9 @@ On a Mac (Apple Silicon), with the release bundle installed through OpenDeck:
       (note whether a prompt appears); the panel says the password is in the keyring.
 - [ ] Update path: build the plugin locally (`cargo build --release && node build.mjs`),
       install that, save the connection, then install the draft over it and restart
-      OpenDeck. One Keychain prompt per saved secret appears; until it is answered the
-      keys don't update. After **Always Allow** they connect, and another restart shows
-      no prompt. (Record the prompt count and correct the setup notes if it differs.)
+      OpenDeck. One Keychain prompt per saved secret appears; until it is answered keys
+      show `Keyring` / `Allow access` and the settings panel still opens. After **Always
+      Allow** they connect, and another restart shows no prompt. (Record the prompt count and correct the setup notes if it differs.)
 - [ ] Keychain Access lists the password and device token under `com.jfms7s.synology`.
 - [ ] Self-signed certificate: trusting the fingerprint works as on Linux.
 - [ ] After a 2FA login, restarting OpenDeck reconnects without a code and without a
