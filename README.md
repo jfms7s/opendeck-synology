@@ -41,9 +41,15 @@ first successful refresh.
 1. Add any Synology action and open its settings.
 2. Enter the NAS's host or IP address, the port (5001 for HTTPS), your DSM account and
    password, then **Save and connect**. These are shared by every key; the password is
-   stored in the system keyring (GNOME Keyring / KWallet via Secret Service), not in
-   OpenDeck's settings file. The panel says where it actually is (see
-   [Without a keyring](#without-a-keyring-flatpak)).
+   stored in the system keyring (GNOME Keyring / KWallet via Secret Service on Linux,
+   the login Keychain on macOS), not in OpenDeck's settings file. The panel says where
+   it actually is (see [Without a keyring](#without-a-keyring-flatpak)).
+   On macOS, the build that saved a secret can read it back without asking. Each new
+   release is a new binary (signed ad hoc, not by a registered developer), so after an
+   update macOS asks once per saved secret - the password and, with 2FA, the device
+   token - whether `opendeck-synology` may use it: choose **Always Allow**. Until you
+   answer, keys show `Keyring` / `Allow access` and the settings panel keeps
+   responding. If you choose Deny, keys show `Keyring` and the plugin asks again later.
 3. **Self-signed certificate** (the DSM default): the panel shows the certificate's SHA-256
    fingerprint. Compare it with DSM › Control Panel › Security › Certificate, then
    **Trust this certificate**. Only that exact fingerprint is trusted: if the NAS presents
@@ -78,8 +84,8 @@ device token sniffed off the network would get past 2FA).
 
 ### Without a keyring (Flatpak)
 
-If no Secret Service keyring can be used - most often because OpenDeck runs as a
-**Flatpak**, which can't reach it unless allowed - the password is kept in OpenDeck's
+On Linux, if no Secret Service keyring can be used - most often because OpenDeck runs
+as a **Flatpak**, which can't reach it unless allowed - the password is kept in OpenDeck's
 settings file instead, and the panel says so. The 2FA device token is then only kept in
 memory, so a code is asked for again after each OpenDeck restart. To let the Flatpak use
 the keyring:
@@ -105,9 +111,18 @@ nothing secret is written to the log.
 
 Download the latest `.streamDeckPlugin` and `SHA256SUMS` from
 [Releases](https://github.com/jfms7s/opendeck-synology/releases) and check the download
-with `sha256sum -c SHA256SUMS`. Then either double-click it (if your file manager
-associates the extension with OpenDeck) or unzip it into `~/.config/opendeck/plugins/`
-and restart OpenDeck. The bundle runs on Linux x86_64 and aarch64.
+with `sha256sum -c SHA256SUMS` (on macOS: `shasum -a 256 -c SHA256SUMS`). Then either
+double-click it (if your file manager associates the extension with OpenDeck) or unzip
+it into OpenDeck's plugin folder - `~/.config/opendeck/plugins/` on Linux,
+`~/Library/Application Support/opendeck/plugins/` on macOS - and restart OpenDeck. The
+bundle runs on Linux x86_64 and aarch64 and on macOS with Apple Silicon.
+
+On macOS, a bundle unzipped by hand (e.g. in Finder) is marked as downloaded and
+Gatekeeper refuses to start the binary. Clear the mark once:
+
+```bash
+xattr -dr com.apple.quarantine ~/Library/Application\ Support/opendeck/plugins/com.jfms7s.synology.sdPlugin
+```
 
 ## Development
 
@@ -116,7 +131,7 @@ cargo fmt --check                                  # the same checks CI runs
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked                                # unit tests, no NAS needed
 cargo build --release --locked && node build.mjs   # dist/opendeck-synology.streamDeckPlugin
-cargo test keyring_round_trip -- --ignored         # check the system keyring works
+cargo test keyring_round_trip -- --ignored         # check the system keyring works (CI does this on macOS)
 scripts/render-icons.sh                            # regenerate icons (needs ImageMagick 7)
 
 # Record redacted responses from a real NAS into tests/fixtures/real/ (git-ignored).
@@ -128,8 +143,8 @@ REQUIRE_REAL_FIXTURES=1 cargo test recorded        # then check the parsers agai
 The toolchain is pinned in CI (`rust-version` in `Cargo.toml` is the oldest supported
 Rust). Releases: bump the version in `Cargo.toml`, `Cargo.lock` and
 `assets/manifest.json`, then push a `vX.Y.Z` tag; the Release workflow checks, builds both
-architectures and creates a **draft** release with the bundle and `SHA256SUMS`, which you
-publish after a look.
+Linux architectures and the macOS one, and creates a **draft** release with the bundle
+and `SHA256SUMS`, which you publish after a look.
 
 ## Manual smoke-test checklist
 
@@ -159,8 +174,9 @@ self-signed certificate can't pass against a NAS with a publicly trusted one.
       keys show `Cert` and the panel warns that the certificate changed before offering
       to trust the new fingerprint.
 - [ ] Switching °C/°F redraws temperature keys immediately.
-- [ ] `~/.config/opendeck/` contains no password (grep for it), unless the panel says the
-      password is in OpenDeck's settings file.
+- [ ] OpenDeck's config folder (`~/.config/opendeck/`, or
+      `~/Library/Application Support/opendeck/` on macOS) contains no password (grep for
+      it), unless the panel says the password is in OpenDeck's settings file.
 - [ ] Unticking HTTPS and saving with an empty password field asks for the password
       instead of connecting.
 - [ ] An out-of-range port (e.g. 70000) shows an error and keeps what was typed.
@@ -170,6 +186,23 @@ self-signed certificate can't pass against a NAS with a publicly trusted one.
       Resource Monitor › Connections) lists at most one `OpenDeck` session for the account.
 - [ ] The settings panel shows the DSM version in its status line with only a CPU key on
       the deck.
+
+On a Mac (Apple Silicon), with the release bundle installed through OpenDeck:
+
+- [ ] `xattr -l` on the installed `opendeck-synology-aarch64-apple-darwin` shows no
+      `com.apple.quarantine`.
+- [ ] On a fresh install, saving the connection stores the password in the Keychain
+      (note whether a prompt appears); the panel says the password is in the keyring.
+- [ ] Update path: build the plugin locally (`cargo build --release && node build.mjs`),
+      install that, save the connection, then install the draft over it and restart
+      OpenDeck. One Keychain prompt per saved secret appears; until it is answered keys
+      show `Keyring` / `Allow access` and the settings panel still opens. After **Always
+      Allow** they connect, and another restart shows no prompt. (Record the prompt count and correct the setup notes if it differs.)
+- [ ] Keychain Access lists the password and device token under `com.jfms7s.synology`.
+- [ ] Self-signed certificate: trusting the fingerprint works as on Linux.
+- [ ] After a 2FA login, restarting OpenDeck reconnects without a code and without a
+      Keychain prompt.
+- [ ] Keys and a dial show values and update.
 
 ## License
 

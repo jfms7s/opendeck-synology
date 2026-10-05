@@ -62,6 +62,11 @@ if (checkOnly) {
 }
 
 const codePaths = manifest.CodePaths || {};
+for (const key of ["CodePathLin", "CodePathMac"]) {
+	if (manifest[key] && !Object.values(codePaths).includes(manifest[key])) {
+		fail(`assets/manifest.json ${key} ${manifest[key]} is not one of its CodePaths`);
+	}
+}
 const host = execFileSync("rustc", ["-vV"], { encoding: "utf8" }).match(/^host: (\S+)/m)?.[1];
 
 // The newest release binary for a target: `--target <triple>` builds land in
