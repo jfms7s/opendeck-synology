@@ -1,7 +1,7 @@
 {
 	"Name": "Synology",
 	"Author": "jfms7s",
-	"Version": "0.3.0",
+	"Version": "0.3.1",
 	"Category": "Synology",
 	"Description": "Live, read-only status of a Synology NAS running DSM 7 - CPU, RAM, temperatures, disk health, volumes, storage pools, network, uptime and updates - on keys and dials. Talks only to your NAS; works with 2FA accounts.",
 	"Icon": "icons/icon",
