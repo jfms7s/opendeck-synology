@@ -1,5 +1,13 @@
 //! Where the password and the 2FA device token live: the system keyring
 //! (Secret Service), keeping them out of OpenDeck's plain-JSON settings file.
+//!
+//! `Vault` adds the fallbacks for a machine without a usable keyring (e.g.
+//! OpenDeck as a Flatpak without access to it): the password goes to the
+//! settings file - which the settings panel then says - and the device token
+//! is kept in memory only, since the two together would get past 2FA.
+
+use crate::settings::{FallbackSecrets, GlobalSettings};
+use std::sync::{Arc, Mutex};
 
 pub const SERVICE: &str = "com.jfms7s.synology";
 
@@ -17,6 +25,197 @@ pub fn password_key(scope: &str) -> String {
 
 pub fn did_key(scope: &str) -> String {
     format!("{scope}/did")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Secret {
+    Password,
+    Did,
+}
+
+impl Secret {
+    fn key(self, scope: &str) -> String {
+        match self {
+            Self::Password => password_key(scope),
+            Self::Did => did_key(scope),
+        }
+    }
+
+    fn slot(self, f: &mut FallbackSecrets) -> &mut Option<String> {
+        match self {
+            Self::Password => &mut f.password,
+            Self::Did => &mut f.did,
+        }
+    }
+}
+
+/// Where a secret was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stored {
+    Keyring,
+    /// OpenDeck's plain-JSON settings file (no usable keyring).
+    SettingsFile,
+    /// This process's memory only (a device token without a keyring).
+    Memory,
+}
+
+impl Stored {
+    /// The settings panel's name for it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Keyring => "keyring",
+            Self::SettingsFile => "settingsFile",
+            Self::Memory => "memory",
+        }
+    }
+}
+
+/// Whether OpenDeck (and so this plugin) runs inside a Flatpak sandbox,
+/// which has no keyring access unless the user grants it.
+pub fn in_flatpak() -> bool {
+    std::env::var_os("FLATPAK_ID").is_some() || std::path::Path::new("/.flatpak-info").exists()
+}
+
+pub struct Vault {
+    store: Arc<dyn SecretStore>,
+    /// (scope, device token) when the keyring refused it.
+    memory_did: Mutex<Option<(String, String)>>,
+}
+
+impl Vault {
+    pub fn new(store: Arc<dyn SecretStore>) -> Self {
+        Self {
+            store,
+            memory_did: Mutex::new(None),
+        }
+    }
+
+    async fn get(&self, key: String) -> Result<Option<String>, String> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.get(&key))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
+    }
+
+    async fn set(&self, key: String, value: Option<String>) -> Result<(), String> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.set(&key, value.as_deref()))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
+    }
+
+    /// The settings-file secrets, if they belong to the current connection.
+    pub fn fallback_for(g: &GlobalSettings) -> Option<&FallbackSecrets> {
+        g.fallback_secrets
+            .as_ref()
+            .filter(|f| f.belongs_to(&g.connection))
+    }
+
+    /// A secret for the current connection and where it was found. `Err`
+    /// only when the keyring failed and no fallback has it - which is not
+    /// the same as "no password saved".
+    pub async fn read(
+        &self,
+        g: &GlobalSettings,
+        which: Secret,
+    ) -> Result<Option<(String, Stored)>, String> {
+        let scope = g.connection.secret_scope();
+        let keyring = self.get(which.key(&scope)).await;
+        if let Ok(Some(v)) = keyring {
+            return Ok(Some((v, Stored::Keyring)));
+        }
+        let fallback = Self::fallback_for(g)
+            .cloned()
+            .and_then(|mut f| which.slot(&mut f).take());
+        if let Some(v) = fallback {
+            return Ok(Some((v, Stored::SettingsFile)));
+        }
+        if which == Secret::Did
+            && let Some((s, v)) = self.memory_did.lock().unwrap().clone()
+            && s == scope
+        {
+            return Ok(Some((v, Stored::Memory)));
+        }
+        keyring.map(|_| None)
+    }
+
+    /// Stores (or with `None`, deletes) a secret in the keyring, falling
+    /// back - with a warning - to the settings file for the password and to
+    /// memory for the device token.
+    pub async fn write(&self, g: &mut GlobalSettings, which: Secret, value: Option<String>) {
+        let scope = g.connection.secret_scope();
+        if Self::fallback_for(g).is_none() {
+            // Nothing there, or another connection's secrets: start afresh.
+            g.fallback_secrets = None;
+        }
+        let result = self.set(which.key(&scope), value.clone()).await;
+        let fallback = g
+            .fallback_secrets
+            .get_or_insert_with(FallbackSecrets::default);
+        fallback.scope = Some(scope.clone());
+        let slot = which.slot(fallback);
+        if which == Secret::Did {
+            *self.memory_did.lock().unwrap() = None;
+        }
+        match (result, which) {
+            (Ok(()), _) => *slot = None,
+            (Err(e), Secret::Password) => {
+                log::warn!(
+                    "no usable system keyring ({e}); keeping the password in OpenDeck's settings file"
+                );
+                *slot = value;
+            }
+            (Err(e), Secret::Did) => {
+                log::warn!(
+                    "no usable system keyring ({e}); the 2FA device token is kept in memory only, so a code is asked for again after a restart"
+                );
+                *slot = None;
+                *self.memory_did.lock().unwrap() = value.map(|v| (scope, v));
+            }
+        }
+        if g.fallback_secrets
+            .as_ref()
+            .is_some_and(|f| f.password.is_none() && f.did.is_none())
+        {
+            g.fallback_secrets = None;
+        }
+    }
+
+    /// Brings stored secrets up to date for the current connection:
+    /// - secrets that fell back to the settings file move into the keyring
+    ///   if it works now (a device token never stays in the file);
+    /// - keyring entries filed under the pre-0.3 `account@host` scope move
+    ///   to this connection's scope - for an HTTPS connection only, since
+    ///   they may have been saved for HTTPS.
+    pub async fn migrate(&self, g: &mut GlobalSettings) {
+        let fallback = Self::fallback_for(g).cloned().unwrap_or_default();
+        if let Some(pw) = fallback.password {
+            self.write(g, Secret::Password, Some(pw)).await;
+        }
+        if let Some(did) = fallback.did {
+            self.write(g, Secret::Did, Some(did)).await;
+        }
+        if !g.connection.https {
+            return;
+        }
+        let (scope, legacy) = (
+            g.connection.secret_scope(),
+            g.connection.legacy_secret_scope(),
+        );
+        for which in [Secret::Password, Secret::Did] {
+            let (new_key, old_key) = (which.key(&scope), which.key(&legacy));
+            if self.get(new_key.clone()).await != Ok(None) {
+                continue;
+            }
+            let Ok(Some(v)) = self.get(old_key.clone()).await else {
+                continue;
+            };
+            if self.set(new_key, Some(v)).await.is_ok() {
+                let _ = self.set(old_key, None).await;
+                log::info!("moved the saved {which:?} to the new keyring entry name");
+            }
+        }
+    }
 }
 
 pub struct KeyringStore;
@@ -48,6 +247,10 @@ impl SecretStore for KeyringStore {
 pub struct MemoryStore {
     map: std::sync::Mutex<std::collections::HashMap<String, String>>,
     broken: bool,
+    /// Reads fail while set (Secret Service not up yet, a locked collection).
+    unreadable: std::sync::atomic::AtomicBool,
+    /// How long each write takes.
+    write_delay: std::time::Duration,
 }
 
 #[cfg(test)]
@@ -59,6 +262,39 @@ impl MemoryStore {
             ..Self::default()
         }
     }
+
+    /// A keyring that holds `entries` but can't be read until
+    /// `set_readable(true)` (Secret Service not on D-Bus yet, a locked
+    /// collection).
+    pub fn unreadable(entries: &[(&str, &str)]) -> Self {
+        let s = Self {
+            unreadable: true.into(),
+            ..Self::default()
+        };
+        for (k, v) in entries {
+            s.map.lock().unwrap().insert(k.to_string(), v.to_string());
+        }
+        s
+    }
+
+    pub fn set_readable(&self, readable: bool) {
+        self.unreadable
+            .store(!readable, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A keyring whose writes take `delay` (an unlock prompt).
+    pub fn slow_writes(delay: std::time::Duration) -> Self {
+        Self {
+            write_delay: delay,
+            ..Self::default()
+        }
+    }
+
+    pub fn keys(&self) -> Vec<String> {
+        let mut k: Vec<_> = self.map.lock().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    }
 }
 
 #[cfg(test)]
@@ -67,6 +303,9 @@ impl SecretStore for MemoryStore {
         if self.broken {
             return Err("no keyring".into());
         }
+        if self.unreadable.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("org.freedesktop.secrets was not provided".into());
+        }
         Ok(self.map.lock().unwrap().get(key).cloned())
     }
 
@@ -74,6 +313,7 @@ impl SecretStore for MemoryStore {
         if self.broken {
             return Err("no keyring".into());
         }
+        std::thread::sleep(self.write_delay);
         let mut map = self.map.lock().unwrap();
         match value {
             Some(v) => map.insert(key.to_string(), v.to_string()),
@@ -88,9 +328,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keys_are_scoped_per_account_and_host() {
-        assert_eq!(password_key("jf@nas.lan"), "jf@nas.lan/password");
-        assert_eq!(did_key("jf@nas.lan"), "jf@nas.lan/did");
+    fn keys_are_scoped_per_connection() {
+        assert_eq!(
+            password_key("jf@https://nas.lan:5001"),
+            "jf@https://nas.lan:5001/password"
+        );
+        assert_eq!(
+            did_key("jf@https://nas.lan:5001"),
+            "jf@https://nas.lan:5001/did"
+        );
     }
 
     #[test]

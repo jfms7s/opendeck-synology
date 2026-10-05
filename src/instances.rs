@@ -1,6 +1,6 @@
 //! Keys and dials currently on screen. Each has a render task that redraws
-//! when its endpoint's poll result, the connection status, or its dial view
-//! changes - so nothing redraws on a timer.
+//! when its endpoint's poll result, the connection status, the display
+//! settings (°C/°F) or its dial view changes - so nothing redraws on a timer.
 
 use crate::dsm::model::Payload;
 use crate::metric::Metric;
@@ -107,6 +107,7 @@ async fn render_loop(
     redraw: Arc<Notify>,
 ) {
     let mut status = services.status();
+    let mut display = services.display();
     // Unchanged readings aren't re-sent, so ten keys don't flood OpenDeck
     // with identical images every 5 s.
     let mut last: Option<Reading> = None;
@@ -114,7 +115,7 @@ async fn render_loop(
         let state = rx.borrow_and_update().clone();
         let conn = status.borrow_and_update().clone();
         let v = view.lock().unwrap().clone();
-        let unit = services.global().temp_unit;
+        let unit = *display.borrow_and_update();
         let reading = metrics::read(
             metric,
             &state,
@@ -135,6 +136,7 @@ async fn render_loop(
         tokio::select! {
             changed = rx.changed() => if changed.is_err() { return },
             changed = status.changed() => if changed.is_err() { return },
+            changed = display.changed() => if changed.is_err() { return },
             // An explicit redraw (appear, settings re-sent, dial turned) always draws.
             _ = redraw.notified() => last = None,
         }
@@ -164,7 +166,7 @@ mod tests {
     use super::*;
     use crate::metric::Endpoint;
     use crate::secrets::MemoryStore;
-    use crate::services::testing::{conn, healthy_nas, services_with};
+    use crate::services::testing::{conn, eventually, healthy_nas, services_with};
     use crate::settings::GlobalSettings;
     use std::time::Duration as StdDuration;
 
@@ -230,13 +232,10 @@ mod tests {
         let s = connected_services().await;
         let live = Instances::default();
         live.show(&s, Metric::DiskTemp, "d1", false, ActionSettings::default());
-        tokio::time::timeout(StdDuration::from_secs(5), async {
-            while s.poller(Endpoint::Storage).latest().value.is_none() {
-                tokio::time::sleep(StdDuration::from_millis(10)).await;
-            }
+        eventually("storage polled", || {
+            s.poller(Endpoint::Storage).latest().value.is_some()
         })
-        .await
-        .unwrap();
+        .await;
         live.rotate(&s, "d1", 1);
         assert_eq!(live.view("d1").unwrap().target.as_deref(), Some("sata1"));
     }

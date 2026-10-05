@@ -1,0 +1,34 @@
+{
+  "disks": [
+    {
+      "id": "sata1", "name": "Drive 1", "longName": "Drive 1", "diskType": "SATA",
+      "temp": 39, "smart_status": "normal", "status": "normal", "overview_status": "normal",
+      "action_status": { "action_name": "idle", "action_progress": "" },
+      "action_status_category": "processing", "below_remain_life_thr": false,
+      "remain_life": { "trustable": true, "value": -1 }, "unc": 0, "sb_days_left": 0,
+      "smart_test_limit": 0, "container": { "order": 0, "str": "REDACTED", "supportPwrBtnDisable": false, "type": "internal" }
+    },
+    {
+      "id": "sata2", "name": "Drive 2", "longName": "Drive 2", "diskType": "SATA",
+      "temp": 47, "smart_status": "failing", "status": "crashed", "overview_status": "danger",
+      "action_status": { "action_name": "idle", "action_progress": "" },
+      "action_status_category": "processing", "below_remain_life_thr": false,
+      "remain_life": { "trustable": true, "value": -1 }, "unc": 112, "sb_days_left": 0,
+      "smart_test_limit": 0, "container": { "order": 0, "str": "REDACTED", "supportPwrBtnDisable": false, "type": "internal" }
+    }
+  ],
+  "storagePools": [
+    {
+      "id": "reuse_1", "status": "degraded", "device_type": "raid_1", "raidType": "single",
+      "progress": { "cur_step": 0, "is_resync_speed_limited": false, "percent": "-1", "remaining_time": 0, "step": "none", "total_step": 0 },
+      "scrubbingStatus": "schedule_done", "repair_action": "repair", "is_actioning": false
+    }
+  ],
+  "volumes": [
+    {
+      "id": "volume_1", "status": "degraded", "vol_path": "/volume1", "pool_path": "reuse_1",
+      "size": { "free_inode": "0", "total": "3839999999999", "total_device": "3998639460352", "total_inode": "0", "used": "1919999999999" },
+      "progress": { "cur_step": 0, "is_resync_speed_limited": false, "percent": "-1", "remaining_time": 0, "step": "none", "total_step": 0 }
+    }
+  ]
+}

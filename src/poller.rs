@@ -4,7 +4,6 @@
 //! same endpoint cost one request per refresh.
 
 use crate::dsm::error::DsmError;
-use futures::FutureExt;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -60,12 +59,17 @@ struct Registry<T> {
     subscribers: HashMap<String, Duration>,
     fetch: Option<Fetch<T>>,
     /// Bumped by `set_fetch`, so a request started on the old connection
-    /// can't overwrite the new connection's state when it finishes.
+    /// can't overwrite the new connection's state when it finishes. (The
+    /// poller's own view of `Services`' connection epoch: `set_fetch` is
+    /// called exactly when that epoch moves on.)
     generation: u64,
     running: bool,
     /// When the current connection last returned a value: data younger than
     /// the interval is not fetched again just because a key appeared.
     last_ok: Option<Instant>,
+    /// When the last request on the current connection started; the
+    /// backoff after a failure counts from here.
+    last_attempt: Option<Instant>,
     /// Set by `refresh_now`: the next round polls even if the data is fresh.
     force: bool,
 }
@@ -93,6 +97,7 @@ impl<T: Send + Sync + 'static> Poller<T> {
                     generation: 0,
                     running: false,
                     last_ok: None,
+                    last_attempt: None,
                     force: false,
                 }),
                 tx,
@@ -104,8 +109,9 @@ impl<T: Send + Sync + 'static> Poller<T> {
     /// Registers (or re-registers) a subscriber, starting the poll loop if
     /// it isn't running. `interval: None` means the endpoint's default.
     /// Polls right away unless the last value is younger than the (new)
-    /// effective interval; fresh data is shared as is, and the next poll is
-    /// rescheduled for the new interval.
+    /// effective interval, or an outage's backoff is still running; fresh
+    /// data is shared as is, and the next poll is rescheduled for the new
+    /// interval.
     pub fn subscribe(&self, id: &str, interval: Option<Duration>) -> watch::Receiver<PollState<T>> {
         let interval = interval
             .unwrap_or(self.inner.default_interval)
@@ -143,6 +149,7 @@ impl<T: Send + Sync + 'static> Poller<T> {
             reg.fetch = fetch;
             reg.generation += 1;
             reg.last_ok = None;
+            reg.last_attempt = None;
             reg.running
         };
         self.inner.tx.send_replace(PollState::default());
@@ -198,85 +205,101 @@ impl<T: Send + Sync + 'static> Poller<T> {
     }
 }
 
+/// Marks the loop as stopped if a fetch panics, so the next `subscribe`
+/// starts a new one instead of waking a loop that no longer exists. (A
+/// normal exit clears the flag itself, under the same lock that saw no
+/// subscribers left.)
+struct Running<'a, T>(&'a Inner<T>);
+
+impl<T> Drop for Running<'_, T> {
+    fn drop(&mut self) {
+        if std::thread::panicking()
+            && let Ok(mut reg) = self.0.registry.lock()
+        {
+            reg.running = false;
+        }
+    }
+}
+
+/// When the next poll is due: `None` waits for `refresh_now` or a new
+/// connection (an error only the user can fix).
+fn next_due<T>(reg: &Registry<T>, st: &PollState<T>, interval: Duration) -> Option<Instant> {
+    let now = Instant::now();
+    match &st.error {
+        Some(e) if e.needs_user() => None,
+        // During an outage the backoff holds, however many keys come and go.
+        Some(_) => Some(
+            reg.last_attempt
+                .map_or(now, |t| t + backoff(interval, st.failures)),
+        ),
+        None => Some(reg.last_ok.map_or(now, |t| t + interval)),
+    }
+}
+
 async fn run<T: Send + Sync + 'static>(inner: Arc<Inner<T>>) {
+    let _running = Running(&inner);
     loop {
-        // Drain a stale wake permit before reading state: `Notify` stores at
-        // most one permit, but two `notify_one` calls with no `await`
-        // between them (e.g. two `set_fetch`s back to back) can each find
-        // no registered waiter and each store one, one after the other. We
-        // are about to read the freshest registry state anyway, so any
-        // permit already sitting here is redundant and would otherwise fire
-        // the `select!` below immediately, causing a spurious extra poll.
-        let _ = inner.wake.notified().now_or_never();
-        let failed = inner.tx.borrow().error.is_some();
-        let (interval, fetch, generation, fresh_for) = {
+        // Every wake-up (a key appearing or leaving, a new interval) only
+        // re-plans; a poll happens when one is due, forced, or the
+        // connection changed.
+        let plan = {
             let mut reg = inner.registry.lock().unwrap();
             let Some(interval) = reg.subscribers.values().min().copied() else {
                 reg.running = false;
                 return;
             };
             let force = std::mem::take(&mut reg.force);
-            // How much longer the last good value stays fresh, if it does.
-            let fresh_for = reg
-                .last_ok
-                .filter(|_| !force && !failed)
-                .and_then(|t| interval.checked_sub(t.elapsed()))
-                .filter(|rest| !rest.is_zero());
-            (interval, reg.fetch.clone(), reg.generation, fresh_for)
-        };
-        // Woken by a new subscriber or a changed interval while the data is
-        // still fresh: just re-plan the next poll.
-        if let (Some(_), Some(rest)) = (&fetch, fresh_for) {
-            tokio::select! {
-                _ = tokio::time::sleep(rest) => {}
-                _ = inner.wake.notified() => {}
-            }
-            continue;
-        }
-        // `None` = wait until woken (unconfigured, or an error only the user can fix).
-        let wait = match fetch {
-            None => None,
-            Some(fetch) => {
-                let result = fetch().await;
-                {
-                    let mut reg = inner.registry.lock().unwrap();
-                    if reg.generation != generation {
-                        continue; // the connection changed mid-request; discard
-                    }
-                    if result.is_ok() {
-                        reg.last_ok = Some(Instant::now());
-                    }
+            let due = if force {
+                Some(Instant::now())
+            } else {
+                next_due(&reg, &inner.tx.borrow(), interval)
+            };
+            match (reg.fetch.clone(), due) {
+                (Some(fetch), Some(due)) if due <= Instant::now() => {
+                    reg.last_attempt = Some(Instant::now());
+                    Ok((fetch, reg.generation))
                 }
-                let mut next = inner.tx.borrow().clone();
-                let wait = match result {
-                    Ok(v) => {
-                        next = PollState {
-                            value: Some(Arc::new(v)),
-                            error: None,
-                            failures: 0,
-                        };
-                        Some(interval)
-                    }
-                    Err(e) => {
-                        next.failures += 1;
-                        let wait = (!e.needs_user()).then(|| backoff(interval, next.failures));
-                        next.error = Some(e);
-                        wait
-                    }
-                };
-                inner.tx.send_replace(next);
-                wait
+                (None, _) => Err(None),
+                (Some(_), due) => Err(due),
             }
         };
-        match wait {
-            Some(d) => {
+        let (fetch, generation) = match plan {
+            Ok(p) => p,
+            Err(Some(due)) => {
                 tokio::select! {
-                    _ = tokio::time::sleep(d) => {}
+                    _ = tokio::time::sleep_until(due) => {}
                     _ = inner.wake.notified() => {}
                 }
+                continue;
             }
-            None => inner.wake.notified().await,
+            Err(None) => {
+                inner.wake.notified().await;
+                continue;
+            }
+        };
+        let result = fetch().await;
+        {
+            let mut reg = inner.registry.lock().unwrap();
+            if reg.generation != generation {
+                continue; // the connection changed mid-request; discard
+            }
+            if result.is_ok() {
+                reg.last_ok = Some(Instant::now());
+            }
         }
+        inner.tx.send_modify(|st| match result {
+            Ok(v) => {
+                *st = PollState {
+                    value: Some(Arc::new(v)),
+                    error: None,
+                    failures: 0,
+                }
+            }
+            Err(e) => {
+                st.failures += 1;
+                st.error = Some(e);
+            }
+        });
     }
 }
 
@@ -474,6 +497,122 @@ mod tests {
             (st.value.as_deref(), st.error, st.failures),
             (Some(&1), None, 0)
         );
+    }
+
+    /// Fails until `ok` is set, then counts up from 100.
+    fn flaky(n: Arc<AtomicU32>, ok: Arc<std::sync::atomic::AtomicBool>) -> Fetch<u32> {
+        Arc::new(move || {
+            let (n, ok) = (n.clone(), ok.clone());
+            Box::pin(async move {
+                let i = n.fetch_add(1, SeqCst);
+                if ok.load(SeqCst) {
+                    Ok(100 + i)
+                } else {
+                    Err(DsmError::Transport("down".into()))
+                }
+            })
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovers_after_an_outage_and_resets_the_backoff() {
+        let p = Poller::new(S(5));
+        let n = Arc::new(AtomicU32::new(0));
+        let ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        p.set_fetch(Some(flaky(n.clone(), ok.clone())));
+        let _a = p.subscribe("a", None);
+        // Fails at 0, 10 and 30 s.
+        tokio::time::sleep(Duration::from_millis(30_500)).await;
+        assert_eq!((n.load(SeqCst), p.latest().failures), (3, 3));
+        ok.store(true, SeqCst);
+        p.refresh_now();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let st = p.latest();
+        assert_eq!(
+            (st.value.is_some(), st.error, st.failures),
+            (true, None, 0),
+            "a success forgets the outage"
+        );
+        assert_eq!(n.load(SeqCst), 4);
+        // Back to the plain interval, not the 40 s the fourth failure would wait.
+        tokio::time::sleep(S(5)).await;
+        assert_eq!(n.load(SeqCst), 5);
+        tokio::time::sleep(S(5)).await;
+        assert_eq!(n.load(SeqCst), 6);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keys_appearing_during_an_outage_do_not_skip_the_backoff() {
+        let p = Poller::new(S(5));
+        let n = Arc::new(AtomicU32::new(0));
+        p.set_fetch(Some(failing(n.clone(), DsmError::Transport("down".into()))));
+        let _a = p.subscribe("a", None);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(n.load(SeqCst), 1);
+        // Page flips during the 10 s backoff.
+        for i in 0..5 {
+            let id = format!("k{i}");
+            let _rx = p.subscribe(&id, None);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            p.unsubscribe(&id);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(n.load(SeqCst), 1, "no request per page flip");
+        tokio::time::sleep(S(10)).await;
+        assert_eq!(n.load(SeqCst), 2, "the backoff still ends on time");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_value_goes_stale_seven_intervals_after_the_last_success() {
+        let p = Poller::new(S(5));
+        let n = Arc::new(AtomicU32::new(0));
+        let ok = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        p.set_fetch(Some(flaky(n.clone(), ok.clone())));
+        let _a = p.subscribe("a", None);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        ok.store(false, SeqCst);
+        // Failures at 5, 15 and 35 s: the third one marks the value stale.
+        tokio::time::sleep(Duration::from_millis(34_000)).await;
+        assert_eq!(p.latest().failures, 2);
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert_eq!(p.latest().failures, crate::metrics::STALE_AFTER);
+        assert!(p.latest().value.is_some(), "the last value is kept");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_result_from_the_old_connection_is_discarded() {
+        let p = Poller::new(S(60));
+        let slow: Fetch<u32> = Arc::new(|| {
+            Box::pin(async {
+                tokio::time::sleep(S(5)).await;
+                Ok(1)
+            })
+        });
+        p.set_fetch(Some(slow));
+        let _a = p.subscribe("a", None);
+        tokio::time::sleep(S(1)).await;
+        let never: Fetch<u32> = Arc::new(|| Box::pin(std::future::pending()));
+        p.set_fetch(Some(never));
+        tokio::time::sleep(S(10)).await;
+        assert_eq!(
+            p.latest().value,
+            None,
+            "the old request's answer is dropped"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_fetch_leaves_the_poller_restartable() {
+        let p = Poller::new(S(5));
+        let boom: Fetch<u32> = Arc::new(|| Box::pin(async { panic!("malformed reply") }));
+        p.set_fetch(Some(boom));
+        let _a = p.subscribe("a", None);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let n = Arc::new(AtomicU32::new(0));
+        p.set_fetch(Some(counting(n.clone())));
+        let _b = p.subscribe("b", None);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(n.load(SeqCst), 1, "a new loop started");
     }
 
     #[tokio::test(start_paused = true)]

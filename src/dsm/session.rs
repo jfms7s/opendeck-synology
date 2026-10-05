@@ -6,6 +6,8 @@
 //! - Credential failures are remembered (`blocked`) and returned without
 //!   contacting DSM until the settings change or a 2FA code is submitted -
 //!   retrying a wrong password is what trips DSM's auto-block.
+//! - `logout` closes a session for good: a request still on its way when the
+//!   connection was replaced can't sign it in again and leak a DSM session.
 
 use crate::dsm::api::{AUTH, ApiInfo, ApiMap, discover};
 use crate::dsm::error::{AuthError, DsmError};
@@ -13,6 +15,7 @@ use crate::dsm::transport::Transport;
 use serde_json::Value;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -35,6 +38,10 @@ pub struct Credentials {
     pub did: Option<String>,
     /// How this device appears in DSM's trusted-device list.
     pub device_name: String,
+    /// Whether to send and ask for a device token. Off over plain HTTP:
+    /// the password and the token together would let anyone sniffing the
+    /// link sign in without a 2FA code.
+    pub remember_device: bool,
 }
 
 impl fmt::Debug for Credentials {
@@ -44,6 +51,7 @@ impl fmt::Debug for Credentials {
             .field("password", &"<redacted>")
             .field("did", &self.did.as_ref().map(|_| "<redacted>"))
             .field("device_name", &self.device_name)
+            .field("remember_device", &self.remember_device)
             .finish()
     }
 }
@@ -63,6 +71,9 @@ pub struct Session {
     transport: Arc<dyn Transport>,
     state: Mutex<State>,
     on_did: DidListener,
+    /// Set by `logout`: a replaced session must never sign in again, or a
+    /// request still on its way would leave a session behind in DSM.
+    closed: AtomicBool,
 }
 
 impl Session {
@@ -77,6 +88,7 @@ impl Session {
                 creds,
             }),
             on_did,
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -125,33 +137,42 @@ impl Session {
 
     /// Logs in with a 2FA code, asking DSM to remember this device; the new
     /// device token goes to `on_did` for safekeeping.
+    ///
+    /// Only when DSM asked for a code: a code sent while signed in (a stale
+    /// settings panel, a double submit) would replace a working session with
+    /// a failed login. A code that can't be one (empty, not digits) never
+    /// reaches DSM, where it would count as a failed sign-in.
     pub async fn submit_otp(&self, code: &str) -> Result<(), DsmError> {
+        if !is_otp_code(code) {
+            return Err(AuthError::BadOtp.into());
+        }
         let mut st = self.state.lock().await;
-        let waiting = match st.blocked.take() {
-            None => false,
-            Some(AuthError::NeedOtp | AuthError::BadOtp) => true,
-            Some(other) => {
-                st.blocked = Some(other); // a code can't fix a wrong password
-                return Err(other.into());
-            }
-        };
+        if self.closed.load(SeqCst) {
+            return Err(DsmError::NotConfigured);
+        }
+        match st.blocked {
+            Some(AuthError::NeedOtp | AuthError::BadOtp) => st.blocked = None,
+            Some(other) => return Err(other.into()), // a code can't fix a wrong password
+            None => return Ok(()),
+        }
         let result = match self.discover_once(&mut st).await {
             Ok(()) => self.login(&mut st, Some(code)).await,
             Err(e) => Err(e),
         };
         // The code never reached DSM's verdict (network, API error): still
         // waiting for one, rather than logging in again without it.
-        if waiting && matches!(&result, Err(e) if !matches!(e, DsmError::Auth(_))) {
+        if matches!(&result, Err(e) if !matches!(e, DsmError::Auth(_))) {
             st.blocked = Some(AuthError::NeedOtp);
         }
         result
     }
 
-    /// Best effort; never takes more than a second. Forgets the sid (and
-    /// bumps `generation`) whether or not the logout request itself
-    /// succeeds, so the next `call()` logs in again instead of reusing a
-    /// session DSM no longer honours.
+    /// Ends the session for good: best effort, never more than a second.
+    /// Forgets the sid whether or not the logout request itself succeeds,
+    /// and any later `call()` fails with `NotConfigured` instead of signing
+    /// in again - a new connection gets a new `Session`.
     pub async fn logout(&self) {
+        self.closed.store(true, SeqCst);
         let _ = tokio::time::timeout(Duration::from_secs(1), async {
             let (info, sid) = {
                 let mut st = self.state.lock().await;
@@ -214,6 +235,9 @@ impl Session {
     /// (apis, sid, generation), logging in first if there is no session.
     async fn ensure_login(&self) -> Result<(Arc<ApiMap>, String, u64), DsmError> {
         let mut st = self.state.lock().await;
+        if self.closed.load(SeqCst) {
+            return Err(DsmError::NotConfigured);
+        }
         if let Some(e) = st.blocked {
             return Err(e.into());
         }
@@ -231,6 +255,9 @@ impl Session {
     /// Returns the new sid and, if this call replaced one, the old sid.
     async fn relogin(&self, seen_generation: u64) -> Result<(String, Option<String>), DsmError> {
         let mut st = self.state.lock().await;
+        if self.closed.load(SeqCst) {
+            return Err(DsmError::NotConfigured);
+        }
         if let Some(e) = st.blocked {
             return Err(e.into());
         }
@@ -256,12 +283,14 @@ impl Session {
             ("session", SESSION_NAME),
             ("format", "sid"),
         ];
-        match (otp, c.did.as_deref()) {
-            (Some(code), _) => form.extend([
+        let did = c.did.as_deref().filter(|_| c.remember_device);
+        match (otp, did) {
+            (Some(code), _) if c.remember_device => form.extend([
                 ("otp_code", code),
                 ("enable_device_token", "yes"),
                 ("device_name", c.device_name.as_str()),
             ]),
+            (Some(code), _) => form.push(("otp_code", code)),
             (None, Some(did)) => {
                 form.extend([("device_id", did), ("device_name", c.device_name.as_str())])
             }
@@ -279,6 +308,7 @@ impl Session {
                 st.sid = Some(sid.to_string());
                 st.generation += 1;
                 if otp.is_some()
+                    && c.remember_device
                     && let Some(did) = data["did"].as_str().filter(|d| !d.is_empty())
                 {
                     st.creds.did = Some(did.to_string());
@@ -293,8 +323,9 @@ impl Session {
                         code,
                     });
                 };
-                if err == AuthError::NeedOtp && st.creds.did.take().is_some() {
-                    // DSM no longer honours the stored device token.
+                if err == AuthError::NeedOtp && otp.is_none() && did.is_some() {
+                    // DSM no longer honours the device token we sent.
+                    st.creds.did = None;
                     (self.on_did)(None);
                 }
                 st.sid = None;
@@ -305,14 +336,19 @@ impl Session {
     }
 }
 
+/// What a TOTP code can look like once whitespace is gone: 6-8 digits.
+pub fn is_otp_code(code: &str) -> bool {
+    (6..=8).contains(&code.len()) && code.chars().all(|c| c.is_ascii_digit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dsm::api::UTILIZATION;
-    use crate::dsm::fake::{FakeDsm, Req};
+    use crate::dsm::fake::{Drops, FakeDsm, Req};
     use serde_json::json;
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+    use std::sync::atomic::AtomicU32;
 
     fn creds(did: Option<&str>) -> Credentials {
         Credentials {
@@ -320,6 +356,7 @@ mod tests {
             password: "p&ss=w+rd%ü".into(),
             did: did.map(str::to_string),
             device_name: "OpenDeck-desk".into(),
+            remember_device: true,
         }
     }
 
@@ -420,23 +457,6 @@ mod tests {
         );
     }
 
-    /// The fake NAS, except that a login with a 2FA code never gets through.
-    struct OtpLoginUnreachable(Arc<FakeDsm>);
-
-    #[async_trait::async_trait]
-    impl Transport for OtpLoginUnreachable {
-        async fn call(
-            &self,
-            path: &str,
-            form: &[(&str, &str)],
-        ) -> Result<Result<Value, i64>, DsmError> {
-            if form.iter().any(|(k, _)| *k == "otp_code") {
-                return Err(DsmError::Transport("connection reset".into()));
-            }
-            self.0.call(path, form).await
-        }
-    }
-
     #[tokio::test]
     async fn an_otp_submit_that_never_arrives_still_waits_for_a_code() {
         let fake = FakeDsm::new(|r| match get(r, "method").as_deref() {
@@ -445,7 +465,7 @@ mod tests {
         });
         let (on_did, _) = did_log();
         let s = Session::new(
-            Arc::new(OtpLoginUnreachable(fake.clone())),
+            Arc::new(Drops(fake.clone(), "otp_code")),
             creds(None),
             on_did,
         );
@@ -633,36 +653,187 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_call_after_logout_logs_in_again() {
-        let logins = Arc::new(AtomicU32::new(0));
-        let l = logins.clone();
-        let fake = FakeDsm::new(move |r| match get(r, "method").as_deref() {
-            Some("login") => Ok(json!({ "sid": format!("s{}", l.fetch_add(1, SeqCst) + 1) })),
-            Some("logout") => Ok(json!({})),
-            // Any sid works here; the point is which sid the second `get` used.
+    async fn a_logged_out_session_never_signs_in_again() {
+        let fake = FakeDsm::new(|r| match get(r, "method").as_deref() {
+            Some("login") => Ok(json!({ "sid": "s1" })),
             _ => Ok(json!({ "ok": true })),
         });
         let (on_did, _) = did_log();
         let s = Session::new(fake.clone(), creds(None), on_did);
         s.call(UTILIZATION, "get", &[]).await.unwrap();
         s.logout().await;
-        s.call(UTILIZATION, "get", &[]).await.unwrap();
+        // A request that was still on its way when the connection was
+        // replaced (a poll, the firmware lookup) must not revive it: that
+        // would leave a session behind in DSM.
+        assert_eq!(
+            s.call(UTILIZATION, "get", &[]).await,
+            Err(DsmError::NotConfigured)
+        );
+        assert_eq!(fake.count("login"), 1);
+        assert_eq!(fake.count("logout"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_code_that_cannot_be_one_never_reaches_dsm() {
+        let fake = FakeDsm::new(|r| match get(r, "method").as_deref() {
+            Some("login") => Err(403),
+            _ => Ok(json!({})),
+        });
+        let (on_did, _) = did_log();
+        let s = Session::new(fake.clone(), creds(None), on_did);
+        assert_eq!(
+            s.call(UTILIZATION, "get", &[]).await,
+            Err(DsmError::Auth(AuthError::NeedOtp))
+        );
+        let sent = fake.requests().len();
+        for code in ["", "12345", "12a456", "123456789"] {
+            assert_eq!(
+                s.submit_otp(code).await,
+                Err(DsmError::Auth(AuthError::BadOtp)),
+                "{code:?}"
+            );
+        }
+        assert_eq!(
+            fake.requests().len(),
+            sent,
+            "no failed sign-in on DSM's counter"
+        );
+        assert_eq!(
+            s.call(UTILIZATION, "get", &[]).await,
+            Err(DsmError::Auth(AuthError::NeedOtp)),
+            "still waiting for a real code"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_code_sent_while_signed_in_is_ignored() {
+        let fake = FakeDsm::new(|r| match get(r, "method").as_deref() {
+            Some("login") if get(r, "otp_code").is_some() => Err(404),
+            Some("login") => Ok(json!({ "sid": "s1" })),
+            _ => Ok(json!({ "ok": true })),
+        });
+        let (on_did, _) = did_log();
+        let s = Session::new(fake.clone(), creds(None), on_did);
+        assert!(s.call(UTILIZATION, "get", &[]).await.is_ok());
+        assert_eq!(s.submit_otp("999999").await, Ok(()));
+        assert_eq!(fake.count("login"), 1, "no second login");
+        assert!(
+            s.call(UTILIZATION, "get", &[]).await.is_ok(),
+            "still connected"
+        );
+        assert_eq!(fake.count("logout"), 0);
+    }
+
+    #[tokio::test]
+    async fn without_remember_device_no_token_is_sent_or_asked_for() {
+        let fake =
+            FakeDsm::new(
+                |r| match (get(r, "method").as_deref(), get(r, "otp_code").as_deref()) {
+                    (Some("login"), Some(_)) => Ok(json!({ "sid": "s1", "did": "dev-2" })),
+                    (Some("login"), None) => Err(403),
+                    _ => Ok(json!({ "ok": true })),
+                },
+            );
+        let (on_did, dids) = did_log();
+        let c = Credentials {
+            remember_device: false,
+            ..creds(Some("dev-1"))
+        };
+        let s = Session::new(fake.clone(), c, on_did);
+        assert_eq!(
+            s.call(UTILIZATION, "get", &[]).await,
+            Err(DsmError::Auth(AuthError::NeedOtp))
+        );
+        s.submit_otp("123456").await.unwrap();
+        for r in fake.requests() {
+            assert_eq!(get(&r, "device_id"), None, "{r:?}");
+            assert_eq!(get(&r, "enable_device_token"), None, "{r:?}");
+        }
+        assert!(dids.lock().unwrap().is_empty(), "nothing to store");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_relogin_is_not_repeated_by_other_callers() {
+        let logins = Arc::new(AtomicU32::new(0));
+        let l = logins.clone();
+        let fake = FakeDsm::new(move |r| match get(r, "method").as_deref() {
+            // The first login works; then the password is changed on the NAS.
+            Some("login") if l.fetch_add(1, SeqCst) == 0 => Ok(json!({ "sid": "s1" })),
+            Some("login") => Err(400),
+            _ => Err(119),
+        });
+        let (on_did, _) = did_log();
+        let s = Arc::new(Session::new(fake.clone(), creds(None), on_did));
+        let calls = (0..4).map(|_| {
+            let s = s.clone();
+            tokio::spawn(async move { s.call(UTILIZATION, "get", &[]).await })
+        });
+        for r in futures::future::join_all(calls).await {
+            assert_eq!(r.unwrap(), Err(DsmError::Auth(AuthError::BadCredentials)));
+        }
         assert_eq!(
             fake.count("login"),
             2,
-            "logout forces a fresh login on the next call"
+            "the first login and one refused re-login, never a third"
         );
-        let last_get = fake
-            .requests()
-            .into_iter()
-            .rev()
-            .find(|r| get(r, "method").as_deref() == Some("get"))
-            .unwrap();
-        assert_eq!(
-            get(&last_get, "_sid").as_deref(),
-            Some("s2"),
-            "used the fresh sid, not the dead one"
-        );
+    }
+
+    /// The fake NAS, except that some requests never get an answer.
+    struct Hangs(Arc<FakeDsm>, &'static str);
+
+    #[async_trait::async_trait]
+    impl Transport for Hangs {
+        async fn call(
+            &self,
+            path: &str,
+            form: &[(&str, &str)],
+        ) -> Result<Result<Value, i64>, DsmError> {
+            if form.contains(&("method", self.1)) {
+                return std::future::pending().await;
+            }
+            self.0.call(path, form).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn logout_gives_up_after_a_second_even_while_a_login_hangs() {
+        let fake = FakeDsm::new(|_| Ok(json!({})));
+        let (on_did, _) = did_log();
+        let s = Arc::new(Session::new(
+            Arc::new(Hangs(fake, "login")),
+            creds(None),
+            on_did,
+        ));
+        let busy = s.clone();
+        tokio::spawn(async move { busy.call(UTILIZATION, "get", &[]).await });
+        tokio::task::yield_now().await;
+        let t0 = tokio::time::Instant::now();
+        s.logout().await;
+        assert_eq!(t0.elapsed(), Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_logout_of_a_superseded_session_costs_at_most_a_second() {
+        let logins = Arc::new(AtomicU32::new(0));
+        let l = logins.clone();
+        let fake = FakeDsm::new(move |r| match get(r, "method").as_deref() {
+            Some("login") => Ok(json!({ "sid": format!("s{}", l.fetch_add(1, SeqCst) + 1) })),
+            _ => Err(105),
+        });
+        let (on_did, _) = did_log();
+        let s = Session::new(Arc::new(Hangs(fake, "logout")), creds(None), on_did);
+        let t0 = tokio::time::Instant::now();
+        assert!(matches!(
+            s.call(crate::dsm::api::STORAGE, "load_info", &[]).await,
+            Err(DsmError::Permission { .. })
+        ));
+        assert_eq!(t0.elapsed(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn otp_codes_are_six_to_eight_digits() {
+        assert!(is_otp_code("123456") && is_otp_code("12345678"));
+        assert!(!is_otp_code("") && !is_otp_code("12345") && !is_otp_code("12 456"));
     }
 
     #[test]

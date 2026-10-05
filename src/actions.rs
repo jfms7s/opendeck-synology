@@ -21,6 +21,9 @@ pub trait MetricKind: Send + Sync + 'static {
     const METRIC: Metric;
 }
 
+/// Declares one marker type per metric and `register_all`, which registers
+/// an action for each - from this one list, so no action can be declared
+/// but never registered.
 macro_rules! kinds {
     ($($name:ident),* $(,)?) => {
         $(
@@ -29,6 +32,14 @@ macro_rules! kinds {
                 const METRIC: Metric = Metric::$name;
             }
         )*
+
+        /// The metric of every action `register_all` registers.
+        #[cfg(test)]
+        pub const REGISTERED: &[Metric] = &[$(Metric::$name),*];
+
+        pub async fn register_all(services: &Arc<Services>, instances: &Arc<Instances>) {
+            $( register_action(MetricAction::<$name>::new(services.clone(), instances.clone())).await; )*
+        }
     };
 }
 
@@ -132,7 +143,7 @@ impl<K: MetricKind> Action for MetricAction<K> {
         instance: &Instance,
         _: &ActionSettings,
     ) -> OpenActionResult<()> {
-        inspector::send_state(&self.services, K::METRIC, instance).await
+        inspector::send_state(&self.services, K::METRIC, instance, None).await
     }
 
     async fn send_to_plugin(
@@ -143,17 +154,6 @@ impl<K: MetricKind> Action for MetricAction<K> {
     ) -> OpenActionResult<()> {
         inspector::handle(&self.services, K::METRIC, instance, payload).await
     }
-}
-
-pub async fn register_all(services: &Arc<Services>, instances: &Arc<Instances>) {
-    macro_rules! register {
-        ($($kind:ident),*) => {
-            $( register_action(MetricAction::<$kind>::new(services.clone(), instances.clone())).await; )*
-        };
-    }
-    register!(
-        Cpu, Ram, Network, SysTemp, Uptime, DiskTemp, DiskHealth, Volume, Pool, Update
-    );
 }
 
 #[cfg(test)]
@@ -185,6 +185,16 @@ mod tests {
             );
         }
         assert_eq!(m["Category"], "Synology");
+    }
+
+    #[test]
+    fn every_metric_gets_an_action() {
+        let mut registered = REGISTERED.to_vec();
+        registered.dedup();
+        assert_eq!(registered.len(), Metric::ALL.len());
+        for m in Metric::ALL {
+            assert!(REGISTERED.contains(&m), "{m:?} is never registered");
+        }
     }
 
     #[test]

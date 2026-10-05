@@ -70,7 +70,6 @@ pub struct Pool {
     pub id: String,
     pub name: String,
     pub status: String,
-    pub raid: String,
     /// Progress of a running repair/expansion/check, 0-100.
     pub progress_pct: Option<f64>,
 }
@@ -207,7 +206,7 @@ pub fn parse_storage(data: &Value) -> Result<Storage, String> {
     if !data.is_object() {
         return Err("expected an object".into());
     }
-    let list = |key: &str| data[key].as_array().cloned().unwrap_or_default();
+    let list = |key: &str| data[key].as_array().map_or(&[][..], Vec::as_slice);
     let disks = list("disks")
         .iter()
         .filter_map(|d| {
@@ -244,9 +243,6 @@ pub fn parse_storage(data: &Value) -> Result<Storage, String> {
             Some(Pool {
                 name: numbered("Pool", &id),
                 status: lower(&p["status"]),
-                raid: text(&p["device_type"])
-                    .or_else(|| text(&p["raidType"]))
-                    .unwrap_or_default(),
                 // -1 means "no operation running".
                 progress_pct: num(&p["progress"]["percent"]).filter(|x| (0.0..=100.0).contains(x)),
                 id,
@@ -277,12 +273,8 @@ pub fn parse_update(data: &Value) -> Result<UpdateStatus, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dsm::fake::fixture;
     use serde_json::{Value, json};
-
-    fn fixture(name: &str) -> Value {
-        let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
-        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
-    }
 
     /// DSM's `real_usage` counts page cache and buffers as free; used bytes
     /// must agree with it. Numbers recorded from a DS920+ on DSM 7.4.1.
@@ -408,7 +400,6 @@ mod tests {
         assert_eq!(s.volumes[0].used_bytes, 5_452_800_000_000);
         assert_eq!(s.pools[0].name, "Pool 1");
         assert_eq!(s.pools[0].status, "normal");
-        assert_eq!(s.pools[0].raid, "shr_with_1_disk_protect");
         assert_eq!(
             s.pools[0].progress_pct, None,
             "-1 means no operation running"
@@ -473,25 +464,91 @@ mod tests {
         assert!(parse_update(&json!({})).is_err());
     }
 
-    /// Real responses from the author's NAS (Task 2). Skips files that
-    /// were not captured, so CI and fresh clones still pass.
     #[test]
-    fn recorded_fixtures_parse() {
-        type Check = fn(&Value) -> Result<(), String>;
-        let checks: [(&str, Check); 4] = [
-            ("utilization.json", |v| parse_utilization(v).map(drop)),
-            ("system.json", |v| parse_system_info(v).map(drop)),
-            ("storage.json", |v| parse_storage(v).map(drop)),
-            ("update.json", |v| parse_update(v).map(drop)),
-        ];
-        for (name, check) in checks {
-            let path = format!("{}/tests/fixtures/real/{name}", env!("CARGO_MANIFEST_DIR"));
-            let Ok(raw) = std::fs::read_to_string(&path) else {
+    fn parses_dsm7_shaped_alarm_states() {
+        let s = parse_storage(&fixture("dsm7/storage_degraded.json")).unwrap();
+        assert_eq!(
+            (s.disks[1].smart_status.as_str(), s.disks[1].status.as_str()),
+            ("failing", "crashed")
+        );
+        assert_eq!(s.pools[0].status, "degraded");
+        assert_eq!(s.pools[0].progress_pct, None);
+        assert_eq!(s.volumes[0].status, "degraded");
+        assert_eq!(s.volumes[0].total_bytes, 3_839_999_999_999);
+        let s = parse_storage(&fixture("dsm7/storage_repairing.json")).unwrap();
+        assert_eq!(
+            (s.pools[0].status.as_str(), s.pools[0].progress_pct),
+            ("repairing", Some(43.0))
+        );
+        assert_eq!(
+            (s.pools[1].status.as_str(), s.pools[1].progress_pct),
+            ("data_scrubbing", Some(7.0))
+        );
+        assert_eq!(
+            parse_update(&fixture("dsm7/update_available.json")).unwrap(),
+            UpdateStatus {
+                available: true,
+                version: Some("DSM 7.4.2-80000".into())
+            }
+        );
+        assert!(
+            !parse_update(&fixture("dsm7/update_none.json"))
+                .unwrap()
+                .available
+        );
+    }
+
+    /// Real responses from the author's NAS (`scripts/capture-fixtures.sh`,
+    /// kept out of git). Skipped when not recorded, so CI and fresh clones
+    /// pass - unless `REQUIRE_REAL_FIXTURES=1`, for a pre-release run on the
+    /// machine that has them.
+    fn recorded(name: &str) -> Option<Value> {
+        let path = format!("{}/tests/fixtures/real/{name}", env!("CARGO_MANIFEST_DIR"));
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => Some(serde_json::from_str(&raw).unwrap()),
+            Err(_) if std::env::var_os("REQUIRE_REAL_FIXTURES").is_some() => {
+                panic!("{path} missing and REQUIRE_REAL_FIXTURES is set")
+            }
+            Err(_) => {
                 eprintln!("skipping {name}: not recorded");
-                continue;
-            };
-            let value: Value = serde_json::from_str(&raw).unwrap();
-            check(&value).unwrap_or_else(|e| panic!("{name}: {e}"));
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn recorded_fixtures_parse_to_sensible_values() {
+        if let Some(v) = recorded("utilization.json") {
+            let u = parse_utilization(&v).unwrap();
+            assert!((0.0..=100.0).contains(&u.cpu.total_pct), "{:?}", u.cpu);
+            assert!(u.cpu.load1.is_some() && u.memory.total_bytes > 0);
+            assert!(u.memory.used_bytes <= u.memory.total_bytes);
+            assert!(u.network.iter().any(|n| n.device == "total"));
+        }
+        if let Some(v) = recorded("system.json") {
+            let s = parse_system_info(&v).unwrap();
+            assert!(s.uptime_secs.is_some_and(|t| t > 0));
+            assert!(s.firmware.is_some_and(|f| f.contains("DSM")));
+        }
+        if let Some(v) = recorded("storage.json") {
+            let s = parse_storage(&v).unwrap();
+            assert!(!s.disks.is_empty() && !s.volumes.is_empty() && !s.pools.is_empty());
+            assert!(s.disks.iter().all(|d| d.smart_status != "unknown"));
+            assert!(
+                s.volumes
+                    .iter()
+                    .all(|v| v.total_bytes > 0 && v.used_bytes <= v.total_bytes)
+            );
+            assert!(s.pools.iter().all(|p| p.status != "unknown"));
+        }
+        if let Some(v) = recorded("update.json") {
+            parse_update(&v).unwrap();
+        }
+        if let Some(v) = recorded("login_keys.json") {
+            let keys: Vec<String> = serde_json::from_value(v).unwrap();
+            // `session::login` reads the device token from this field.
+            assert!(keys.iter().any(|k| k == "did"), "{keys:?}");
+            assert!(keys.iter().any(|k| k == "sid"), "{keys:?}");
         }
     }
 }

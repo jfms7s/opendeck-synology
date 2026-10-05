@@ -5,13 +5,23 @@
 
 use crate::dsm::error::DsmError;
 use crate::dsm::tls::{PinningVerifier, Rejection};
-use crate::settings::Connection;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 
-const TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Where to reach DSM, in the `dsm` layer's own terms (the plugin's
+/// settings turn into this, so a settings change doesn't reach the wire).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    /// `https://nas.lan:5001`
+    pub base_url: String,
+    pub https: bool,
+    /// SHA-256 of the trusted leaf certificate (lowercase hex).
+    pub pinned_sha256: Option<String>,
+}
 
 #[async_trait]
 pub trait Transport: Send + Sync {
@@ -24,40 +34,42 @@ pub trait Transport: Send + Sync {
 pub struct HttpTransport {
     client: reqwest::Client,
     base: String,
-    verifier: Option<Arc<PinningVerifier>>,
 }
 
 impl HttpTransport {
-    pub fn new(conn: &Connection) -> Result<Self, DsmError> {
+    pub fn new(target: &Target) -> Result<Self, DsmError> {
         // The NAS is on the LAN: a system proxy would only get in the way.
-        let mut builder = reqwest::Client::builder().timeout(TIMEOUT).no_proxy();
-        let verifier = if conn.https {
+        // DSM's API never redirects; following one would replay the login
+        // form (password, 2FA code, device token) to wherever it points.
+        let mut builder = reqwest::Client::builder()
+            .timeout(TIMEOUT)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none());
+        if target.https {
             let v = Arc::new(PinningVerifier::with_system_roots(
-                conn.pinned_sha256.clone(),
+                target.pinned_sha256.clone(),
             ));
-            builder = builder.tls_backend_preconfigured(v.clone().client_config());
-            Some(v)
-        } else {
-            None
-        };
+            builder = builder
+                .tls_backend_preconfigured(v.client_config())
+                .https_only(true);
+        }
         let client = builder
             .build()
             .map_err(|e| DsmError::Transport(e.to_string()))?;
         Ok(Self {
             client,
-            base: conn.base_url(),
-            verifier,
+            base: target.base_url.clone(),
         })
     }
+}
 
-    fn send_error(&self, e: reqwest::Error) -> DsmError {
-        match self.verifier.as_ref().and_then(|v| v.take_rejection()) {
-            Some(Rejection::NotTrusted(fingerprint)) => {
-                DsmError::CertificateNotTrusted { fingerprint }
-            }
-            Some(Rejection::Changed(fingerprint)) => DsmError::CertificateChanged { fingerprint },
-            None => DsmError::Transport(reason(e)),
-        }
+/// A failed request as the plugin should treat it: the certificate verdict
+/// rides inside the error itself, so each request reports its own.
+fn send_error(e: reqwest::Error) -> DsmError {
+    match Rejection::find(&e) {
+        Some(Rejection::NotTrusted(fingerprint)) => DsmError::CertificateNotTrusted { fingerprint },
+        Some(Rejection::Changed(fingerprint)) => DsmError::CertificateChanged { fingerprint },
+        None => DsmError::Transport(reason(e)),
     }
 }
 
@@ -75,7 +87,13 @@ impl Transport for HttpTransport {
             .form(form)
             .send()
             .await
-            .map_err(|e| self.send_error(e))?;
+            .map_err(send_error)?;
+        if response.status().is_redirection() {
+            return Err(DsmError::Transport(format!(
+                "the NAS answered with a redirect (HTTP {}); check the host, port and HTTPS setting",
+                response.status().as_u16()
+            )));
+        }
         let response = response
             .error_for_status()
             .map_err(|e| DsmError::Transport(reason(e)))?;
@@ -122,7 +140,9 @@ pub fn unwrap_envelope(body: Value) -> Result<Result<Value, i64>, DsmError> {
 mod tests {
     use super::*;
     use crate::dsm::tls::fingerprint;
-    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::server::{ClientHello, ResolvesServerCert};
+    use rustls::sign::CertifiedKey;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
@@ -136,18 +156,18 @@ mod tests {
         )
     }
 
-    fn conn(port: u16, https: bool, pinned: Option<String>) -> Connection {
-        Connection {
-            host: "127.0.0.1".into(),
-            port,
+    fn target(port: u16, https: bool, pinned: Option<String>) -> Target {
+        let scheme = if https { "https" } else { "http" };
+        Target {
+            base_url: format!("{scheme}://127.0.0.1:{port}"),
             https,
-            account: "jf".into(),
             pinned_sha256: pinned,
         }
     }
 
-    /// Plain-HTTP server answering one request; hands back the raw request.
-    async fn http_server() -> (u16, oneshot::Receiver<String>) {
+    /// Plain-HTTP server answering one request with `reply`; hands back the
+    /// raw request.
+    async fn http_server_replying(reply: String) -> (u16, oneshot::Receiver<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = oneshot::channel();
@@ -156,25 +176,44 @@ mod tests {
             let mut buf = vec![0u8; 16 * 1024];
             let n = tcp.read(&mut buf).await.unwrap();
             let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
-            tcp.write_all(response().as_bytes()).await.unwrap();
+            tcp.write_all(reply.as_bytes()).await.unwrap();
         });
         (port, rx)
     }
 
-    /// HTTPS server with a fresh self-signed certificate; returns its port
-    /// and the certificate's fingerprint.
-    async fn tls_server() -> (u16, String) {
-        let ck = rcgen::generate_simple_self_signed(vec!["nas.lan".to_string()]).unwrap();
-        let fp = fingerprint(ck.cert.der().as_ref());
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()));
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(vec![ck.cert.der().clone()], key)
-        .unwrap();
+    async fn http_server() -> (u16, oneshot::Receiver<String>) {
+        http_server_replying(response()).await
+    }
+
+    fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+        Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+    }
+
+    /// Presents `cert` but signs the handshake with `key` - which, for a
+    /// forged server, is not the certificate's own key.
+    #[derive(Debug)]
+    struct Presents(Arc<CertifiedKey>);
+
+    impl ResolvesServerCert for Presents {
+        fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+            Some(self.0.clone())
+        }
+    }
+
+    /// HTTPS server answering every request; `versions` limits the TLS
+    /// versions it speaks.
+    async fn tls_server_with(
+        cert: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+        versions: &[&'static rustls::SupportedProtocolVersion],
+    ) -> u16 {
+        let signer = provider().key_provider.load_private_key(key).unwrap();
+        let resolver = Presents(Arc::new(CertifiedKey::new(vec![cert], signer)));
+        let config = rustls::ServerConfig::builder_with_provider(provider())
+            .with_protocol_versions(versions)
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(resolver));
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -192,6 +231,24 @@ mod tests {
                 });
             }
         });
+        port
+    }
+
+    fn key_der(k: &rcgen::KeyPair) -> PrivateKeyDer<'static> {
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(k.serialize_der()))
+    }
+
+    /// HTTPS server with a fresh self-signed certificate; returns its port
+    /// and the certificate's fingerprint.
+    async fn tls_server() -> (u16, String) {
+        let ck = rcgen::generate_simple_self_signed(vec!["nas.lan".to_string()]).unwrap();
+        let fp = fingerprint(ck.cert.der().as_ref());
+        let port = tls_server_with(
+            ck.cert.der().clone(),
+            key_der(&ck.signing_key),
+            rustls::DEFAULT_VERSIONS,
+        )
+        .await;
         (port, fp)
     }
 
@@ -218,7 +275,7 @@ mod tests {
     #[tokio::test]
     async fn posts_a_form_body_and_keeps_secrets_out_of_the_url() {
         let (port, request) = http_server().await;
-        let t = HttpTransport::new(&conn(port, false, None)).unwrap();
+        let t = HttpTransport::new(&target(port, false, None)).unwrap();
         let out = t
             .call(
                 "entry.cgi",
@@ -247,7 +304,7 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
-        let t = HttpTransport::new(&conn(port, false, None)).unwrap();
+        let t = HttpTransport::new(&target(port, false, None)).unwrap();
         let err = t.call("query.cgi", &[]).await.unwrap_err();
         assert!(matches!(err, DsmError::Transport(_)), "{err:?}");
     }
@@ -259,7 +316,7 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
-        let t = HttpTransport::new(&conn(port, false, None)).unwrap();
+        let t = HttpTransport::new(&target(port, false, None)).unwrap();
         let DsmError::Transport(msg) = t
             .call("query.cgi", &[("passwd", "p&ss")])
             .await
@@ -277,7 +334,7 @@ mod tests {
     #[tokio::test]
     async fn untrusted_certificate_reports_its_fingerprint() {
         let (port, fp) = tls_server().await;
-        let t = HttpTransport::new(&conn(port, true, None)).unwrap();
+        let t = HttpTransport::new(&target(port, true, None)).unwrap();
         let err = t.call("query.cgi", &[]).await.unwrap_err();
         assert_eq!(err, DsmError::CertificateNotTrusted { fingerprint: fp });
     }
@@ -285,17 +342,112 @@ mod tests {
     #[tokio::test]
     async fn pinned_certificate_connects() {
         let (port, fp) = tls_server().await;
-        let t = HttpTransport::new(&conn(port, true, Some(fp))).unwrap();
+        let t = HttpTransport::new(&target(port, true, Some(fp))).unwrap();
         assert_eq!(
             t.call("query.cgi", &[]).await.unwrap(),
             Ok(json!({ "ok": 1 }))
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_handshakes_each_report_the_certificate() {
+        let (port, fp) = tls_server().await;
+        let t = Arc::new(HttpTransport::new(&target(port, true, Some("00".repeat(32)))).unwrap());
+        let calls = (0..8).map(|_| {
+            let t = t.clone();
+            tokio::spawn(async move { t.call("query.cgi", &[]).await })
+        });
+        for r in futures::future::join_all(calls).await {
+            assert_eq!(
+                r.unwrap().unwrap_err(),
+                DsmError::CertificateChanged {
+                    fingerprint: fp.clone()
+                },
+                "no request mistaken for a network error"
+            );
+        }
+    }
+
+    /// A server that replays the pinned certificate without its private key
+    /// must fail the handshake signature check, in either TLS version.
+    async fn forged_server_is_refused(version: &'static rustls::SupportedProtocolVersion) {
+        let real = rcgen::generate_simple_self_signed(vec!["nas.lan".to_string()]).unwrap();
+        let other_key = rcgen::KeyPair::generate().unwrap();
+        let port = tls_server_with(real.cert.der().clone(), key_der(&other_key), &[version]).await;
+        let pin = fingerprint(real.cert.der().as_ref());
+        let t = HttpTransport::new(&target(port, true, Some(pin))).unwrap();
+        let err = t.call("query.cgi", &[]).await.unwrap_err();
+        assert!(matches!(err, DsmError::Transport(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_replayed_certificate_without_its_key_fails_tls13() {
+        forged_server_is_refused(&rustls::version::TLS13).await;
+    }
+
+    #[tokio::test]
+    async fn a_replayed_certificate_without_its_key_fails_tls12() {
+        forged_server_is_refused(&rustls::version::TLS12).await;
+    }
+
+    #[tokio::test]
+    async fn the_real_key_passes_in_both_tls_versions() {
+        for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            let ck = rcgen::generate_simple_self_signed(vec!["nas.lan".to_string()]).unwrap();
+            let port =
+                tls_server_with(ck.cert.der().clone(), key_der(&ck.signing_key), &[version]).await;
+            let pin = fingerprint(ck.cert.der().as_ref());
+            let t = HttpTransport::new(&target(port, true, Some(pin))).unwrap();
+            assert_eq!(t.call("q", &[]).await.unwrap(), Ok(json!({ "ok": 1 })));
+        }
+    }
+
+    #[tokio::test]
+    async fn redirects_are_not_followed() {
+        let (elsewhere, followed) = http_server().await;
+        let reply = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{elsewhere}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let (port, _) = http_server_replying(reply).await;
+        let t = HttpTransport::new(&target(port, false, None)).unwrap();
+        let DsmError::Transport(msg) = t
+            .call("entry.cgi", &[("passwd", "secret")])
+            .await
+            .unwrap_err()
+        else {
+            panic!("not a transport error")
+        };
+        assert!(msg.contains("redirect"), "{msg}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut followed = followed;
+        assert!(
+            followed.try_recv().is_err(),
+            "the login form went nowhere else"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_nas_that_never_answers_times_out_after_ten_seconds() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (_tcp, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let t = HttpTransport::new(&target(port, false, None)).unwrap();
+        let t0 = tokio::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(60), t.call("query.cgi", &[]))
+            .await
+            .expect("the transport's own timeout fires first");
+        assert!(matches!(result, Err(DsmError::Transport(_))), "{result:?}");
+        assert_eq!(t0.elapsed(), TIMEOUT);
+        assert_eq!(TIMEOUT, Duration::from_secs(10));
+    }
+
     #[tokio::test]
     async fn a_new_certificate_behind_a_pin_is_reported_as_changed() {
         let (port, fp) = tls_server().await;
-        let t = HttpTransport::new(&conn(port, true, Some("00".repeat(32)))).unwrap();
+        let t = HttpTransport::new(&target(port, true, Some("00".repeat(32)))).unwrap();
         let err = t.call("query.cgi", &[]).await.unwrap_err();
         assert_eq!(err, DsmError::CertificateChanged { fingerprint: fp });
     }

@@ -1,0 +1,33 @@
+{
+  "disks": [
+    {
+      "id": "sata1", "name": "Drive 1", "longName": "Drive 1", "diskType": "SATA",
+      "temp": 41, "smart_status": "normal", "status": "normal", "overview_status": "normal",
+      "action_status": { "action_name": "idle", "action_progress": "" }
+    },
+    {
+      "id": "sata2", "name": "Drive 2", "longName": "Drive 2", "diskType": "SATA",
+      "temp": 40, "smart_status": "normal", "status": "normal", "overview_status": "normal",
+      "action_status": { "action_name": "repairing", "action_progress": "43" }
+    }
+  ],
+  "storagePools": [
+    {
+      "id": "reuse_1", "status": "repairing", "device_type": "raid_1", "raidType": "single",
+      "progress": { "cur_step": 1, "is_resync_speed_limited": false, "percent": "43", "remaining_time": 5400, "step": "resync", "total_step": 1 },
+      "scrubbingStatus": "schedule_done", "repair_action": "none", "is_actioning": true
+    },
+    {
+      "id": "reuse_2", "status": "data_scrubbing", "device_type": "raid_5", "raidType": "multiple",
+      "progress": { "cur_step": 1, "is_resync_speed_limited": true, "percent": "7", "remaining_time": 86400, "step": "data_scrubbing", "total_step": 1 },
+      "scrubbingStatus": "scrubbing", "repair_action": "none", "is_actioning": true
+    }
+  ],
+  "volumes": [
+    {
+      "id": "volume_1", "status": "normal", "vol_path": "/volume1", "pool_path": "reuse_1",
+      "size": { "free_inode": "0", "total": "3839999999999", "total_device": "3998639460352", "total_inode": "0", "used": "959999999999" },
+      "progress": { "cur_step": 0, "is_resync_speed_limited": false, "percent": "-1", "remaining_time": 0, "step": "none", "total_step": 0 }
+    }
+  ]
+}
