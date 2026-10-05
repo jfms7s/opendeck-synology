@@ -19,9 +19,9 @@ use crate::settings::{Connection, GlobalSettings, TempUnit};
 use crate::status::ConnStatus;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::SeqCst};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 /// First wait before reading an unreadable keyring again; doubles per try.
 const KEYRING_RETRY: Duration = if cfg!(test) {
@@ -31,6 +31,12 @@ const KEYRING_RETRY: Duration = if cfg!(test) {
 };
 /// Retries before waiting for the user (each read may show an unlock prompt).
 const KEYRING_RETRIES: u32 = 5;
+/// A keyring call taking longer than this is taken to wait on a prompt.
+const KEYRING_PATIENCE: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(2)
+};
 
 #[async_trait]
 pub trait SettingsSink: Send + Sync {
@@ -57,6 +63,8 @@ pub struct Services {
     writing: tokio::sync::Mutex<()>,
     /// Serialises session swaps.
     connecting: tokio::sync::Mutex<()>,
+    /// Settings from OpenDeck waiting to be applied, in order.
+    inbox: OnceLock<mpsc::UnboundedSender<GlobalSettings>>,
     loaded: AtomicBool,
     session: Mutex<Option<Arc<Session>>>,
     epoch: AtomicU64,
@@ -88,6 +96,7 @@ impl Services {
             global: Mutex::new(GlobalSettings::default()),
             writing: tokio::sync::Mutex::new(()),
             connecting: tokio::sync::Mutex::new(()),
+            inbox: OnceLock::new(),
             loaded: AtomicBool::new(false),
             session: Mutex::new(None),
             epoch: AtomicU64::new(0),
@@ -137,6 +146,26 @@ impl Services {
     /// The connected NAS's DSM version, once looked up.
     pub fn firmware(&self) -> Option<String> {
         self.firmware.lock().unwrap().clone()
+    }
+
+    /// Hands settings from OpenDeck over without waiting for them to be
+    /// applied: openaction handles one event at a time, and applying them may
+    /// wait on a keyring prompt, which would hold up every key and panel
+    /// event meanwhile. They are still applied one after another, in order.
+    pub fn receive_global(self: &Arc<Self>, g: GlobalSettings) {
+        let inbox = self.inbox.get_or_init(|| {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let this = Arc::downgrade(self);
+            tokio::spawn(async move {
+                while let Some(g) = rx.recv().await {
+                    let Some(s) = this.upgrade() else { return };
+                    s.load_global(g).await;
+                }
+            });
+            tx
+        });
+        // The receiver lives as long as `self`.
+        let _ = inbox.send(g);
     }
 
     /// Adopts settings loaded from OpenDeck, at startup or when they change.
@@ -297,21 +326,26 @@ impl Services {
     /// Makes a session for the current settings and gives every poller a
     /// new fetch (`None` when it can't connect).
     async fn connect(self: &Arc<Self>, epoch: u64) {
-        let g = {
-            let _w = self.writing.lock().await;
-            let mut g = self.global();
-            let before = g.clone();
-            self.vault.migrate(&mut g).await;
-            if g != before {
-                self.persist(g.clone()).await;
-            }
-            g
-        };
+        let g = self
+            .keyring_step(async {
+                let _w = self.writing.lock().await;
+                let mut g = self.global();
+                let before = g.clone();
+                self.vault.migrate(&mut g).await;
+                if g != before {
+                    self.persist(g.clone()).await;
+                }
+                g
+            })
+            .await;
         if !g.connection.is_complete() {
             *self.password.lock().unwrap() = None;
             return self.go_idle(ConnStatus::NotConfigured);
         }
-        let password = match self.vault.read(&g, Secret::Password).await {
+        let password = match self
+            .keyring_step(self.vault.read(&g, Secret::Password))
+            .await
+        {
             Ok(Some((p, stored))) if !p.is_empty() => {
                 *self.password.lock().unwrap() = Some(stored);
                 self.keyring_retries.store(0, SeqCst);
@@ -340,8 +374,7 @@ impl Services {
         };
         // Over plain HTTP no device token is sent or asked for.
         let did = if g.connection.https {
-            self.vault
-                .read(&g, Secret::Did)
+            self.keyring_step(self.vault.read(&g, Secret::Did))
                 .await
                 .unwrap_or_else(|e| {
                     log::warn!("can't read the 2FA device token from the system keyring: {e}");
@@ -365,6 +398,19 @@ impl Services {
             self.poller(e)
                 .set_fetch(Some(self.fetch_for(e, &session, epoch)));
         }
+    }
+
+    /// Awaits a step that calls the keyring. If it takes long - a prompt
+    /// waiting for the user - keys and panel say so, and nothing polls the
+    /// old session meanwhile; the step's outcome then sets the status.
+    async fn keyring_step<T>(&self, step: impl Future<Output = T>) -> T {
+        let mut step = std::pin::pin!(step);
+        if let Ok(v) = tokio::time::timeout(KEYRING_PATIENCE, step.as_mut()).await {
+            return v;
+        }
+        log::info!("waiting for the system keyring (an access or unlock prompt?)");
+        self.go_idle(ConnStatus::KeyringPending);
+        step.await
     }
 
     /// Reads the keyring again after a while (it may not have been up yet,

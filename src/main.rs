@@ -56,7 +56,7 @@ impl GlobalEventHandler for GlobalEvents {
                 "unreadable plugin settings {unreadable:?}: using their defaults, keeping the rest"
             );
         }
-        self.services.load_global(settings).await;
+        self.services.receive_global(settings);
         Ok(())
     }
 }
@@ -96,4 +96,71 @@ async fn main() -> OpenActionResult<()> {
     // it to time out.
     services.logout().await;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsm::endpoint::Endpoint;
+    use crate::secrets::{MemoryStore, password_key};
+    use crate::services::testing::{conn, eventually, healthy_nas, services_with, wait_for_value};
+    use crate::settings::TempUnit;
+    use crate::status::ConnStatus;
+    use std::time::Duration;
+
+    fn settings_event(g: &GlobalSettings) -> DidReceiveGlobalSettingsEvent {
+        serde_json::from_value(serde_json::json!({ "payload": { "settings": g } })).unwrap()
+    }
+
+    /// openaction handles one event at a time. While the keyring waits for
+    /// the user (macOS's Keychain access prompt after an update, a locked
+    /// Secret Service), the settings handler must not hold up every key
+    /// press and panel message behind it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_keyring_prompt_does_not_hold_up_other_events() {
+        let secrets = Arc::new(MemoryStore::gated(&[(
+            &password_key(&conn().secret_scope()),
+            "pw",
+        )]));
+        let (services, _) = services_with(healthy_nas(), secrets.clone());
+        let mut key = services
+            .poller(Endpoint::Utilization)
+            .subscribe("key-1", None);
+        let events = GlobalEvents {
+            services: services.clone(),
+        };
+        let first = GlobalSettings {
+            connection: conn(),
+            ..GlobalSettings::default()
+        };
+        let second = GlobalSettings {
+            temp_unit: TempUnit::Fahrenheit,
+            ..first.clone()
+        };
+
+        for g in [&first, &second] {
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                events.did_receive_global_settings(settings_event(g)),
+            )
+            .await
+            .expect("the settings handler waited for the keyring")
+            .unwrap();
+        }
+        eventually("keys say the plugin waits for the keyring", || {
+            services.current_status() == ConnStatus::KeyringPending
+        })
+        .await;
+
+        secrets.open_gate();
+        eventually("connected once the prompt is answered", || {
+            matches!(services.current_status(), ConnStatus::Connected { .. })
+        })
+        .await;
+        wait_for_value(&mut key).await;
+        eventually("later settings applied after earlier ones", || {
+            services.global() == second
+        })
+        .await;
+    }
 }

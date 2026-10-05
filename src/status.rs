@@ -19,6 +19,9 @@ pub enum ConnStatus {
     Unreachable(String),
     /// The keyring holds the password (or might) but can't be read now.
     Keyring(String),
+    /// A keyring call is waiting on the user: macOS's Keychain access
+    /// prompt (shown after each update) or a Secret Service unlock prompt.
+    KeyringPending,
 }
 
 impl ConnStatus {
@@ -59,6 +62,9 @@ impl ConnStatus {
             Self::Certificate { changed: true, .. } => "Certificate changed".into(),
             Self::Unreachable(msg) => format!("Unreachable: {msg}"),
             Self::Keyring(msg) => format!("Can't read the password from the system keyring: {msg}"),
+            Self::KeyringPending => {
+                "Waiting for the system keyring - allow access in the system prompt".into()
+            }
         }
     }
 
@@ -73,6 +79,7 @@ impl ConnStatus {
             Self::Certificate { .. } => "certificate",
             Self::Unreachable(_) => "unreachable",
             Self::Keyring(_) => "keyring",
+            Self::KeyringPending => "keyringPending",
         }
     }
 
@@ -81,7 +88,10 @@ impl ConnStatus {
     pub fn severity(&self) -> &'static str {
         match self {
             Self::Connected { .. } => "ok",
-            Self::NotConfigured | Self::Connecting | Self::Auth(AuthError::NeedOtp) => "neutral",
+            Self::NotConfigured
+            | Self::Connecting
+            | Self::KeyringPending
+            | Self::Auth(AuthError::NeedOtp) => "neutral",
             Self::Auth(_) | Self::Certificate { .. } | Self::Unreachable(_) | Self::Keyring(_) => {
                 "bad"
             }
@@ -149,6 +159,12 @@ mod tests {
                 .contains("blocked")
         );
         assert_eq!(ConnStatus::Keyring("locked".into()).kind(), "keyring");
+        assert_eq!(ConnStatus::KeyringPending.kind(), "keyringPending");
+        assert!(
+            ConnStatus::KeyringPending.describe().contains("allow"),
+            "{}",
+            ConnStatus::KeyringPending.describe()
+        );
     }
 
     #[test]
@@ -161,5 +177,7 @@ mod tests {
         assert_eq!(ConnStatus::Auth(AuthError::BadOtp).severity(), "bad");
         assert_eq!(ConnStatus::Keyring("x".into()).severity(), "bad");
         assert_eq!(ConnStatus::Connecting.severity(), "neutral");
+        // Waiting on the user, not failed.
+        assert_eq!(ConnStatus::KeyringPending.severity(), "neutral");
     }
 }

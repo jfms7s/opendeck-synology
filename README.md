@@ -90,7 +90,9 @@ flatpak override --user --talk-name=org.freedesktop.secrets me.amankhanna.opende
 
 then restart OpenDeck and save the password again. If the keyring is there but can't be
 read yet (e.g. still locked right after logging in), keys show `Keyring` and the plugin
-tries again a few times.
+tries again a few times. While the keyring waits for you (an unlock prompt), keys show
+`Keyring` / `Allow access` and the settings panel keeps responding; once you answer,
+the plugin connects.
 
 ## Privacy
 
@@ -141,6 +143,9 @@ self-signed certificate can't pass against a NAS with a publicly trusted one.
 - [ ] Entering a wrong 2FA code shows *Wrong 2FA code*; the right one connects, and the
       device appears under DSM › Personal › Security › Trusted devices.
 - [ ] Restarting OpenDeck reconnects without asking for a code.
+- [ ] Locking the login keyring (e.g. in Seahorse) and restarting OpenDeck: when the
+      unlock prompt appears, keys show `Keyring` / `Allow access` and the settings panel
+      still opens and shows the status; after unlocking, keys connect.
 - [ ] A wrong password shows *Wrong account or password* and DSM's log shows exactly one
       failed login, not one per refresh.
 - [ ] Each of the ten actions shows a sensible value on a key and on a dial; rotating each
