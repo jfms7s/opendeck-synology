@@ -3,6 +3,7 @@ mod dsm;
 mod format;
 mod inspector;
 mod instances;
+mod logging;
 mod metric;
 mod metrics;
 mod poller;
@@ -71,8 +72,7 @@ async fn main() -> OpenActionResult<()> {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    simplelog::SimpleLogger::init(log::LevelFilter::Info, simplelog::Config::default())
-        .expect("logger init");
+    logging::init();
 
     let device_name = format!("OpenDeck-{}", gethostname::gethostname().to_string_lossy());
     let transports: TransportFactory =
