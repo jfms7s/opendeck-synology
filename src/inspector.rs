@@ -12,10 +12,14 @@ use crate::secrets::{Stored, in_flatpak};
 use crate::services::Services;
 use crate::settings::{Connection, TempUnit};
 use crate::status::ConnStatus;
+use futures::FutureExt;
 use openaction::{Instance, OpenActionResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 // Debug only in tests: a derived Debug would print the password.
 #[derive(Deserialize, PartialEq)]
@@ -125,8 +129,11 @@ pub async fn send_state(
         .await
 }
 
+/// Answers `getState` (and anything unrecognised) at once; every other
+/// request goes to `panel`, which applies them in order.
 pub async fn handle(
     services: &Arc<Services>,
+    panel: &PanelInbox,
     metric: Metric,
     instance: &Instance,
     payload: &Value,
@@ -140,18 +147,81 @@ pub async fn handle(
             return send_state(services, metric, instance, Some(notice)).await;
         }
     };
-    // openaction handles one event at a time: a login against a slow NAS or
-    // a keyring unlock prompt must not freeze every key and dial meanwhile.
-    let (services, id) = (services.clone(), instance.instance_id.clone());
+    panel.send(metric, instance.instance_id.clone(), req);
+    Ok(())
+}
+
+/// Runs each job sent to the returned sender to completion before starting
+/// the next, in the order they were sent, on a task of its own. A job that
+/// panics is logged and the worker carries on with the next one.
+fn ordered_worker<J, F, Fut>(run: F) -> mpsc::UnboundedSender<J>
+where
+    J: Send + 'static,
+    F: Fn(J) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let (tx, mut rx) = mpsc::unbounded_channel::<J>();
     tokio::spawn(async move {
-        let notice = apply(&services, req).await;
-        if let Some(instance) = openaction::get_instance(id).await
-            && let Err(e) = send_state(&services, metric, &instance, notice.as_deref()).await
-        {
-            log::warn!("updating the settings panel failed: {e}");
+        while let Some(job) = rx.recv().await {
+            if AssertUnwindSafe(run(job)).catch_unwind().await.is_err() {
+                log::error!("a settings-panel request failed unexpectedly; carrying on");
+            }
         }
     });
-    Ok(())
+    tx
+}
+
+struct PanelJob {
+    metric: Metric,
+    instance_id: String,
+    req: Request,
+}
+
+/// Panel requests that change something, waiting to be applied. openaction
+/// handles one event at a time, so a login against a slow NAS or a keyring
+/// prompt must not run on its loop and freeze every key and dial meanwhile;
+/// but the requests are still applied one after another, in the order the
+/// user sent them (two quick unit changes must end on the last one), like
+/// settings from OpenDeck (`Services::receive_global`).
+#[derive(Clone)]
+pub struct PanelInbox(mpsc::UnboundedSender<PanelJob>);
+
+impl PanelInbox {
+    /// Starts the worker; needs a running tokio runtime.
+    pub fn new(services: Arc<Services>) -> Self {
+        Self::answering_with(services, |services, metric, id, notice| async move {
+            if let Some(instance) = openaction::get_instance(id).await
+                && let Err(e) = send_state(&services, metric, &instance, notice.as_deref()).await
+            {
+                log::warn!("updating the settings panel failed: {e}");
+            }
+        })
+    }
+
+    /// `answer` tells the panel of `instance_id` the outcome of each request.
+    fn answering_with<A, Fut>(services: Arc<Services>, answer: A) -> Self
+    where
+        A: Fn(Arc<Services>, Metric, String, Option<String>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let answer = Arc::new(answer);
+        Self(ordered_worker(move |job: PanelJob| {
+            let (services, answer) = (services.clone(), answer.clone());
+            async move {
+                let notice = apply(&services, job.req).await;
+                answer(services, job.metric, job.instance_id, notice).await;
+            }
+        }))
+    }
+
+    fn send(&self, metric: Metric, instance_id: String, req: Request) {
+        // The worker only stops once every sender is gone.
+        let _ = self.0.send(PanelJob {
+            metric,
+            instance_id,
+            req,
+        });
+    }
 }
 
 /// Carries out a panel request; `Some` is a message for the panel.
@@ -293,6 +363,97 @@ mod tests {
 
     fn save(password: Option<&str>) -> Request {
         save_on(json!(5001), password)
+    }
+
+    /// Two quick requests: the first takes longer, yet the second must not
+    /// overtake it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_jobs_finish_in_the_order_they_were_sent() {
+        let done = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let worker = ordered_worker({
+            let done = done.clone();
+            move |(n, ms): (u32, u64)| {
+                let (done, tx) = (done.clone(), tx.clone());
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    done.lock().unwrap().push(n);
+                    let _ = tx.send(());
+                }
+            }
+        });
+        worker.send((1, 50)).unwrap();
+        worker.send((2, 0)).unwrap();
+        for _ in 0..2 {
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("both jobs ran");
+        }
+        assert_eq!(*done.lock().unwrap(), [1, 2]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicking_job_does_not_stop_later_ones() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let worker = ordered_worker(move |n: u32| {
+            let tx = tx.clone();
+            async move {
+                assert_ne!(n, 1, "job 1 panics");
+                let _ = tx.send(n);
+            }
+        });
+        worker.send(1).unwrap();
+        worker.send(2).unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
+        assert_eq!(got.expect("the worker carried on"), Some(2));
+    }
+
+    /// Arrow keys on the unit `<select>` send one change per step. While a
+    /// slow keyring write holds the settings lock, both changes queue up;
+    /// the last one sent must win, and every request is answered in order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn panel_requests_are_applied_in_the_order_they_arrive() {
+        let secrets = Arc::new(MemoryStore::slow_writes(std::time::Duration::from_millis(
+            200,
+        )));
+        let (s, sink) = services_with(healthy_nas(), secrets);
+        s.load_global(GlobalSettings::default()).await;
+        let (tx, mut answers) = mpsc::unbounded_channel();
+        let panel = PanelInbox::answering_with(s.clone(), move |_, _, id, notice| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send((id, notice));
+            }
+        });
+        panel.send(Metric::SysTemp, "save".into(), save(Some("pw")));
+        panel.send(
+            Metric::SysTemp,
+            "to-f".into(),
+            Request::SetTempUnit {
+                unit: TempUnit::Fahrenheit,
+            },
+        );
+        panel.send(
+            Metric::SysTemp,
+            "to-c".into(),
+            Request::SetTempUnit {
+                unit: TempUnit::Celsius,
+            },
+        );
+        let mut order = Vec::new();
+        for _ in 0..3 {
+            let (id, notice) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), answers.recv())
+                    .await
+                    .expect("every request answered")
+                    .unwrap();
+            assert_eq!(notice, None, "{id}");
+            order.push(id);
+        }
+        assert_eq!(order, ["save", "to-f", "to-c"]);
+        assert_eq!(s.global().temp_unit, TempUnit::Celsius);
+        assert_eq!(sink.last().temp_unit, TempUnit::Celsius);
+        assert!(s.has_password());
     }
 
     #[tokio::test(flavor = "multi_thread")]

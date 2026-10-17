@@ -89,7 +89,8 @@ async fn main() -> OpenActionResult<()> {
     set_global_event_handler(Box::leak(Box::new(GlobalEvents {
         services: services.clone(),
     })));
-    actions::register_all(&services, &instances).await;
+    let panel = inspector::PanelInbox::new(services.clone());
+    actions::register_all(&services, &instances, &panel).await;
 
     let result = run(std::env::args().collect()).await;
     // OpenDeck closed the connection: end the DSM session instead of leaving
