@@ -224,35 +224,73 @@ impl Vault {
     /// back - with a warning - when it can't: the password to the settings
     /// file only when there is no keyring at all, and to memory when the
     /// keyring refused it; the device token to memory either way.
+    /// `store` and then `apply`, for a caller that owns `g` throughout.
+    #[cfg(test)]
     pub async fn write(&self, g: &mut GlobalSettings, which: Secret, value: Option<String>) {
-        self.store_secret(g, which, value, false).await;
+        let written = self.store(g.connection.secret_scope(), which, value).await;
+        self.apply(g, written);
     }
 
-    /// `keep_file_copy`: on a refusal, leave the settings file as it is
-    /// (moving a password that is already there into the keyring).
-    async fn store_secret(
-        &self,
-        g: &mut GlobalSettings,
-        which: Secret,
-        value: Option<String>,
-        keep_file_copy: bool,
-    ) {
-        let scope = g.connection.secret_scope();
+    /// The keyring half of `write`: stores (or deletes) the secret for
+    /// `scope` and returns the outcome for `apply`. Touches no settings, so
+    /// it can wait on a keyring prompt without holding them.
+    pub async fn store(&self, scope: String, which: Secret, value: Option<String>) -> Written {
+        let result = self.set(which.key(&scope), value.clone()).await;
+        Written {
+            scope,
+            which,
+            value,
+            result,
+            from_file: false,
+        }
+    }
+
+    /// The bookkeeping half of `write`: records where the secret ended up
+    /// (the settings-file copy in `g`, the memory copy). If `g` moved on to
+    /// another connection while the keyring call ran, nothing is filed
+    /// under the new one; a move out of the settings file applies only if
+    /// the file still holds the value that was moved.
+    pub fn apply(&self, g: &mut GlobalSettings, w: Written) {
+        let Written {
+            scope,
+            which,
+            value,
+            result,
+            from_file,
+        } = w;
+        let memory = which.memory(self);
+        if g.connection.secret_scope() != scope {
+            log::info!("the connection changed while the keyring stored the {which:?}");
+            // The keyring now holds the newest value for that connection.
+            if result.is_ok() && self.in_memory(which, &scope).is_some() {
+                *memory.lock().unwrap() = None;
+            }
+            return;
+        }
+        if from_file
+            && Self::fallback_for(g)
+                .cloned()
+                .and_then(|mut f| which.slot(&mut f).take())
+                != value
+        {
+            log::info!("the settings file changed while its {which:?} moved to the keyring");
+            return;
+        }
         if Self::fallback_for(g).is_none() {
             // Nothing there, or another connection's secrets: start afresh.
             g.fallback_secrets = None;
         }
-        let result = self.set(which.key(&scope), value.clone()).await;
         let fallback = g
             .fallback_secrets
             .get_or_insert_with(FallbackSecrets::default);
         fallback.scope = Some(scope.clone());
         let slot = which.slot(fallback);
-        let memory = which.memory(self);
         *memory.lock().unwrap() = None;
         match (result, which) {
             (Ok(()), _) => *slot = None,
-            (Err(StoreError::Refused(_)), Secret::Password) if keep_file_copy => {}
+            // Moving a file password: on a refusal it stays in the file, the
+            // only copy that outlives a restart.
+            (Err(StoreError::Refused(_)), Secret::Password) if from_file => {}
             (Err(e @ StoreError::Refused(_)), Secret::Password) => {
                 log::warn!(
                     "the system keyring refused the password ({e}); keeping it in memory only until OpenDeck restarts"
@@ -282,7 +320,8 @@ impl Vault {
         }
     }
 
-    /// Brings stored secrets up to date for the current connection:
+    /// Brings stored secrets up to date for the connection in `g`, a
+    /// snapshot of the settings:
     /// - secrets that fell back to the settings file move into the keyring
     ///   if it works now (a device token never stays in the file; a
     ///   password the keyring refuses stays where it is, the only copy that
@@ -290,21 +329,29 @@ impl Vault {
     /// - keyring entries filed under the pre-0.3 `account@host` scope move
     ///   to this connection's scope - for an HTTPS connection only, since
     ///   they may have been saved for HTTPS.
-    pub async fn migrate(&self, g: &mut GlobalSettings) {
+    ///
+    /// Only calls the keyring: the returned moves out of the settings file
+    /// go to `apply`, against the settings as they are by then.
+    pub async fn migrate(&self, g: &GlobalSettings) -> Vec<Written> {
+        let scope = g.connection.secret_scope();
         let fallback = Self::fallback_for(g).cloned().unwrap_or_default();
-        if let Some(pw) = fallback.password {
-            self.store_secret(g, Secret::Password, Some(pw), true).await;
-        }
-        if let Some(did) = fallback.did {
-            self.write(g, Secret::Did, Some(did)).await;
+        let mut moved = Vec::new();
+        for (which, value) in [
+            (Secret::Password, fallback.password),
+            (Secret::Did, fallback.did),
+        ] {
+            if let Some(v) = value {
+                let w = self.store(scope.clone(), which, Some(v)).await;
+                moved.push(Written {
+                    from_file: true,
+                    ..w
+                });
+            }
         }
         if !g.connection.https {
-            return;
+            return moved;
         }
-        let (scope, legacy) = (
-            g.connection.secret_scope(),
-            g.connection.legacy_secret_scope(),
-        );
+        let legacy = g.connection.legacy_secret_scope();
         for which in [Secret::Password, Secret::Did] {
             let (new_key, old_key) = (which.key(&scope), which.key(&legacy));
             // A memory copy replaced whatever the old entry holds.
@@ -321,6 +368,29 @@ impl Vault {
                 log::info!("moved the saved {which:?} to the new keyring entry name");
             }
         }
+        moved
+    }
+}
+
+/// A finished keyring write, waiting for `Vault::apply` to record where the
+/// secret ended up. `Debug` leaves the value out.
+pub struct Written {
+    scope: String,
+    which: Secret,
+    value: Option<String>,
+    result: Result<(), StoreError>,
+    /// Moves a settings-file copy into the keyring.
+    from_file: bool,
+}
+
+impl std::fmt::Debug for Written {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Written")
+            .field("scope", &self.scope)
+            .field("which", &self.which)
+            .field("result", &self.result)
+            .field("from_file", &self.from_file)
+            .finish_non_exhaustive()
     }
 }
 
@@ -470,7 +540,7 @@ impl MemoryStore {
             .count()
     }
 
-    /// The same store, with writes taking `delay` (refused ones too).
+    /// The same store, with writes taking `delay` (failing ones too).
     pub fn with_write_delay(mut self, delay: std::time::Duration) -> Self {
         self.write_delay = delay;
         self
@@ -525,13 +595,13 @@ impl SecretStore for MemoryStore {
     }
 
     fn set(&self, key: &str, value: Option<&str>) -> Result<(), StoreError> {
+        std::thread::sleep(self.write_delay);
         if self.read_only {
             return Err(StoreError::Unavailable("cannot create item".into()));
         }
         if self.broken {
             return Err(StoreError::Unavailable("no keyring".into()));
         }
-        std::thread::sleep(self.write_delay);
         if self.refusing.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(StoreError::Refused("the user denied access".into()));
         }
