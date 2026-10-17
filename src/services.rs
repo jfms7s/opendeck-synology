@@ -58,8 +58,15 @@ pub fn target_for(conn: &Connection) -> Target {
 pub struct Services {
     pollers: [Poller<Payload>; 4],
     global: Mutex<GlobalSettings>,
-    /// Serialises read-modify-write of `global`, which can span keyring
-    /// calls: without it a slow write could put back a stale snapshot.
+    /// Serialises keyring writes (and the settings changes recording their
+    /// outcome), so secret writes never reorder against each other. Held
+    /// across keyring calls, which may wait on a prompt for as long as the
+    /// user takes. Lock order: `connecting`, then `secrets`, then `writing`.
+    secrets: tokio::sync::Mutex<()>,
+    /// Serialises read-modify-write of `global`, so no change puts back a
+    /// stale snapshot. Never held across a keyring call: a secret write
+    /// takes it only once the keyring answered, re-reads `global` and
+    /// applies the outcome to that (`Vault::apply`). Taken after `secrets`.
     writing: tokio::sync::Mutex<()>,
     /// Serialises session swaps.
     connecting: tokio::sync::Mutex<()>,
@@ -98,6 +105,7 @@ impl Services {
         Arc::new(Self {
             pollers: Endpoint::ALL.map(|e| Poller::new(e.default_interval())),
             global: Mutex::new(GlobalSettings::default()),
+            secrets: tokio::sync::Mutex::new(()),
             writing: tokio::sync::Mutex::new(()),
             connecting: tokio::sync::Mutex::new(()),
             inbox: OnceLock::new(),
@@ -191,7 +199,12 @@ impl Services {
             tokio::spawn(async move {
                 while let Some(g) = rx.recv().await {
                     let Some(s) = this.upgrade() else { return };
-                    s.load_global(g).await;
+                    // Reconnecting may wait on a keyring prompt; the next
+                    // settings must not queue behind it. Reconnects queue on
+                    // `connecting` and each reads the settings afresh.
+                    if s.adopt(g).await {
+                        tokio::spawn(async move { s.reconnect().await });
+                    }
                 }
             });
             tx
@@ -200,12 +213,26 @@ impl Services {
         let _ = inbox.send(g);
     }
 
-    /// Adopts settings loaded from OpenDeck, at startup or when they change.
+    /// Adopts settings loaded from OpenDeck and waits for the reconnect, if
+    /// any: what the inbox does, for tests that need it done.
+    #[cfg(test)]
     pub async fn load_global(self: &Arc<Self>, g: GlobalSettings) {
-        let unchanged = {
+        if self.adopt(g).await {
+            self.reconnect().await;
+        }
+    }
+
+    /// Adopts settings loaded from OpenDeck, at startup or when they
+    /// change, and says whether the connection needs replacing: the first
+    /// time, and after any change but the display unit's.
+    async fn adopt(&self, g: GlobalSettings) -> bool {
+        let same_connection = {
             let _w = self.writing.lock().await;
             let mut cur = self.global.lock().unwrap();
-            let same = *cur == g;
+            let same = GlobalSettings {
+                temp_unit: g.temp_unit,
+                ..cur.clone()
+            } == g;
             self.display.send_if_modified(|u| {
                 let changed = *u != g.temp_unit;
                 *u = g.temp_unit;
@@ -214,10 +241,7 @@ impl Services {
             *cur = g;
             same
         };
-        if self.loaded.swap(true, SeqCst) && unchanged {
-            return;
-        }
-        self.reconnect().await;
+        !(self.loaded.swap(true, SeqCst) && same_connection)
     }
 
     /// Saves the connection block of the settings panel. `password: None`
@@ -227,6 +251,18 @@ impl Services {
     pub async fn save_connection(self: &Arc<Self>, mut conn: Connection, password: Option<String>) {
         let _saving = Saving::start(&self.saving);
         {
+            let _s = self.secrets.lock().await;
+            // The new connection's password first: the keyring may wait on
+            // a prompt, and nothing else waits for it meanwhile.
+            let written = match password {
+                Some(pw) => Some(
+                    self.vault
+                        .store(conn.secret_scope(), Secret::Password, Some(pw))
+                        .await,
+                ),
+                None => None,
+            };
+            // Then the connection and where its password ended up, together.
             let _w = self.writing.lock().await;
             let mut g = self.global();
             // Another NAS has another certificate: the old pin must not carry over.
@@ -241,8 +277,8 @@ impl Services {
                 g.fallback_secrets = None;
             }
             g.connection = conn;
-            if let Some(pw) = password {
-                self.vault.write(&mut g, Secret::Password, Some(pw)).await;
+            if let Some(w) = written {
+                self.vault.apply(&mut g, w);
             }
             self.persist(g).await;
         }
@@ -366,10 +402,14 @@ impl Services {
     async fn connect(self: &Arc<Self>, epoch: u64) {
         let g = self
             .keyring_step(async {
+                let _s = self.secrets.lock().await;
+                let moved = self.vault.migrate(&self.global()).await;
                 let _w = self.writing.lock().await;
                 let mut g = self.global();
                 let before = g.clone();
-                self.vault.migrate(&mut g).await;
+                for w in moved {
+                    self.vault.apply(&mut g, w);
+                }
                 if g != before {
                     self.persist(g.clone()).await;
                 }
@@ -569,13 +609,16 @@ impl Services {
     }
 
     async fn store_did(&self, epoch: u64, did: Option<String>) {
-        let _w = self.writing.lock().await;
+        let _s = self.secrets.lock().await;
         if !self.is_current(epoch) {
             return;
         }
+        let scope = self.global().connection.secret_scope();
+        let written = self.vault.store(scope, Secret::Did, did).await;
+        let _w = self.writing.lock().await;
         let mut g = self.global();
         let before = g.clone();
-        self.vault.write(&mut g, Secret::Did, did).await;
+        self.vault.apply(&mut g, written);
         if g != before {
             self.persist(g).await;
         }
@@ -1600,6 +1643,275 @@ mod tests {
         let last = sink.last();
         assert_eq!(last.temp_unit, TempUnit::Fahrenheit);
         assert_eq!(last.connection.host, "nas.lan");
+    }
+
+    /// Waits (up to 500 ms) until `check` holds: what a keyring prompt must
+    /// not hold up.
+    async fn promptly(what: &str, check: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while !check() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("waited for the keyring: {what}"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_temp_unit_does_not_wait_for_a_keyring_write() {
+        let secrets = Arc::new(MemoryStore::slow_writes(Duration::from_millis(1500)));
+        let (s, sink) = services_with(healthy_nas(), secrets);
+        s.load_global(GlobalSettings::default()).await;
+        let saving = {
+            let s = s.clone();
+            tokio::spawn(async move { s.save_connection(conn(), Some("pw".into())).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            s.set_temp_unit(TempUnit::Fahrenheit),
+        )
+        .await
+        .expect("the unit change waited for the keyring write");
+        assert_eq!(sink.last().temp_unit, TempUnit::Fahrenheit);
+        assert_eq!(*s.display().borrow(), TempUnit::Fahrenheit);
+        saving.await.unwrap();
+        let last = sink.last();
+        assert_eq!(last.temp_unit, TempUnit::Fahrenheit);
+        assert_eq!(last.connection.host, "nas.lan");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_unit_change_from_opendeck_does_not_wait_for_a_keyring_write() {
+        let secrets = Arc::new(MemoryStore::slow_writes(Duration::from_millis(1500)));
+        let (s, sink) = services_with(healthy_nas(), secrets);
+        s.load_global(GlobalSettings::default()).await;
+        let saving = {
+            let s = s.clone();
+            tokio::spawn(async move { s.save_connection(conn(), Some("pw".into())).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let unit_only = GlobalSettings {
+            temp_unit: TempUnit::Fahrenheit,
+            ..s.global()
+        };
+        tokio::time::timeout(Duration::from_millis(500), s.load_global(unit_only))
+            .await
+            .expect("the settings change waited for the keyring write");
+        assert_eq!(*s.display().borrow(), TempUnit::Fahrenheit);
+        saving.await.unwrap();
+        let last = sink.last();
+        assert_eq!(last.temp_unit, TempUnit::Fahrenheit, "not put back");
+        assert_eq!(last.connection.host, "nas.lan");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opendeck_settings_do_not_queue_behind_a_keyring_prompt() {
+        // Startup: reading the keyring waits on its access prompt.
+        let secrets = Arc::new(MemoryStore::gated(&[(&password_key(&scope()), "pw")]));
+        let (s, _) = services_with(healthy_nas(), secrets.clone());
+        let _k = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let first = GlobalSettings {
+            connection: conn(),
+            ..GlobalSettings::default()
+        };
+        s.receive_global(first.clone());
+        wait_for(&s, |st| *st == ConnStatus::KeyringPending).await;
+        let second = GlobalSettings {
+            temp_unit: TempUnit::Fahrenheit,
+            ..first
+        };
+        s.receive_global(second.clone());
+        promptly("a unit change from OpenDeck", || {
+            s.global() == second && *s.display().borrow() == TempUnit::Fahrenheit
+        })
+        .await;
+        secrets.open_gate();
+        wait_for(&s, connected).await;
+        assert_eq!(s.global(), second);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn trusting_a_certificate_does_not_wait_for_a_keyring_write() {
+        let secrets = Arc::new(MemoryStore::slow_writes(Duration::from_millis(1000)));
+        let (s, sink) = services_over(cert_then_nas(healthy_nas()), secrets.clone());
+        s.load_global(GlobalSettings::default()).await;
+        s.save_connection(conn(), Some("pw".into())).await;
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        wait_for(&s, |st| {
+            matches!(st, ConnStatus::Certificate { changed: false, .. })
+        })
+        .await;
+        // The user types a new password, then trusts the certificate while
+        // the keyring still takes the password.
+        let saving = {
+            let s = s.clone();
+            tokio::spawn(async move { s.save_connection(conn(), Some("pw2".into())).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let trusting = {
+            let s = s.clone();
+            tokio::spawn(async move { s.trust_certificate("AB").await })
+        };
+        promptly("the pin is saved", || {
+            sink.last().connection.pinned_sha256.as_deref() == Some("ab")
+        })
+        .await;
+        assert!(trusting.await.unwrap());
+        saving.await.unwrap();
+        assert_eq!(
+            sink.last().connection.pinned_sha256.as_deref(),
+            Some("ab"),
+            "the save kept the pin"
+        );
+        assert_eq!(secrets.get(&password_key(&scope())), Ok(Some("pw2".into())));
+        wait_for(&s, connected).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn secret_writes_and_other_changes_never_save_a_stale_snapshot() {
+        let secrets = Arc::new(MemoryStore::slow_writes(Duration::from_millis(150)));
+        let (s, sink) = services_with(healthy_nas(), secrets.clone());
+        s.load_global(GlobalSettings::default()).await;
+        let other = Connection {
+            host: "other.lan".into(),
+            ..conn()
+        };
+        let a = {
+            let s = s.clone();
+            tokio::spawn(async move { s.save_connection(conn(), Some("pw-a".into())).await })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        s.set_temp_unit(TempUnit::Fahrenheit).await;
+        let b = {
+            let (s, other) = (s.clone(), other.clone());
+            tokio::spawn(async move { s.save_connection(other, Some("pw-b".into())).await })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        s.set_temp_unit(TempUnit::Fahrenheit).await;
+        a.await.unwrap();
+        b.await.unwrap();
+
+        let saved = sink.0.lock().unwrap().clone();
+        let f = saved
+            .iter()
+            .position(|g| g.temp_unit == TempUnit::Fahrenheit)
+            .expect("the unit was saved");
+        for (i, g) in saved.iter().enumerate().skip(f) {
+            assert_eq!(g.temp_unit, TempUnit::Fahrenheit, "save {i} put °C back");
+        }
+        let first_a = saved
+            .iter()
+            .position(|g| g.connection.host == "nas.lan")
+            .expect("save A landed");
+        let first_b = saved
+            .iter()
+            .position(|g| g.connection.host == "other.lan")
+            .expect("save B landed");
+        assert!(first_a < first_b, "the saves landed in order");
+        for (i, g) in saved.iter().enumerate().skip(first_b) {
+            assert_eq!(g.connection.host, "other.lan", "save {i} put A back");
+        }
+        assert_eq!(
+            secrets.get(&password_key(&scope())),
+            Ok(Some("pw-a".into()))
+        );
+        assert_eq!(
+            secrets.get(&password_key(&other.secret_scope())),
+            Ok(Some("pw-b".into()))
+        );
+        assert_eq!(s.global().connection.host, "other.lan");
+        assert_eq!(s.global().temp_unit, TempUnit::Fahrenheit);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_secret_write_for_a_connection_left_meanwhile_files_nothing_under_the_new_one() {
+        // No keyring, and a slow one: moving the file password "into the
+        // keyring" fails only after the settings switched to another NAS.
+        let secrets = Arc::new(MemoryStore::broken().with_write_delay(Duration::from_millis(300)));
+        let (s, sink) = services_with(healthy_nas(), secrets);
+        let first = {
+            let s = s.clone();
+            tokio::spawn(async move { s.load_global(with_file_password("pw")).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let other = GlobalSettings {
+            connection: Connection {
+                host: "other.lan".into(),
+                ..conn()
+            },
+            ..GlobalSettings::default()
+        };
+        s.load_global(other.clone()).await;
+        first.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for g in sink.0.lock().unwrap().iter() {
+            if g.connection.host == "other.lan" {
+                assert_eq!(
+                    g.fallback_secrets, None,
+                    "nas.lan's password went to other.lan"
+                );
+            }
+        }
+        assert_eq!(s.global(), other);
+        assert!(!s.has_password(), "other.lan has no password of its own");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_device_token_stored_while_the_connection_changes_leaves_the_new_ones_file_alone() {
+        // No keyring, and a slow one: the token's write fails only after
+        // OpenDeck switched the settings to another NAS with its own file
+        // password.
+        let secrets = Arc::new(MemoryStore::broken().with_write_delay(Duration::from_millis(300)));
+        let (s, sink) = services_with(healthy_nas(), secrets);
+        s.load_global(with_file_password("pw")).await;
+        let epoch = s.epoch.load(SeqCst);
+        let storing = {
+            let s = s.clone();
+            tokio::spawn(async move { s.store_did(epoch, Some("dev-1".into())).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let other = Connection {
+            host: "other.lan".into(),
+            ..conn()
+        };
+        let next = GlobalSettings {
+            connection: other.clone(),
+            fallback_secrets: Some(FallbackSecrets {
+                password: Some("pw-other".into()),
+                scope: Some(other.secret_scope()),
+                ..FallbackSecrets::default()
+            }),
+            ..GlobalSettings::default()
+        };
+        s.load_global(next.clone()).await;
+        storing.await.unwrap();
+        for g in sink.0.lock().unwrap().iter() {
+            if g.connection.host == "other.lan" {
+                assert_eq!(g.fallback_secrets, next.fallback_secrets, "re-filed");
+            }
+        }
+        assert_eq!(s.global(), next);
+        assert_eq!(s.password_stored(), Some(Stored::SettingsFile));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_password_replaced_while_it_moves_to_the_keyring_is_not_lost() {
+        let secrets = Arc::new(MemoryStore::slow_writes(Duration::from_millis(300)));
+        let nas = healthy_nas();
+        let (s, _) = services_with(nas.clone(), secrets.clone());
+        let first = {
+            let s = s.clone();
+            tokio::spawn(async move { s.load_global(with_file_password("old")).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // OpenDeck hands over a newer file password meanwhile.
+        s.load_global(with_file_password("new")).await;
+        first.await.unwrap();
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        wait_for(&s, connected).await;
+        assert_eq!(secrets.get(&password_key(&scope())), Ok(Some("new".into())));
+        assert_eq!(last_login_password(&nas).as_deref(), Some("new"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
