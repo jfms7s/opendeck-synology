@@ -49,7 +49,10 @@ first successful refresh.
    update macOS asks once per saved secret - the password and, with 2FA, the device
    token - whether `opendeck-synology` may use it: choose **Always Allow**. Until you
    answer, keys show `Keyring` / `Allow access` and the settings panel keeps
-   responding. If you choose Deny, keys show `Keyring` and the plugin asks again later.
+   responding. If you choose Deny, keys show `Keyring` / `Press to retry` and the plugin
+   does not ask again by itself: press a key or save in the panel to get the prompt
+   back. A password you save while the Keychain refuses it is kept in memory only until
+   OpenDeck restarts, never in OpenDeck's settings file; the panel says so.
 3. **Self-signed certificate** (the DSM default): the panel shows the certificate's SHA-256
    fingerprint. Compare it with DSM › Control Panel › Security › Certificate, then
    **Trust this certificate**. Only that exact fingerprint is trusted: if the NAS presents
@@ -94,11 +97,16 @@ the keyring:
 flatpak override --user --talk-name=org.freedesktop.secrets me.amankhanna.opendeck
 ```
 
-then restart OpenDeck and save the password again. If the keyring is there but can't be
-read yet (e.g. still locked right after logging in), keys show `Keyring` and the plugin
-tries again a few times. While the keyring waits for you (an unlock prompt), keys show
-`Keyring` / `Allow access` and the settings panel keeps responding; once you answer,
-the plugin connects.
+then restart OpenDeck and save the password again. Only a missing keyring (no Secret
+Service on the bus, or no keychain on macOS) sends the password to the settings file. If
+the keyring is there but says no - an unlock or access prompt dismissed or denied, a
+locked collection - a password you save is kept in memory only until OpenDeck restarts,
+and the panel says so. If the keyring can't be reached yet (e.g. Secret Service not up
+right after logging in), keys show `Keyring` and the plugin tries again a few times; if it
+refused, keys show `Keyring` / `Press to retry` and the plugin waits for a key press or a
+save before asking again, so no prompt keeps coming back. While the keyring waits for you
+(an unlock prompt), keys show `Keyring` / `Allow access` and the settings panel keeps
+responding; once you answer, the plugin connects.
 
 ## Privacy
 
@@ -161,6 +169,9 @@ self-signed certificate can't pass against a NAS with a publicly trusted one.
 - [ ] Locking the login keyring (e.g. in Seahorse) and restarting OpenDeck: when the
       unlock prompt appears, keys show `Keyring` / `Allow access` and the settings panel
       still opens and shows the status; after unlocking, keys connect.
+- [ ] Locking the login keyring, restarting OpenDeck and dismissing the unlock prompt:
+      keys show `Keyring` / `Press to retry` and no prompt comes back by itself; pressing
+      a key brings the prompt back, and unlocking connects.
 - [ ] A wrong password shows *Wrong account or password* and DSM's log shows exactly one
       failed login, not one per refresh.
 - [ ] Each of the ten actions shows a sensible value on a key and on a dial; rotating each
@@ -198,6 +209,11 @@ On a Mac (Apple Silicon), with the release bundle installed through OpenDeck:
       OpenDeck. One Keychain prompt per saved secret appears; until it is answered keys
       show `Keyring` / `Allow access` and the settings panel still opens. After **Always
       Allow** they connect, and another restart shows no prompt. (Record the prompt count and correct the setup notes if it differs.)
+- [ ] Choosing **Deny** at the Keychain prompt after an update: keys show `Keyring` /
+      `Press to retry` and no prompt comes back by itself; pressing a key asks again.
+- [ ] Saving the password and choosing **Deny** at the Keychain prompt: the panel says the
+      password is kept in memory until OpenDeck restarts, keys connect, and
+      `~/Library/Application Support/opendeck/` contains no password (grep for it).
 - [ ] Keychain Access lists the password and device token under `com.jfms7s.synology`.
 - [ ] Self-signed certificate: trusting the fingerprint works as on Linux.
 - [ ] After a 2FA login, restarting OpenDeck reconnects without a code and without a

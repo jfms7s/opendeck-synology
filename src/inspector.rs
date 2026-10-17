@@ -321,6 +321,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn the_panel_is_told_when_a_refused_keyring_left_the_password_in_memory() {
+        let (s, sink) = services_with(healthy_nas(), Arc::new(MemoryStore::refusing(&[])));
+        s.load_global(GlobalSettings::default()).await;
+        apply(&s, save(Some("pw-secret"))).await;
+        let msg = state_message(&s, Metric::Cpu, None);
+        assert_eq!(msg["hasPassword"], true);
+        assert_eq!(msg["passwordStorage"], "memory");
+        assert!(!msg.to_string().contains("pw-secret"));
+        assert!(
+            !serde_json::to_string(&sink.last())
+                .unwrap()
+                .contains("pw-secret")
+        );
+    }
+
+    #[test]
+    fn the_panel_has_text_for_every_password_storage_and_keyring_state() {
+        let html = include_str!("../assets/propertyInspector/index.html");
+        for name in ["keyring", "settingsFile", "memory"] {
+            assert!(
+                html.contains(&format!("{name}: \"")),
+                "no placeholder for {name}"
+            );
+            assert!(
+                html.contains(&format!("st.passwordStorage === \"{name}\"")) || name == "keyring",
+                "no storage warning for {name}"
+            );
+        }
+        assert!(html.contains("st.status.kind === \"keyringRefused\""));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn an_invalid_port_is_answered_and_nothing_is_saved() {
         let (s, sink) = services_with(healthy_nas(), Arc::new(MemoryStore::default()));
         s.load_global(GlobalSettings::default()).await;

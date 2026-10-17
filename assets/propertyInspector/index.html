@@ -230,6 +230,7 @@
 			const where = {
 				keyring: "saved in the system keyring",
 				settingsFile: "saved in OpenDeck's settings file",
+				memory: "kept in memory until OpenDeck restarts",
 			}[st.passwordStorage];
 			$("password").placeholder = st.hasPassword ? `•••••••• (${where || "saved"})` : "";
 			$("password-hint").textContent = st.hasPassword ? "Leave empty to keep the saved password." : "";
@@ -239,9 +240,13 @@
 			$("storage-warning").textContent =
 				st.passwordStorage === "settingsFile"
 					? "No system keyring could be used, so the password is stored unencrypted in OpenDeck's settings file. The 2FA device token is not stored at all: a code is asked for again after each restart." + flatpakHint
-					: st.status.kind === "keyring"
-						? "The system keyring can't be read right now; the plugin retries a few times. Unlock it, or type the password again to store it in OpenDeck's settings file instead." + flatpakHint
-						: "";
+					: st.passwordStorage === "memory"
+						? "The system keyring refused the password, so it is only kept in memory until OpenDeck restarts - never in the settings file. To keep it, type it again and save, and allow access when the keyring asks."
+						: st.status.kind === "keyringRefused"
+							? "The system keyring refused access to the saved password, so the plugin stopped asking. Press a key or save to ask again, and allow access when the keyring asks. A password typed in while access is refused is only kept in memory until OpenDeck restarts."
+							: st.status.kind === "keyring"
+								? "The system keyring can't be reached right now; the plugin tries again a few times. Start or unlock it - or, if this computer has no keyring, type the password again to store it in OpenDeck's settings file instead." + flatpakHint
+								: "";
 			// A notice answers one request; the 2 s refreshes don't clear it.
 			if (st.notice) $("notice").textContent = st.notice;
 

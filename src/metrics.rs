@@ -108,6 +108,7 @@ fn connection_reading(metric: Metric, status: &ConnStatus) -> Option<Reading> {
         ConnStatus::Auth(_) => ("Login", "Check settings", Level::Error),
         ConnStatus::Certificate { .. } => ("Cert", "Check settings", Level::Error),
         ConnStatus::Keyring(_) => ("Keyring", "Open settings", Level::Error),
+        ConnStatus::KeyringRefused(_) => ("Keyring", "Press to retry", Level::Error),
         ConnStatus::KeyringPending => ("Keyring", "Allow access", Level::Warn),
         ConnStatus::Connecting | ConnStatus::Connected { .. } | ConnStatus::Unreachable(_) => {
             return None;
@@ -1045,6 +1046,18 @@ mod tests {
         };
         let r = read(Metric::Cpu, &state(util()), &view(), &ctx);
         assert_eq!((r.value.as_str(), r.level), ("Keyring", Level::Error));
+    }
+
+    #[test]
+    fn a_refused_keyring_tells_every_key_to_press_to_retry() {
+        let status = ConnStatus::KeyringRefused("denied".into());
+        let ctx = Context {
+            status: &status,
+            unit: TempUnit::Celsius,
+        };
+        let r = read(Metric::Cpu, &state(util()), &view(), &ctx);
+        assert_eq!((r.value.as_str(), r.level), ("Keyring", Level::Error));
+        assert_eq!(r.subject, "Press to retry");
     }
 
     #[test]
