@@ -2,7 +2,7 @@
 //! generic `MetricAction` is instantiated per metric through a marker type;
 //! everything metric-specific lives in `metrics`.
 
-use crate::inspector;
+use crate::inspector::{self, PanelInbox};
 use crate::instances::Instances;
 use crate::metric::Metric;
 use crate::services::Services;
@@ -37,8 +37,12 @@ macro_rules! kinds {
         #[cfg(test)]
         pub const REGISTERED: &[Metric] = &[$(Metric::$name),*];
 
-        pub async fn register_all(services: &Arc<Services>, instances: &Arc<Instances>) {
-            $( register_action(MetricAction::<$name>::new(services.clone(), instances.clone())).await; )*
+        pub async fn register_all(
+            services: &Arc<Services>,
+            instances: &Arc<Instances>,
+            panel: &PanelInbox,
+        ) {
+            $( register_action(MetricAction::<$name>::new(services.clone(), instances.clone(), panel.clone())).await; )*
         }
     };
 }
@@ -50,14 +54,16 @@ kinds!(
 pub struct MetricAction<K> {
     services: Arc<Services>,
     instances: Arc<Instances>,
+    panel: PanelInbox,
     _kind: PhantomData<fn() -> K>,
 }
 
 impl<K: MetricKind> MetricAction<K> {
-    pub fn new(services: Arc<Services>, instances: Arc<Instances>) -> Self {
+    pub fn new(services: Arc<Services>, instances: Arc<Instances>, panel: PanelInbox) -> Self {
         Self {
             services,
             instances,
+            panel,
             _kind: PhantomData,
         }
     }
@@ -152,7 +158,7 @@ impl<K: MetricKind> Action for MetricAction<K> {
         _: &ActionSettings,
         payload: &Value,
     ) -> OpenActionResult<()> {
-        inspector::handle(&self.services, K::METRIC, instance, payload).await
+        inspector::handle(&self.services, &self.panel, K::METRIC, instance, payload).await
     }
 }
 
