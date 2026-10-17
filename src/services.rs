@@ -72,6 +72,11 @@ pub struct Services {
     connecting: tokio::sync::Mutex<()>,
     /// Settings from OpenDeck waiting to be applied, in order.
     inbox: OnceLock<mpsc::UnboundedSender<GlobalSettings>>,
+    /// Counts settings from OpenDeck that need a reconnect; and the count
+    /// the newest connection was made with. Both change under `writing`, so
+    /// a connection covers every change counted before it read `global`.
+    settings_gen: AtomicU64,
+    connected_gen: AtomicU64,
     loaded: AtomicBool,
     session: Mutex<Option<Arc<Session>>>,
     epoch: AtomicU64,
@@ -109,6 +114,8 @@ impl Services {
             writing: tokio::sync::Mutex::new(()),
             connecting: tokio::sync::Mutex::new(()),
             inbox: OnceLock::new(),
+            settings_gen: AtomicU64::new(0),
+            connected_gen: AtomicU64::new(0),
             loaded: AtomicBool::new(false),
             session: Mutex::new(None),
             epoch: AtomicU64::new(0),
@@ -200,10 +207,16 @@ impl Services {
                 while let Some(g) = rx.recv().await {
                     let Some(s) = this.upgrade() else { return };
                     // Reconnecting may wait on a keyring prompt; the next
-                    // settings must not queue behind it. Reconnects queue on
-                    // `connecting` and each reads the settings afresh.
-                    if s.adopt(g).await {
-                        tokio::spawn(async move { s.reconnect().await });
+                    // settings must not queue behind it. A queued reconnect
+                    // is skipped if a later one already read these settings:
+                    // a burst of changes logs in once, with the newest.
+                    if let Some(generation) = s.adopt(g).await {
+                        tokio::spawn(async move {
+                            let c = s.connecting.lock().await;
+                            if s.connected_gen.load(SeqCst) < generation {
+                                s.reconnect_locked(c).await;
+                            }
+                        });
                     }
                 }
             });
@@ -217,17 +230,18 @@ impl Services {
     /// any: what the inbox does, for tests that need it done.
     #[cfg(test)]
     pub async fn load_global(self: &Arc<Self>, g: GlobalSettings) {
-        if self.adopt(g).await {
+        if self.adopt(g).await.is_some() {
             self.reconnect().await;
         }
     }
 
     /// Adopts settings loaded from OpenDeck, at startup or when they
-    /// change, and says whether the connection needs replacing: the first
-    /// time, and after any change but the display unit's.
-    async fn adopt(&self, g: GlobalSettings) -> bool {
+    /// change. Returns the settings generation to reconnect with when the
+    /// connection needs replacing: the first time, and after any change but
+    /// the display unit's.
+    async fn adopt(&self, g: GlobalSettings) -> Option<u64> {
+        let _w = self.writing.lock().await;
         let same_connection = {
-            let _w = self.writing.lock().await;
             let mut cur = self.global.lock().unwrap();
             let same = GlobalSettings {
                 temp_unit: g.temp_unit,
@@ -241,7 +255,10 @@ impl Services {
             *cur = g;
             same
         };
-        !(self.loaded.swap(true, SeqCst) && same_connection)
+        if self.loaded.swap(true, SeqCst) && same_connection {
+            return None;
+        }
+        Some(self.settings_gen.fetch_add(1, SeqCst) + 1)
     }
 
     /// Saves the connection block of the settings panel. `password: None`
@@ -406,6 +423,8 @@ impl Services {
                 let moved = self.vault.migrate(&self.global()).await;
                 let _w = self.writing.lock().await;
                 let mut g = self.global();
+                self.connected_gen
+                    .store(self.settings_gen.load(SeqCst), SeqCst);
                 let before = g.clone();
                 for w in moved {
                     self.vault.apply(&mut g, w);
@@ -476,7 +495,8 @@ impl Services {
             device_name: self.device_name.clone(),
             remember_device: g.connection.https,
         };
-        let session = Arc::new(Session::new(transport, creds, self.did_listener(epoch)));
+        let listener = self.did_listener(epoch, g.connection.secret_scope());
+        let session = Arc::new(Session::new(transport, creds, listener));
         *self.session.lock().unwrap() = Some(session.clone());
         self.set_status(ConnStatus::Connecting);
         for e in Endpoint::ALL {
@@ -597,23 +617,24 @@ impl Services {
         });
     }
 
-    /// `epoch` is the connection the session was made for: a device token
-    /// arriving after the settings moved on is dropped.
-    fn did_listener(self: &Arc<Self>, epoch: u64) -> DidListener {
+    /// `epoch` and `scope` are the connection the session was made for: a
+    /// device token arriving after the settings moved on is dropped, and one
+    /// arriving before the reconnect is filed under its own connection.
+    fn did_listener(self: &Arc<Self>, epoch: u64, scope: String) -> DidListener {
         let this = Arc::downgrade(self);
         Arc::new(move |did| {
             if let Some(s) = this.upgrade() {
-                tokio::spawn(async move { s.store_did(epoch, did).await });
+                let scope = scope.clone();
+                tokio::spawn(async move { s.store_did(epoch, scope, did).await });
             }
         })
     }
 
-    async fn store_did(&self, epoch: u64, did: Option<String>) {
+    async fn store_did(&self, epoch: u64, scope: String, did: Option<String>) {
         let _s = self.secrets.lock().await;
         if !self.is_current(epoch) {
             return;
         }
-        let scope = self.global().connection.secret_scope();
         let written = self.vault.store(scope, Secret::Did, did).await;
         let _w = self.writing.lock().await;
         let mut g = self.global();
@@ -1468,7 +1489,8 @@ mod tests {
             ..conn()
         };
         s.save_connection(other.clone(), Some("pw2".into())).await;
-        s.store_did(old_epoch, Some("dev-old".into())).await;
+        s.store_did(old_epoch, scope(), Some("dev-old".into()))
+            .await;
         assert_eq!(secrets.get(&did_key(&other.secret_scope())), Ok(None));
         assert_eq!(secrets.get(&did_key(&scope())), Ok(None));
     }
@@ -1868,7 +1890,7 @@ mod tests {
         let epoch = s.epoch.load(SeqCst);
         let storing = {
             let s = s.clone();
-            tokio::spawn(async move { s.store_did(epoch, Some("dev-1".into())).await })
+            tokio::spawn(async move { s.store_did(epoch, scope(), Some("dev-1".into())).await })
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
         let other = Connection {
@@ -1912,6 +1934,78 @@ mod tests {
         wait_for(&s, connected).await;
         assert_eq!(secrets.get(&password_key(&scope())), Ok(Some("new".into())));
         assert_eq!(last_login_password(&nas).as_deref(), Some("new"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_burst_of_settings_from_opendeck_logs_in_once_with_the_newest() {
+        // B's password is wrong: DSM must see it once, never retried.
+        let b_conn = Connection {
+            account: "admin".into(),
+            ..conn()
+        };
+        let secrets = Arc::new(MemoryStore::default());
+        secrets.set(&password_key(&scope()), Some("pw-a")).unwrap();
+        secrets
+            .set(&password_key(&b_conn.secret_scope()), Some("pw-b"))
+            .unwrap();
+        let nas = FakeDsm::new(|r| match r.get("method").map(String::as_str) {
+            Some("login") if r.get("passwd").map(String::as_str) == Some("pw-b") => Err(400),
+            Some("login") => Ok(json!({ "sid": "s1" })),
+            _ => Ok(fixture("utilization.json")),
+        });
+        let (s, _) = services_with(nas.clone(), secrets);
+        let _k = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let b = GlobalSettings {
+            connection: b_conn,
+            ..GlobalSettings::default()
+        };
+        s.receive_global(GlobalSettings {
+            connection: conn(),
+            ..GlobalSettings::default()
+        });
+        s.receive_global(b.clone());
+        let logins_with = |pw: &str| {
+            nas.requests()
+                .iter()
+                .filter(|r| r.get("method").map(String::as_str) == Some("login"))
+                .filter(|r| r.get("passwd").map(String::as_str) == Some(pw))
+                .count()
+        };
+        eventually("B's password is tried", || logins_with("pw-b") > 0).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(logins_with("pw-b"), 1, "a failed login was repeated");
+        assert_eq!(last_login_password(&nas).as_deref(), Some("pw-b"));
+        assert_eq!(s.global(), b);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_device_token_is_filed_under_its_own_sessions_connection() {
+        let secrets = Arc::new(MemoryStore::default());
+        let (s, _) = services_with(healthy_nas(), secrets.clone());
+        s.load_global(GlobalSettings::default()).await;
+        s.save_connection(conn(), Some("pw".into())).await;
+        let epoch = s.epoch.load(SeqCst);
+        let listener = s.did_listener(epoch, scope());
+        // OpenDeck's switch to another NAS is adopted; its reconnect has not
+        // run yet when the old session hands over its token.
+        let other = Connection {
+            host: "other.lan".into(),
+            ..conn()
+        };
+        assert!(
+            s.adopt(GlobalSettings {
+                connection: other.clone(),
+                ..GlobalSettings::default()
+            })
+            .await
+            .is_some()
+        );
+        listener(Some("dev-a".into()));
+        eventually("the token is stored", || {
+            secrets.get(&did_key(&scope())) == Ok(Some("dev-a".into()))
+        })
+        .await;
+        assert_eq!(secrets.get(&did_key(&other.secret_scope())), Ok(None));
     }
 
     #[tokio::test(flavor = "multi_thread")]
