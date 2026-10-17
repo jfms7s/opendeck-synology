@@ -63,7 +63,7 @@ impl<K: MetricKind> MetricAction<K> {
     }
 
     fn refresh(&self) {
-        self.services.poller(K::METRIC.endpoint()).refresh_now();
+        self.services.refresh(K::METRIC.endpoint());
     }
 }
 

@@ -14,7 +14,7 @@ use crate::dsm::model::Payload;
 use crate::dsm::session::{Credentials, DidListener, Session};
 use crate::dsm::transport::{Target, Transport};
 use crate::poller::{Fetch, Poller};
-use crate::secrets::{Secret, SecretStore, Stored, Vault};
+use crate::secrets::{Secret, SecretStore, StoreError, Stored, Vault};
 use crate::settings::{Connection, GlobalSettings, TempUnit};
 use crate::status::ConnStatus;
 use async_trait::async_trait;
@@ -70,6 +70,8 @@ pub struct Services {
     epoch: AtomicU64,
     password: Mutex<Option<Stored>>,
     keyring_retries: AtomicU32,
+    /// A key press is asking a refusing keyring again.
+    asking_keyring: AtomicBool,
     /// The DSM version of the current connection, and the epoch it was
     /// looked up for.
     firmware: Mutex<Option<String>>,
@@ -102,6 +104,7 @@ impl Services {
             epoch: AtomicU64::new(0),
             password: Mutex::new(None),
             keyring_retries: AtomicU32::new(0),
+            asking_keyring: AtomicBool::new(false),
             firmware: Mutex::new(None),
             firmware_epoch: AtomicU64::new(0),
             // Until OpenDeck hands over the saved settings, keys show "…".
@@ -141,6 +144,23 @@ impl Services {
 
     pub fn has_password(&self) -> bool {
         self.password_stored().is_some()
+    }
+
+    /// A key press or dial tap on a key showing `e`: polls it now - or,
+    /// after the keyring refused the password, asks the keyring again (in
+    /// the background: it may wait on a prompt).
+    pub fn refresh(self: &Arc<Self>, e: Endpoint) {
+        if !matches!(self.current_status(), ConnStatus::KeyringRefused(_)) {
+            return self.poller(e).refresh_now();
+        }
+        if self.asking_keyring.swap(true, SeqCst) {
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.reconnect().await;
+            this.asking_keyring.store(false, SeqCst);
+        });
     }
 
     /// The connected NAS's DSM version, once looked up.
@@ -355,7 +375,14 @@ impl Services {
                 *self.password.lock().unwrap() = None;
                 return self.go_idle(ConnStatus::NotConfigured);
             }
-            Err(e) => {
+            Err(StoreError::Refused(e)) => {
+                // Asking again by itself would show the prompt again and
+                // train the user to allow it: wait for a key press or a save.
+                log::warn!("the system keyring refused to hand over the password: {e}");
+                *self.password.lock().unwrap() = None;
+                return self.go_idle(ConnStatus::KeyringRefused(e));
+            }
+            Err(StoreError::Unavailable(e)) => {
                 // Not "no password": the keyring may well hold it.
                 log::warn!("can't read the password from the system keyring: {e}");
                 *self.password.lock().unwrap() = None;
@@ -733,6 +760,187 @@ mod tests {
             "the panel can say where it really is"
         );
         let _rx = s.poller(Endpoint::SystemInfo).subscribe("key-1", None);
+        wait_for(&s, connected).await;
+    }
+
+    /// Every settings snapshot handed to OpenDeck, none with a password.
+    fn assert_no_password_saved(sink: &RecordingSink) {
+        let saved = sink.0.lock().unwrap();
+        assert!(!saved.is_empty(), "something was saved");
+        for g in saved.iter() {
+            assert_eq!(
+                g.fallback_secrets.as_ref().and_then(|f| f.password.clone()),
+                None,
+                "a refused keyring put the password in the settings file"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_keyring_keeps_the_password_in_memory_not_the_settings_file() {
+        let (s, sink) = services_with(healthy_nas(), Arc::new(MemoryStore::refusing(&[])));
+        s.load_global(GlobalSettings::default()).await;
+        s.save_connection(conn(), Some("pw".into())).await;
+        assert_no_password_saved(&sink);
+        assert_eq!(
+            s.password_stored(),
+            Some(Stored::Memory),
+            "the panel can say where it really is"
+        );
+        // Still usable for this run.
+        let _rx = s.poller(Endpoint::SystemInfo).subscribe("key-1", None);
+        wait_for(&s, connected).await;
+        s.reconnect().await;
+        wait_for(&s, connected).await;
+        assert_eq!(s.password_stored(), Some(Stored::Memory));
+        assert_no_password_saved(&sink);
+    }
+
+    fn with_file_password(pw: &str) -> GlobalSettings {
+        GlobalSettings {
+            connection: conn(),
+            fallback_secrets: Some(FallbackSecrets {
+                password: Some(pw.into()),
+                scope: Some(scope()),
+                ..FallbackSecrets::default()
+            }),
+            ..GlobalSettings::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_write_drops_an_older_settings_file_copy() {
+        // Saved to the file while there was no keyring; now there is one,
+        // and the user denies it the newly typed password.
+        let nas = healthy_nas();
+        let (s, sink) = services_with(nas.clone(), Arc::new(MemoryStore::refusing(&[])));
+        s.load_global(with_file_password("old")).await;
+        s.save_connection(conn(), Some("new".into())).await;
+        assert_eq!(s.password_stored(), Some(Stored::Memory));
+        assert_eq!(
+            sink.last().fallback_secrets.and_then(|f| f.password),
+            None,
+            "neither the new password nor the stale one stays in the file"
+        );
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        wait_for(&s, connected).await;
+        let last = nas
+            .requests()
+            .into_iter()
+            .rev()
+            .find(|r| r.get("method").map(String::as_str) == Some("login"))
+            .unwrap();
+        assert_eq!(last.get("passwd").map(String::as_str), Some("new"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_move_into_the_keyring_leaves_the_settings_file_copy() {
+        // Moving it out of the file would lose the only copy kept across
+        // restarts on a dismissed prompt; it is tried again next time.
+        let (s, sink) = services_with(healthy_nas(), Arc::new(MemoryStore::refusing(&[])));
+        s.load_global(with_file_password("pw")).await;
+        assert_eq!(s.password_stored(), Some(Stored::SettingsFile));
+        assert!(
+            sink.0.lock().unwrap().iter().all(|g| g
+                .fallback_secrets
+                .as_ref()
+                .and_then(|f| f.password.as_deref())
+                == Some("pw")),
+            "never dropped from the file"
+        );
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        wait_for(&s, connected).await;
+    }
+
+    /// The memory copy follows the same scope rule as everything else.
+    async fn requests_after_leaving_a_memory_password(
+        next: Connection,
+    ) -> (Arc<Services>, Vec<Req>) {
+        let nas = healthy_nas();
+        let (s, _) = services_with(nas.clone(), Arc::new(MemoryStore::refusing(&[])));
+        s.load_global(GlobalSettings::default()).await;
+        s.save_connection(conn(), Some("pw".into())).await;
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        wait_for(&s, connected).await;
+        assert_eq!(s.password_stored(), Some(Stored::Memory));
+        assert_ne!(next.secret_scope(), scope(), "the test must change scope");
+        let before = nas.requests().len();
+        s.save_connection(next, None).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (s, nas.requests().split_off(before))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_memory_password_never_goes_to_another_nas_port_or_scheme() {
+        for next in [
+            Connection {
+                host: "other.lan".into(),
+                ..conn()
+            },
+            Connection {
+                port: conn().port + 1,
+                ..conn()
+            },
+            Connection {
+                account: "someone-else".into(),
+                ..conn()
+            },
+            http_conn(),
+        ] {
+            let (s, after) = requests_after_leaving_a_memory_password(next.clone()).await;
+            assert!(
+                after.iter().all(|r| r.get("passwd").is_none()),
+                "the password went to {next:?}"
+            );
+            assert!(!s.has_password(), "{next:?} has no password of its own");
+            // And the original connection still has it.
+            s.save_connection(conn(), None).await;
+            wait_for(&s, connected).await;
+            assert_eq!(s.password_stored(), Some(Stored::Memory));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_read_is_not_retried_until_a_key_press() {
+        let secrets = Arc::new(MemoryStore::refusing(&[(&password_key(&scope()), "pw")]));
+        let (s, _) = services_with(healthy_nas(), secrets.clone());
+        s.load_global(GlobalSettings {
+            connection: conn(),
+            ..GlobalSettings::default()
+        })
+        .await;
+        assert!(
+            matches!(s.current_status(), ConnStatus::KeyringRefused(_)),
+            "{:?}",
+            s.current_status()
+        );
+        assert!(!s.has_password());
+        let _k = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let reads = secrets.reads();
+        // Longer than every automatic retry would take (20+40+80+160+320 ms).
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(secrets.reads(), reads, "no prompt shown again by itself");
+        assert!(matches!(s.current_status(), ConnStatus::KeyringRefused(_)));
+        // The user presses a key and allows access this time.
+        secrets.set_refusing(false);
+        s.refresh(Endpoint::Utilization);
+        wait_for(&s, connected).await;
+        assert_eq!(s.password_stored(), Some(Stored::Keyring));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn saving_after_a_refused_read_asks_the_keyring_again() {
+        let secrets = Arc::new(MemoryStore::refusing(&[(&password_key(&scope()), "pw")]));
+        let (s, _) = services_with(healthy_nas(), secrets.clone());
+        s.load_global(GlobalSettings {
+            connection: conn(),
+            ..GlobalSettings::default()
+        })
+        .await;
+        assert!(matches!(s.current_status(), ConnStatus::KeyringRefused(_)));
+        secrets.set_refusing(false);
+        let _k = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        s.save_connection(conn(), None).await;
         wait_for(&s, connected).await;
     }
 

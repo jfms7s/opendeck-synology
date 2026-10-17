@@ -19,6 +19,10 @@ pub enum ConnStatus {
     Unreachable(String),
     /// The keyring holds the password (or might) but can't be read now.
     Keyring(String),
+    /// The keyring refused to hand the password over (a denied access
+    /// prompt, a dismissed unlock prompt). Not retried by itself, since
+    /// each try may prompt again: waits for a key press or a save.
+    KeyringRefused(String),
     /// A keyring call is waiting on the user: macOS's Keychain access
     /// prompt (shown after each update) or a Secret Service unlock prompt.
     KeyringPending,
@@ -62,6 +66,9 @@ impl ConnStatus {
             Self::Certificate { changed: true, .. } => "Certificate changed".into(),
             Self::Unreachable(msg) => format!("Unreachable: {msg}"),
             Self::Keyring(msg) => format!("Can't read the password from the system keyring: {msg}"),
+            Self::KeyringRefused(msg) => format!(
+                "The system keyring refused access to the password ({msg}) - press a key or save to ask again"
+            ),
             Self::KeyringPending => {
                 "Waiting for the system keyring - allow access in the system prompt".into()
             }
@@ -79,6 +86,7 @@ impl ConnStatus {
             Self::Certificate { .. } => "certificate",
             Self::Unreachable(_) => "unreachable",
             Self::Keyring(_) => "keyring",
+            Self::KeyringRefused(_) => "keyringRefused",
             Self::KeyringPending => "keyringPending",
         }
     }
@@ -92,9 +100,11 @@ impl ConnStatus {
             | Self::Connecting
             | Self::KeyringPending
             | Self::Auth(AuthError::NeedOtp) => "neutral",
-            Self::Auth(_) | Self::Certificate { .. } | Self::Unreachable(_) | Self::Keyring(_) => {
-                "bad"
-            }
+            Self::Auth(_)
+            | Self::Certificate { .. }
+            | Self::Unreachable(_)
+            | Self::Keyring(_)
+            | Self::KeyringRefused(_) => "bad",
         }
     }
 }
@@ -160,6 +170,16 @@ mod tests {
         );
         assert_eq!(ConnStatus::Keyring("locked".into()).kind(), "keyring");
         assert_eq!(ConnStatus::KeyringPending.kind(), "keyringPending");
+        assert_eq!(
+            ConnStatus::KeyringRefused("denied".into()).kind(),
+            "keyringRefused"
+        );
+        assert!(
+            ConnStatus::KeyringRefused("denied".into())
+                .describe()
+                .contains("press a key"),
+            "says what to do: nothing retries by itself"
+        );
         assert!(
             ConnStatus::KeyringPending.describe().contains("allow"),
             "{}",
@@ -176,6 +196,7 @@ mod tests {
         assert_eq!(ConnStatus::Auth(AuthError::NeedOtp).severity(), "neutral");
         assert_eq!(ConnStatus::Auth(AuthError::BadOtp).severity(), "bad");
         assert_eq!(ConnStatus::Keyring("x".into()).severity(), "bad");
+        assert_eq!(ConnStatus::KeyringRefused("x".into()).severity(), "bad");
         assert_eq!(ConnStatus::Connecting.severity(), "neutral");
         // Waiting on the user, not failed.
         assert_eq!(ConnStatus::KeyringPending.severity(), "neutral");
