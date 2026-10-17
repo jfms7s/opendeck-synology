@@ -189,24 +189,24 @@ impl Vault {
             .map(|(_, v)| v.clone())
     }
 
-    /// A secret for the current connection and where it was found. `Err`
-    /// only when the keyring failed and no fallback has it - which is not
-    /// the same as "no password saved".
+    /// A secret for the current connection and where it was found, looked
+    /// up memory first, then the settings file, then the keyring: the
+    /// fallbacks only exist when a newer keyring write failed. `Err` only
+    /// when the keyring failed and no fallback has it - which is not the
+    /// same as "no password saved".
     pub async fn read(
         &self,
         g: &GlobalSettings,
         which: Secret,
     ) -> Result<Option<(String, Stored)>, StoreError> {
         let scope = g.connection.secret_scope();
-        // A memory copy is always the newest: every later write clears it,
-        // and the keyring may still hold the value it replaced. Asking the
-        // keyring first would also show its prompt again.
+        // A memory copy or a settings-file copy is always newer than the
+        // keyring's: each exists only because a later keyring write failed,
+        // and a write that succeeds clears both, so the keyring may still
+        // hold the value they replaced. Asking the keyring first would also
+        // show its prompt again.
         if let Some(v) = self.in_memory(which, &scope) {
             return Ok(Some((v, Stored::Memory)));
-        }
-        let keyring = self.get(which.key(&scope)).await;
-        if let Ok(Some(v)) = keyring {
-            return Ok(Some((v, Stored::Keyring)));
         }
         let fallback = Self::fallback_for(g)
             .cloned()
@@ -214,7 +214,10 @@ impl Vault {
         if let Some(v) = fallback {
             return Ok(Some((v, Stored::SettingsFile)));
         }
-        keyring.map(|_| None)
+        match self.get(which.key(&scope)).await {
+            Ok(Some(v)) => Ok(Some((v, Stored::Keyring))),
+            other => other.map(|_| None),
+        }
     }
 
     /// Stores (or with `None`, deletes) a secret in the keyring, falling
@@ -354,6 +357,9 @@ impl SecretStore for KeyringStore {
 pub struct MemoryStore {
     map: std::sync::Mutex<std::collections::HashMap<String, String>>,
     broken: bool,
+    /// Reads work but writes fail as "no keyring" (a Secret Service that
+    /// denies creating items).
+    read_only: bool,
     /// Reads fail while set (Secret Service not up yet, a locked collection,
     /// a denied Keychain prompt).
     unreadable: std::sync::atomic::AtomicBool,
@@ -416,6 +422,19 @@ impl MemoryStore {
     pub fn open_gate(&self) {
         *self.gate.closed.lock().unwrap() = false;
         self.gate.opened.notify_all();
+    }
+
+    /// A keyring that holds `entries` and reads them, but whose writes fail
+    /// as unavailable, so a new password lands in the settings file.
+    pub fn read_only(entries: &[(&str, &str)]) -> Self {
+        let s = Self {
+            read_only: true,
+            ..Self::default()
+        };
+        for (k, v) in entries {
+            s.map.lock().unwrap().insert(k.to_string(), v.to_string());
+        }
+        s
     }
 
     /// A keyring that holds `entries` but refuses every read and write until
@@ -506,6 +525,9 @@ impl SecretStore for MemoryStore {
     }
 
     fn set(&self, key: &str, value: Option<&str>) -> Result<(), StoreError> {
+        if self.read_only {
+            return Err(StoreError::Unavailable("cannot create item".into()));
+        }
         if self.broken {
             return Err(StoreError::Unavailable("no keyring".into()));
         }

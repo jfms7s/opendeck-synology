@@ -880,6 +880,34 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_settings_file_password_beats_an_older_one_in_a_read_only_keyring() {
+        // The keyring still reads "old" but won't take writes, so the new
+        // password lands in the settings file: that copy is the newer one.
+        let key = password_key(&scope());
+        let secrets = Arc::new(MemoryStore::read_only(&[(&key, "old")]));
+        let nas = healthy_nas();
+        let (s, sink) = services_with(nas.clone(), secrets.clone());
+        s.load_global(GlobalSettings {
+            connection: conn(),
+            ..GlobalSettings::default()
+        })
+        .await;
+        s.save_connection(conn(), Some("new".into())).await;
+        assert_eq!(
+            sink.last().fallback_secrets.and_then(|f| f.password),
+            Some("new".into())
+        );
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        wait_for(&s, connected).await;
+        assert_eq!(
+            last_login_password(&nas).as_deref(),
+            Some("new"),
+            "signed in with the password the keyring still held"
+        );
+        assert_eq!(s.password_stored(), Some(Stored::SettingsFile));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_legacy_keyring_entry_never_replaces_a_refused_new_password() {
         let secrets = Arc::new(MemoryStore::refusing(&[("jf@nas.lan/password", "old")]));
         let nas = healthy_nas();
