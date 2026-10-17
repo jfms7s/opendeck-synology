@@ -77,6 +77,9 @@ struct Registry<T> {
 struct Inner<T> {
     default_interval: Duration,
     registry: Mutex<Registry<T>>,
+    /// Written only while `registry` is held (except `clear_error`), so a
+    /// generation check and the write it guards are one step. Lock order:
+    /// `registry`, then `tx`; nothing locks `registry` inside a `tx` closure.
     tx: watch::Sender<PollState<T>>,
     wake: Notify,
 }
@@ -150,9 +153,12 @@ impl<T: Send + Sync + 'static> Poller<T> {
             reg.generation += 1;
             reg.last_ok = None;
             reg.last_attempt = None;
+            // Inside the guard, so a request that passed its generation
+            // check before the bump has already published (and is cleared
+            // here), and one that checks after it sees the new generation.
+            self.inner.tx.send_replace(PollState::default());
             reg.running
         };
-        self.inner.tx.send_replace(PollState::default());
         self.wake_if(running);
     }
 
@@ -278,14 +284,14 @@ async fn run<T: Send + Sync + 'static>(inner: Arc<Inner<T>>) {
             }
         };
         let result = fetch().await;
-        {
-            let mut reg = inner.registry.lock().unwrap();
-            if reg.generation != generation {
-                continue; // the connection changed mid-request; discard
-            }
-            if result.is_ok() {
-                reg.last_ok = Some(Instant::now());
-            }
+        // Check and publish under one guard: a `set_fetch` can't slip in
+        // between and have its empty state overwritten by this old result.
+        let mut reg = inner.registry.lock().unwrap();
+        if reg.generation != generation {
+            continue; // the connection changed mid-request; discard
+        }
+        if result.is_ok() {
+            reg.last_ok = Some(Instant::now());
         }
         inner.tx.send_modify(|st| match result {
             Ok(v) => {
@@ -300,6 +306,7 @@ async fn run<T: Send + Sync + 'static>(inner: Arc<Inner<T>>) {
                 st.error = Some(e);
             }
         });
+        drop(reg);
     }
 }
 
@@ -599,6 +606,52 @@ mod tests {
             None,
             "the old request's answer is dropped"
         );
+    }
+
+    /// Busy-waits (no await, no yield) for `d`.
+    fn spin_for(d: Duration) {
+        let t = std::time::Instant::now();
+        while t.elapsed() < d {
+            std::hint::spin_loop();
+        }
+    }
+
+    /// The race `a_result_from_the_old_connection_is_discarded` can't reach:
+    /// the old request finishes at the same moment `set_fetch` moves the
+    /// poller on from another thread. Both sides leave a `Barrier` together;
+    /// the request then lingers 0-10 us more, a little longer each round,
+    /// sweeping `set_fetch` across the poller's check-then-publish step.
+    /// Whatever the order, the new connection must start from an empty state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_old_result_never_lands_after_set_fetch() {
+        for round in 0..500u32 {
+            let p = Poller::new(S(60));
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            let fetch_gate = gate.clone();
+            let lag = Duration::from_nanos(u64::from(round % 250) * 40);
+            let old: Fetch<u32> = Arc::new(move || {
+                let gate = fetch_gate.clone();
+                Box::pin(async move {
+                    // Blocks this worker on purpose, so the request ends in
+                    // step with the test thread.
+                    gate.wait();
+                    spin_for(lag);
+                    Err(DsmError::Auth(AuthError::BadCredentials))
+                })
+            });
+            p.set_fetch(Some(old));
+            let _a = p.subscribe("a", None);
+            gate.wait();
+            p.set_fetch(None);
+            // Let the poller finish whatever it was doing.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            let st = p.latest();
+            assert!(
+                st.error.is_none() && st.value.is_none() && st.failures == 0,
+                "round {round}: the old connection's result landed on the new one: {st:?}"
+            );
+            p.unsubscribe("a");
+        }
     }
 
     #[tokio::test(start_paused = true)]
