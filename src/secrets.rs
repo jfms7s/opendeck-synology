@@ -178,6 +178,17 @@ impl Vault {
             .filter(|f| f.belongs_to(&g.connection))
     }
 
+    /// The memory copy of a secret, if it belongs to `scope`.
+    fn in_memory(&self, which: Secret, scope: &str) -> Option<String> {
+        which
+            .memory(self)
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(s, _)| s == scope)
+            .map(|(_, v)| v.clone())
+    }
+
     /// A secret for the current connection and where it was found. `Err`
     /// only when the keyring failed and no fallback has it - which is not
     /// the same as "no password saved".
@@ -187,6 +198,12 @@ impl Vault {
         which: Secret,
     ) -> Result<Option<(String, Stored)>, StoreError> {
         let scope = g.connection.secret_scope();
+        // A memory copy is always the newest: every later write clears it,
+        // and the keyring may still hold the value it replaced. Asking the
+        // keyring first would also show its prompt again.
+        if let Some(v) = self.in_memory(which, &scope) {
+            return Ok(Some((v, Stored::Memory)));
+        }
         let keyring = self.get(which.key(&scope)).await;
         if let Ok(Some(v)) = keyring {
             return Ok(Some((v, Stored::Keyring)));
@@ -196,11 +213,6 @@ impl Vault {
             .and_then(|mut f| which.slot(&mut f).take());
         if let Some(v) = fallback {
             return Ok(Some((v, Stored::SettingsFile)));
-        }
-        if let Some((s, v)) = which.memory(self).lock().unwrap().clone()
-            && s == scope
-        {
-            return Ok(Some((v, Stored::Memory)));
         }
         keyring.map(|_| None)
     }
@@ -292,7 +304,10 @@ impl Vault {
         );
         for which in [Secret::Password, Secret::Did] {
             let (new_key, old_key) = (which.key(&scope), which.key(&legacy));
-            if self.get(new_key.clone()).await != Ok(None) {
+            // A memory copy replaced whatever the old entry holds.
+            if self.in_memory(which, &scope).is_some()
+                || self.get(new_key.clone()).await != Ok(None)
+            {
                 continue;
             }
             let Ok(Some(v)) = self.get(old_key.clone()).await else {
@@ -350,8 +365,8 @@ pub struct MemoryStore {
     /// Reads and writes are refused while set (a denied Keychain prompt, a
     /// dismissed unlock prompt).
     refusing: std::sync::atomic::AtomicBool,
-    /// Reads attempted so far, refused ones included.
-    reads: std::sync::atomic::AtomicUsize,
+    /// The keys of every read attempted so far, refused ones included.
+    reads: std::sync::Mutex<Vec<String>>,
 }
 
 /// Holds keyring reads until opened.
@@ -423,7 +438,23 @@ impl MemoryStore {
 
     /// How many reads were attempted, refused or not.
     pub fn reads(&self) -> usize {
-        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        self.reads.lock().unwrap().len()
+    }
+
+    /// How many reads of `key` were attempted, refused or not.
+    pub fn reads_of(&self, key: &str) -> usize {
+        self.reads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|k| *k == key)
+            .count()
+    }
+
+    /// The same store, with writes taking `delay` (refused ones too).
+    pub fn with_write_delay(mut self, delay: std::time::Duration) -> Self {
+        self.write_delay = delay;
+        self
     }
 
     pub fn set_readable(&self, readable: bool) {
@@ -450,7 +481,7 @@ impl MemoryStore {
 impl SecretStore for MemoryStore {
     fn get(&self, key: &str) -> Result<Option<String>, StoreError> {
         use std::sync::atomic::Ordering::SeqCst;
-        self.reads.fetch_add(1, SeqCst);
+        self.reads.lock().unwrap().push(key.to_string());
         if self.broken {
             return Err(StoreError::Unavailable("no keyring".into()));
         }
@@ -478,10 +509,10 @@ impl SecretStore for MemoryStore {
         if self.broken {
             return Err(StoreError::Unavailable("no keyring".into()));
         }
+        std::thread::sleep(self.write_delay);
         if self.refusing.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(StoreError::Refused("the user denied access".into()));
         }
-        std::thread::sleep(self.write_delay);
         let mut map = self.map.lock().unwrap();
         match value {
             Some(v) => map.insert(key.to_string(), v.to_string()),

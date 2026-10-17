@@ -72,6 +72,8 @@ pub struct Services {
     keyring_retries: AtomicU32,
     /// A key press is asking a refusing keyring again.
     asking_keyring: AtomicBool,
+    /// Saves of the connection block in progress; each reconnects itself.
+    saving: AtomicU32,
     /// The DSM version of the current connection, and the epoch it was
     /// looked up for.
     firmware: Mutex<Option<String>>,
@@ -105,6 +107,7 @@ impl Services {
             password: Mutex::new(None),
             keyring_retries: AtomicU32::new(0),
             asking_keyring: AtomicBool::new(false),
+            saving: AtomicU32::new(0),
             firmware: Mutex::new(None),
             firmware_epoch: AtomicU64::new(0),
             // Until OpenDeck hands over the saved settings, keys show "…".
@@ -153,12 +156,21 @@ impl Services {
         if !matches!(self.current_status(), ConnStatus::KeyringRefused(_)) {
             return self.poller(e).refresh_now();
         }
-        if self.asking_keyring.swap(true, SeqCst) {
+        // A save in progress reconnects (and asks the keyring) itself.
+        if self.saving.load(SeqCst) > 0 || self.asking_keyring.swap(true, SeqCst) {
             return;
         }
+        let epoch = self.epoch.load(SeqCst);
         let this = self.clone();
         tokio::spawn(async move {
-            this.reconnect().await;
+            let c = this.connecting.lock().await;
+            // Skip it if anything reconnected or started saving meanwhile.
+            if this.is_current(epoch)
+                && this.saving.load(SeqCst) == 0
+                && matches!(this.current_status(), ConnStatus::KeyringRefused(_))
+            {
+                this.reconnect_locked(c).await;
+            }
             this.asking_keyring.store(false, SeqCst);
         });
     }
@@ -213,6 +225,7 @@ impl Services {
     /// and port), while any other connection starts without one: a password
     /// saved for HTTPS is never sent over plain HTTP unless typed in again.
     pub async fn save_connection(self: &Arc<Self>, mut conn: Connection, password: Option<String>) {
+        let _saving = Saving::start(&self.saving);
         {
             let _w = self.writing.lock().await;
             let mut g = self.global();
@@ -331,7 +344,12 @@ impl Services {
 
     /// Replaces the session and points every poller at it.
     async fn reconnect(self: &Arc<Self>) {
-        let _c = self.connecting.lock().await;
+        let c = self.connecting.lock().await;
+        self.reconnect_locked(c).await;
+    }
+
+    /// `reconnect`, for a caller already holding `connecting`.
+    async fn reconnect_locked(self: &Arc<Self>, _c: tokio::sync::MutexGuard<'_, ()>) {
         let old = self.session.lock().unwrap().take();
         let epoch = self.epoch.fetch_add(1, SeqCst) + 1;
         *self.firmware.lock().unwrap() = None;
@@ -561,6 +579,22 @@ impl Services {
         if g != before {
             self.persist(g).await;
         }
+    }
+}
+
+/// Counts a save in progress for as long as it lives.
+struct Saving<'a>(&'a AtomicU32);
+
+impl<'a> Saving<'a> {
+    fn start(n: &'a AtomicU32) -> Self {
+        n.fetch_add(1, SeqCst);
+        Self(n)
+    }
+}
+
+impl Drop for Saving<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, SeqCst);
     }
 }
 
@@ -806,6 +840,93 @@ mod tests {
             }),
             ..GlobalSettings::default()
         }
+    }
+
+    fn last_login_password(nas: &FakeDsm) -> Option<String> {
+        nas.requests()
+            .into_iter()
+            .rev()
+            .find(|r| r.get("method").map(String::as_str) == Some("login"))
+            .and_then(|r| r.get("passwd").cloned())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_new_password_beats_the_old_one_still_in_the_keyring() {
+        // The keyring holds "old"; the user saves "new" and dismisses the
+        // prompt, then unlocks the keyring at the next prompt.
+        let key = password_key(&scope());
+        let secrets = Arc::new(MemoryStore::refusing(&[(&key, "old")]));
+        let nas = healthy_nas();
+        let (s, _) = services_with(nas.clone(), secrets.clone());
+        s.load_global(GlobalSettings {
+            connection: conn(),
+            ..GlobalSettings::default()
+        })
+        .await;
+        s.save_connection(conn(), Some("new".into())).await;
+        assert_eq!(s.password_stored(), Some(Stored::Memory));
+        secrets.set_refusing(false);
+        let reads = secrets.reads_of(&key);
+        s.reconnect().await;
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        wait_for(&s, connected).await;
+        assert_eq!(
+            last_login_password(&nas).as_deref(),
+            Some("new"),
+            "signed in with the replaced password"
+        );
+        assert_eq!(s.password_stored(), Some(Stored::Memory));
+        assert_eq!(secrets.reads_of(&key), reads, "no second keyring prompt");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_legacy_keyring_entry_never_replaces_a_refused_new_password() {
+        let secrets = Arc::new(MemoryStore::refusing(&[("jf@nas.lan/password", "old")]));
+        let nas = healthy_nas();
+        let (s, _) = services_with(nas.clone(), secrets.clone());
+        s.load_global(GlobalSettings::default()).await;
+        s.save_connection(conn(), Some("new".into())).await;
+        secrets.set_refusing(false);
+        s.reconnect().await;
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        wait_for(&s, connected).await;
+        assert_eq!(last_login_password(&nas).as_deref(), Some("new"));
+        assert_eq!(
+            secrets.keys(),
+            ["jf@nas.lan/password"],
+            "the old password is not filed under the new scope"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_key_press_during_a_save_does_not_reconnect_twice() {
+        let secrets = Arc::new(
+            MemoryStore::refusing(&[(&password_key(&scope()), "pw")])
+                .with_write_delay(Duration::from_millis(300)),
+        );
+        let (s, _) = services_with(healthy_nas(), secrets.clone());
+        s.load_global(GlobalSettings {
+            connection: conn(),
+            ..GlobalSettings::default()
+        })
+        .await;
+        assert!(matches!(s.current_status(), ConnStatus::KeyringRefused(_)));
+        let before = s.epoch.load(SeqCst);
+        let save = {
+            let s = s.clone();
+            tokio::spawn(async move { s.save_connection(conn(), Some("new".into())).await })
+        };
+        // While the save waits on the keyring prompt, the user presses a key.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(matches!(s.current_status(), ConnStatus::KeyringRefused(_)));
+        s.refresh(Endpoint::Utilization);
+        save.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            s.epoch.load(SeqCst),
+            before + 1,
+            "one reconnect, the save's"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
