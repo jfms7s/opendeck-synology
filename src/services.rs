@@ -644,7 +644,7 @@ mod tests {
     use super::testing::*;
     use super::*;
     use crate::dsm::error::AuthError;
-    use crate::dsm::fake::{Drops, FakeDsm, fixture};
+    use crate::dsm::fake::{Drops, FakeDsm, Req, fixture};
     use crate::secrets::{MemoryStore, did_key, password_key};
     use crate::settings::FallbackSecrets;
     use serde_json::{Value, json};
@@ -766,6 +766,67 @@ mod tests {
             .unwrap();
         assert!(nas.count("login") > logins);
         assert_eq!(last.get("device_id").map(String::as_str), Some("dev-1"));
+    }
+
+    /// Signs in to `conn()` with 2FA and no keyring, so device token `dev-1`
+    /// lives only in memory, then saves `next` and returns every request the
+    /// NAS saw after the switch. Waits for either outcome, so a leak fails
+    /// the caller's assertion instead of timing out on `NeedOtp`.
+    async fn requests_after_leaving_a_memory_device_token(next: Connection) -> Vec<Req> {
+        let nas = nas_with_2fa();
+        let (s, _) = services_with(nas.clone(), Arc::new(MemoryStore::broken()));
+        s.load_global(GlobalSettings::default()).await;
+        s.save_connection(conn(), Some("pw".into())).await;
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        wait_for(&s, |st| *st == ConnStatus::Auth(AuthError::NeedOtp)).await;
+        s.submit_otp("123456").await.unwrap();
+        wait_for(&s, connected).await;
+        assert_ne!(next.secret_scope(), scope(), "the test must change scope");
+        let before = nas.requests().len();
+        s.save_connection(next, Some("pw".into())).await;
+        wait_for(&s, |st| {
+            *st == ConnStatus::Auth(AuthError::NeedOtp) || connected(st)
+        })
+        .await;
+        nas.requests().split_off(before)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_memory_device_token_never_goes_to_another_nas() {
+        let next = Connection {
+            host: "other.lan".into(),
+            ..conn()
+        };
+        let after = requests_after_leaving_a_memory_device_token(next).await;
+        assert!(
+            after
+                .iter()
+                .any(|r| r.get("method").map(String::as_str) == Some("login"))
+        );
+        assert!(
+            after.iter().all(|r| r.get("device_id").is_none()),
+            "NAS A's device token went to NAS B"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_memory_device_token_never_goes_to_another_port_on_the_same_host() {
+        // Still HTTPS, so only the scope check can stop it.
+        let next = Connection {
+            port: conn().port + 1,
+            ..conn()
+        };
+        assert!(next.https);
+        let after = requests_after_leaving_a_memory_device_token(next).await;
+        assert!(
+            after
+                .iter()
+                .any(|r| r.get("method").map(String::as_str) == Some("login"))
+        );
+        assert!(
+            after.iter().all(|r| r.get("device_id").is_none()),
+            "the device token went to another port's DSM"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
