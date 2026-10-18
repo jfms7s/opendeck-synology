@@ -4,3 +4,4 @@
 *.streamDeckPlugin
 # Responses recorded from a real NAS: kept local (scripts/capture-fixtures.sh)
 /tests/fixtures/real/
+.quality/
