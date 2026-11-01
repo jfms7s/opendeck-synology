@@ -21,6 +21,9 @@ pub fn paths(metric: Metric) -> &'static str {
             r#"<ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>"#
         }
         Metric::Pool => r#"<path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/>"#,
+        Metric::Health => {
+            r#"<path d="M12 3l8 3v6c0 4.5-3.4 8.2-8 9-4.6-.8-8-4.5-8-9V6z"/><path d="M8.5 12l2.5 2.5 4.5-5"/>"#
+        }
         Metric::Update => r#"<path d="M12 3v12M7 10l5 5 5-5M4 20h16"/>"#,
     }
 }

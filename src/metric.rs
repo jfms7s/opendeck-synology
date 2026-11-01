@@ -29,12 +29,13 @@ pub enum Metric {
     DiskHealth,
     Volume,
     Pool,
+    Health,
     Update,
 }
 
 impl Metric {
     #[cfg(test)]
-    pub const ALL: [Metric; 10] = [
+    pub const ALL: [Metric; 11] = [
         Self::Cpu,
         Self::Ram,
         Self::Network,
@@ -44,6 +45,7 @@ impl Metric {
         Self::DiskHealth,
         Self::Volume,
         Self::Pool,
+        Self::Health,
         Self::Update,
     ];
 
@@ -51,7 +53,9 @@ impl Metric {
         match self {
             Self::Cpu | Self::Ram | Self::Network => Endpoint::Utilization,
             Self::SysTemp | Self::Uptime => Endpoint::SystemInfo,
-            Self::DiskTemp | Self::DiskHealth | Self::Volume | Self::Pool => Endpoint::Storage,
+            Self::DiskTemp | Self::DiskHealth | Self::Volume | Self::Pool | Self::Health => {
+                Endpoint::Storage
+            }
             Self::Update => Endpoint::Update,
         }
     }
@@ -68,6 +72,7 @@ impl Metric {
             Self::DiskHealth => "com.jfms7s.synology.diskhealth",
             Self::Volume => "com.jfms7s.synology.volume",
             Self::Pool => "com.jfms7s.synology.pool",
+            Self::Health => "com.jfms7s.synology.health",
             Self::Update => "com.jfms7s.synology.update",
         }
     }
@@ -84,6 +89,7 @@ impl Metric {
             Self::DiskHealth => "Health",
             Self::Volume => "Volume",
             Self::Pool => "Pool",
+            Self::Health => "NAS",
             Self::Update => "DSM",
         }
     }
@@ -130,7 +136,9 @@ impl Metric {
                 target: Some("Pool"),
                 ..none
             },
-            Self::Uptime | Self::Update => none,
+            // Health reads every pool, disk and volume at the Disk
+            // Temperature and Volume defaults: no target, no thresholds.
+            Self::Uptime | Self::Update | Self::Health => none,
         }
     }
 
@@ -156,7 +164,7 @@ mod tests {
     #[test]
     fn uuids_are_unique_and_namespaced() {
         let uuids: HashSet<_> = Metric::ALL.iter().map(|m| m.uuid()).collect();
-        assert_eq!(uuids.len(), 10);
+        assert_eq!(uuids.len(), 11);
         assert!(uuids.iter().all(|u| u.starts_with("com.jfms7s.synology.")));
     }
 
@@ -167,6 +175,7 @@ mod tests {
             Metric::DiskHealth,
             Metric::Volume,
             Metric::Pool,
+            Metric::Health,
         ] {
             assert_eq!(m.endpoint(), Endpoint::Storage);
         }
@@ -185,6 +194,7 @@ mod tests {
         assert_eq!(Metric::Network.fields().threshold_unit, Some("MB/s"));
         assert_eq!(Metric::Pool.fields().target, Some("Pool"));
         assert_eq!(Metric::Update.fields(), Fields::default());
+        assert_eq!(Metric::Health.fields(), Fields::default());
     }
 
     #[test]

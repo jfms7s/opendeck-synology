@@ -2,7 +2,9 @@
 //! Pure: no I/O and no clocks - everything it needs is passed in.
 
 use crate::dsm::error::{AuthError, DsmError};
-use crate::dsm::model::{Disk, Payload, Storage, SystemInfo, UpdateStatus, Utilization};
+use crate::dsm::model::{
+    Disk, Payload, Pool, Storage, SystemInfo, UpdateStatus, Utilization, Volume,
+};
 use crate::format;
 use crate::metric::Metric;
 use crate::poller::PollState;
@@ -145,6 +147,7 @@ fn value_reading(metric: Metric, p: &Payload, v: &ActionSettings, unit: TempUnit
         (Metric::DiskHealth, Payload::Storage(s)) => disk_health(s, v),
         (Metric::Volume, Payload::Storage(s)) => volume(s, v),
         (Metric::Pool, Payload::Storage(s)) => pool(s, v),
+        (Metric::Health, Payload::Storage(s)) => health(s, v, unit),
         (Metric::Update, Payload::Update(u)) => update(u),
         _ => Reading::new(metric, "Error", Level::Error),
     }
@@ -277,15 +280,24 @@ fn rotation_targets(metric: Metric, s: &Storage) -> Vec<Option<String>> {
             .collect(),
         Metric::Volume => s.volumes.iter().map(|x| Some(x.id.clone())).collect(),
         Metric::Pool => s.pools.iter().map(|x| Some(x.id.clone())).collect(),
+        // Problems only, worst first; with none there is nothing to turn to.
+        Metric::Health => problems(s).into_iter().map(|p| Some(p.id)).collect(),
         _ => Vec::new(),
     }
 }
 
-/// The target actually shown: for volumes and pools, unset means the first.
+/// The target actually shown: for volumes and pools, unset means the first;
+/// for the health summary, unset or no longer a problem means the worst.
 fn resolved_target(metric: Metric, s: &Storage, v: &ActionSettings) -> Option<String> {
     match (metric, &v.target) {
         (Metric::Volume, None) => s.volumes.first().map(|x| x.id.clone()),
         (Metric::Pool, None) => s.pools.first().map(|x| x.id.clone()),
+        (Metric::Health, t) => {
+            let ids: Vec<String> = problems(s).into_iter().map(|p| p.id).collect();
+            t.clone()
+                .filter(|t| ids.contains(t))
+                .or_else(|| ids.into_iter().next())
+        }
         (_, t) => t.clone(),
     }
 }
@@ -430,6 +442,21 @@ fn volume(s: &Storage, v: &ActionSettings) -> Reading {
         .pager(pos, count)
 }
 
+/// `Normal`, `Degraded`, or what a running job is doing (`Rebuild 43%`).
+fn pool_word(p: &Pool) -> String {
+    let verb = match p.status.as_str() {
+        "repairing" => "Rebuild".to_string(),
+        "expanding" => "Expand".to_string(),
+        "verifying" | "data_scrubbing" => "Check".to_string(),
+        other => capitalize(other),
+    };
+    match (p.status.as_str(), p.progress_pct) {
+        ("normal", _) => "Normal".to_string(),
+        (_, Some(pct)) => format!("{verb} {pct:.0}%"),
+        (_, None) => verb,
+    }
+}
+
 fn pool(s: &Storage, v: &ActionSettings) -> Reading {
     let (pos, count) = position(Metric::Pool, s, v);
     let p = match v.target.as_deref() {
@@ -442,24 +469,137 @@ fn pool(s: &Storage, v: &ActionSettings) -> Reading {
             None => return Reading::new(Metric::Pool, "N/A", Level::Normal).subject("No pools"),
         },
     };
-    let verb = match p.status.as_str() {
-        "repairing" => "Rebuild".to_string(),
-        "expanding" => "Expand".to_string(),
-        "verifying" | "data_scrubbing" => "Check".to_string(),
-        other => capitalize(other),
-    };
-    let value = match (p.status.as_str(), p.progress_pct) {
-        ("normal", _) => "Normal".to_string(),
-        (_, Some(pct)) => format!("{verb} {pct:.0}%"),
-        (_, None) => verb,
-    };
-    let r = Reading::new(Metric::Pool, value, state_level(&p.status))
+    let r = Reading::new(Metric::Pool, pool_word(p), state_level(&p.status))
         .subject(p.name.clone())
         .pager(pos, count);
     match p.progress_pct {
         Some(pct) if p.status != "normal" => r.bar(pct),
         _ => r,
     }
+}
+
+/// One pool, disk or volume that needs attention, for the health summary.
+/// `id` is namespaced by kind (`disk:sata2`, `pool:reuse_1`,
+/// `volume:volume_1`), since the dial steps through all three kinds.
+struct Problem {
+    id: String,
+    name: String,
+    /// The value shown for it; temperatures are formatted when read.
+    word: Word,
+    level: Level,
+}
+
+enum Word {
+    Text(String),
+    Celsius(f64),
+}
+
+/// A disk: its health word, or, if healthy but at or over the Disk
+/// Temperature warn default, its temperature in amber (never red: heat
+/// alone is a warning, not a failure).
+fn disk_problem(d: &Disk) -> Option<Problem> {
+    let level = disk_level(d);
+    let (word, level) = if level != Level::Normal {
+        (Word::Text(health_word(level).to_string()), level)
+    } else {
+        let warn = thresholds(Metric::DiskTemp, &ActionSettings::default()).0;
+        match d.temp_c {
+            Some(c) if level_for(c, (warn, None)) == Level::Warn => (Word::Celsius(c), Level::Warn),
+            _ => return None,
+        }
+    };
+    Some(Problem {
+        id: format!("disk:{}", d.id),
+        name: d.name.clone(),
+        word,
+        level,
+    })
+}
+
+fn pool_problem(p: &Pool) -> Option<Problem> {
+    let level = state_level(&p.status);
+    (level != Level::Normal).then(|| Problem {
+        id: format!("pool:{}", p.id),
+        name: p.name.clone(),
+        word: Word::Text(pool_word(p)),
+        level,
+    })
+}
+
+/// A volume: its state word, or how full it is against the Volume
+/// defaults (80/90 %). A volume without a size counts by state only.
+fn volume_problem(x: &Volume) -> Option<Problem> {
+    let state = state_level(&x.status);
+    let (word, level) = if state != Level::Normal {
+        (capitalize(&x.status), state)
+    } else if x.total_bytes == 0 {
+        return None;
+    } else {
+        let pct = x.used_bytes as f64 / x.total_bytes as f64 * 100.0;
+        let level = level_for(pct, thresholds(Metric::Volume, &ActionSettings::default()));
+        if level == Level::Normal {
+            return None;
+        }
+        (format::percent(pct), level)
+    };
+    Some(Problem {
+        id: format!("volume:{}", x.id),
+        name: x.name.clone(),
+        word: Word::Text(word),
+        level,
+    })
+}
+
+/// Everything that needs attention, worst first. Among equally bad items
+/// disks come first (a failing drive is what degrades its pool and volume,
+/// and what to act on), then pools, then volumes, each in DSM's order.
+fn problems(s: &Storage) -> Vec<Problem> {
+    let mut all: Vec<Problem> = s
+        .disks
+        .iter()
+        .filter_map(disk_problem)
+        .chain(s.pools.iter().filter_map(pool_problem))
+        .chain(s.volumes.iter().filter_map(volume_problem))
+        .collect();
+    // Stable, so the kind order above breaks ties.
+    all.sort_by_key(|p| std::cmp::Reverse(p.level));
+    all
+}
+
+fn count(n: usize, one: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{n} {one}s")
+    }
+}
+
+/// One key for every pool, disk and volume: `OK` with the counts, or the
+/// worst item. A dial turned to another problem shows that one, but the
+/// colour stays the worst level, so the key never under-reports.
+fn health(s: &Storage, v: &ActionSettings, unit: TempUnit) -> Reading {
+    let (pos, of) = position(Metric::Health, s, v);
+    let all = problems(s);
+    let Some(worst) = all.first().map(|p| p.level) else {
+        if s.disks.is_empty() && s.pools.is_empty() && s.volumes.is_empty() {
+            return Reading::new(Metric::Health, "N/A", Level::Normal).subject("No storage");
+        }
+        let subject = format!(
+            "{} · {} · {}",
+            count(s.pools.len(), "pool"),
+            count(s.disks.len(), "disk"),
+            count(s.volumes.len(), "volume")
+        );
+        return Reading::new(Metric::Health, "OK", Level::Normal).subject(subject);
+    };
+    let shown = &all[pos];
+    let value = match shown.word {
+        Word::Text(ref t) => t.clone(),
+        Word::Celsius(c) => format::temperature(c, unit),
+    };
+    Reading::new(Metric::Health, value, worst)
+        .subject(shown.name.clone())
+        .pager(pos, of)
 }
 
 fn update(u: &UpdateStatus) -> Reading {
@@ -492,7 +632,7 @@ pub fn rotate(metric: Metric, view: &mut ActionSettings, latest: Option<&Payload
                 ticks,
             )]
         }
-        Metric::DiskTemp | Metric::DiskHealth | Metric::Volume | Metric::Pool => {
+        Metric::DiskTemp | Metric::DiskHealth | Metric::Volume | Metric::Pool | Metric::Health => {
             let Some(Payload::Storage(s)) = latest else {
                 return;
             };
@@ -1136,5 +1276,164 @@ mod tests {
         let opts = target_options(Metric::Network, &util());
         assert_eq!(opts.len(), 3, "all interfaces + eth0 + eth1, not `total`");
         assert!(target_options(Metric::Cpu, &util()).is_empty());
+        assert!(target_options(Metric::Health, &storage("storage.json")).is_empty());
+    }
+
+    fn storage_of(name: &str) -> Storage {
+        let Payload::Storage(s) = storage(name) else {
+            unreachable!()
+        };
+        s
+    }
+    fn health(s: Storage, v: &ActionSettings) -> Reading {
+        read_as(Metric::Health, Payload::Storage(s), v)
+    }
+    fn shown(r: &Reading) -> (&str, &str, Level) {
+        (r.value.as_str(), r.subject.as_str(), r.level)
+    }
+
+    #[test]
+    fn health_all_well_counts_pools_disks_and_volumes() {
+        let r = health(storage_of("storage.json"), &view());
+        assert_eq!(r.title, "NAS");
+        assert_eq!(
+            shown(&r),
+            ("OK", "1 pool · 3 disks · 1 volume", Level::Normal)
+        );
+        assert_eq!((r.bar, r.pager), (None, None));
+        let mut s = storage_of("dsm7/storage_repairing.json");
+        s.pools.iter_mut().for_each(|p| p.status = "normal".into());
+        assert_eq!(health(s, &view()).subject, "2 pools · 2 disks · 1 volume");
+        let r = health(Storage::default(), &view());
+        assert_eq!(shown(&r), ("N/A", "No storage", Level::Normal));
+    }
+
+    #[test]
+    fn health_names_a_degraded_pool() {
+        let mut s = storage_of("storage.json");
+        s.pools[0].status = "degraded".into();
+        assert_eq!(
+            shown(&health(s, &view())),
+            ("Degraded", "Pool 1", Level::Crit)
+        );
+    }
+
+    #[test]
+    fn health_names_a_failing_disk_first() {
+        // Drive 2 is failing, which also degrades its pool and volume: the
+        // disk is the one to act on, so it is named.
+        let r = health(storage_of("dsm7/storage_degraded.json"), &view());
+        assert_eq!(shown(&r), ("Failing", "Drive 2", Level::Crit));
+        assert_eq!(r.pager, Some((0, 3)));
+    }
+
+    #[test]
+    fn health_shows_a_repairing_pool_in_amber() {
+        let r = health(storage_of("dsm7/storage_repairing.json"), &view());
+        assert_eq!(shown(&r), ("Rebuild 43%", "Pool 1", Level::Warn));
+        assert_eq!(r.pager, Some((0, 2)));
+    }
+
+    #[test]
+    fn health_unknown_state_words_are_a_warning() {
+        let mut s = storage_of("storage.json");
+        s.volumes[0].status = "something_new".into();
+        assert_eq!(
+            shown(&health(s, &view())),
+            ("Something_new", "Volume 1", Level::Warn)
+        );
+    }
+
+    #[test]
+    fn health_counts_a_full_volume_at_the_volume_thresholds() {
+        let mut s = storage_of("storage.json");
+        s.volumes[0].used_bytes = s.volumes[0].total_bytes / 100 * 95;
+        assert_eq!(
+            shown(&health(s.clone(), &view())),
+            ("95%", "Volume 1", Level::Crit)
+        );
+        s.volumes[0].used_bytes = s.volumes[0].total_bytes / 100 * 85;
+        assert_eq!(
+            shown(&health(s.clone(), &view())),
+            ("85%", "Volume 1", Level::Warn)
+        );
+        // No size: never a zero, and only the state word counts.
+        s.volumes[0].total_bytes = 0;
+        assert_eq!(health(s, &view()).value, "OK");
+    }
+
+    #[test]
+    fn health_counts_a_hot_disk_as_amber_only() {
+        let mut s = storage_of("storage.json");
+        s.disks[1].temp_c = Some(52.0);
+        assert_eq!(
+            shown(&health(s.clone(), &view())),
+            ("52°C", "Drive 2", Level::Warn)
+        );
+        s.disks[1].temp_c = Some(65.0);
+        assert_eq!(health(s.clone(), &view()).level, Level::Warn);
+        s.disks[1].temp_c = Some(49.0);
+        assert_eq!(health(s, &view()).value, "OK");
+    }
+
+    #[test]
+    fn health_names_the_worst_item_whatever_its_kind() {
+        let mut s = storage_of("storage.json");
+        s.disks[0].temp_c = Some(55.0);
+        s.volumes[0].status = "crashed".into();
+        let r = health(s, &view());
+        assert_eq!(shown(&r), ("Crashed", "Volume 1", Level::Crit));
+        assert_eq!(r.pager, Some((0, 2)));
+    }
+
+    #[test]
+    fn health_key_colour_stays_the_worst_while_the_dial_shows_a_lesser_item() {
+        let mut s = storage_of("dsm7/storage_repairing.json");
+        s.disks[0].smart_status = "failing".into();
+        let v = ActionSettings {
+            target: Some("pool:reuse_2".into()),
+            ..view()
+        };
+        let r = health(s, &v);
+        assert_eq!(shown(&r), ("Check 7%", "Pool 2", Level::Crit));
+        assert_eq!(r.pager, Some((2, 3)));
+    }
+
+    #[test]
+    fn health_target_that_is_no_longer_a_problem_falls_back_to_the_summary() {
+        let v = ActionSettings {
+            target: Some("pool:reuse_1".into()),
+            ..view()
+        };
+        assert_eq!(health(storage_of("storage.json"), &v).value, "OK");
+        let v = ActionSettings {
+            target: Some("disk:sata1".into()),
+            ..view()
+        };
+        let r = health(storage_of("dsm7/storage_degraded.json"), &v);
+        assert_eq!((r.subject.as_str(), r.pager), ("Drive 2", Some((0, 3))));
+    }
+
+    #[test]
+    fn health_rotation_walks_only_problems_and_wraps() {
+        let p = storage("dsm7/storage_degraded.json");
+        let mut v = view();
+        rotate(Metric::Health, &mut v, Some(&p), 1);
+        assert_eq!(v.target.as_deref(), Some("pool:reuse_1"));
+        rotate(Metric::Health, &mut v, Some(&p), 1);
+        assert_eq!(v.target.as_deref(), Some("volume:volume_1"));
+        let r = read_as(Metric::Health, p.clone(), &v);
+        assert_eq!(shown(&r), ("Degraded", "Volume 1", Level::Crit));
+        rotate(Metric::Health, &mut v, Some(&p), 1);
+        assert_eq!(v.target.as_deref(), Some("disk:sata2"));
+        rotate(Metric::Health, &mut v, Some(&p), -1);
+        assert_eq!(v.target.as_deref(), Some("volume:volume_1"));
+
+        let well = storage("storage.json");
+        let mut v = view();
+        rotate(Metric::Health, &mut v, Some(&well), 1);
+        assert_eq!(v.target, None, "all well: the dial does not move");
+        rotate(Metric::Health, &mut v, None, 1);
+        assert_eq!(v.target, None, "no data yet: nothing to rotate through");
     }
 }
