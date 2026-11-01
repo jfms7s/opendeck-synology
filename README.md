@@ -54,8 +54,11 @@ first successful refresh.
    it actually is (see [Without a keyring](#without-a-keyring-flatpak)).
    On macOS, the build that saved a secret can read it back without asking. Each new
    release is a new binary (signed ad hoc, not by a registered developer), so after an
-   update macOS asks once per saved secret - the password and, with 2FA, the device
-   token - whether `opendeck-synology` may use it: choose **Always Allow**. Until you
+   update macOS is expected to ask once per saved secret - the password and, with 2FA,
+   the device token - whether `opendeck-synology` may use it: choose **Always Allow**
+   (the first Mac smoke run will confirm the prompt count). Expect this prompt only right
+   after you installed an update. A prompt at any other time means the binary changed
+   without you: choose Deny. Until you
    answer, keys show `Keyring` / `Allow access` and the settings panel keeps
    responding. If you choose Deny, keys show `Keyring` / `Press to retry` and the plugin
    does not ask again by itself: press a key or save in the panel to get the prompt
