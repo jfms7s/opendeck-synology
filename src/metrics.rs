@@ -177,13 +177,22 @@ fn missing(metric: Metric, what: &str) -> Reading {
 }
 
 fn cpu(u: &Utilization, v: &ActionSettings) -> Reading {
-    let c = &u.cpu;
     let pager = (index_of(&CPU_VIEWS, &v.cpu_view), CPU_VIEWS.len());
-    let (value, subject) = match v.cpu_view {
-        CpuView::Total => (Some(format::percent(c.total_pct)), "Usage"),
-        CpuView::Load1 => (c.load1.map(format::load), "Load 1 min"),
-        CpuView::Load5 => (c.load5.map(format::load), "Load 5 min"),
-        CpuView::Load15 => (c.load15.map(format::load), "Load 15 min"),
+    let subject = match v.cpu_view {
+        CpuView::Total => "Usage",
+        CpuView::Load1 => "Load 1 min",
+        CpuView::Load5 => "Load 5 min",
+        CpuView::Load15 => "Load 15 min",
+    };
+    // `u.cpu` is `None` when DSM's CPU block was unreadable: every view is lost.
+    let Some(c) = &u.cpu else {
+        return missing(Metric::Cpu, subject).pager(pager.0, pager.1);
+    };
+    let value = match v.cpu_view {
+        CpuView::Total => Some(format::percent(c.total_pct)),
+        CpuView::Load1 => c.load1.map(format::load),
+        CpuView::Load5 => c.load5.map(format::load),
+        CpuView::Load15 => c.load15.map(format::load),
     };
     let Some(value) = value else {
         return missing(Metric::Cpu, subject).pager(pager.0, pager.1);
@@ -204,7 +213,10 @@ fn cpu(u: &Utilization, v: &ActionSettings) -> Reading {
 }
 
 fn ram(u: &Utilization, v: &ActionSettings) -> Reading {
-    let m = &u.memory;
+    let pager = (index_of(&AMOUNTS, &v.amount), AMOUNTS.len());
+    let Some(m) = &u.memory else {
+        return missing(Metric::Ram, "Used").pager(pager.0, pager.1);
+    };
     let value = match v.amount {
         Amount::Percent => format::percent(m.used_pct),
         Amount::Used => format::used_of_total(m.used_bytes, m.total_bytes),
@@ -216,7 +228,7 @@ fn ram(u: &Utilization, v: &ActionSettings) -> Reading {
     )
     .subject("Used")
     .bar(m.used_pct)
-    .pager(index_of(&AMOUNTS, &v.amount), AMOUNTS.len())
+    .pager(pager.0, pager.1)
 }
 
 fn network(u: &Utilization, v: &ActionSettings) -> Reading {
@@ -763,7 +775,7 @@ mod tests {
         let Payload::Utilization(mut u) = util() else {
             unreachable!()
         };
-        u.cpu.load5 = None;
+        u.cpu.as_mut().unwrap().load5 = None;
         let v = ActionSettings {
             cpu_view: CpuView::Load5,
             ..view()
@@ -791,6 +803,40 @@ mod tests {
             ..view()
         };
         assert_eq!(read_as(Metric::Cpu, util(), &v).level, Level::Crit);
+    }
+
+    #[test]
+    fn an_unreadable_memory_block_shows_missing_on_ram_only() {
+        let mut v = fixture("utilization.json");
+        v.as_object_mut().unwrap().remove("memory");
+        let p = || Payload::Utilization(parse_utilization(&v).unwrap());
+        let r = read_as(Metric::Ram, p(), &view());
+        assert_eq!(
+            (r.value.as_str(), r.subject.as_str(), r.level, r.pager),
+            ("Missing", "Used", Level::Crit, Some((0, 2)))
+        );
+        assert_eq!(read_as(Metric::Cpu, p(), &view()).value, "37%");
+        assert_eq!(
+            read_as(Metric::Network, p(), &view()).value,
+            read_as(Metric::Network, util(), &view()).value
+        );
+    }
+
+    #[test]
+    fn an_unreadable_cpu_field_shows_missing_on_cpu_only() {
+        let mut v = fixture("utilization.json");
+        v["cpu"].as_object_mut().unwrap().remove("system_load");
+        let p = || Payload::Utilization(parse_utilization(&v).unwrap());
+        let r = read_as(Metric::Cpu, p(), &view());
+        assert_eq!(
+            (r.value.as_str(), r.subject.as_str(), r.level, r.pager),
+            ("Missing", "Usage", Level::Crit, Some((0, 4)))
+        );
+        assert_eq!(read_as(Metric::Ram, p(), &view()).value, "37%");
+        assert_eq!(
+            read_as(Metric::Network, p(), &view()).value,
+            read_as(Metric::Network, util(), &view()).value
+        );
     }
 
     #[test]

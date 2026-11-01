@@ -180,8 +180,8 @@
 			websocket.send(JSON.stringify({ event: "setSettings", context: uuid, payload: settings }));
 		}
 
-		// An empty field must become null, never "": one field the plugin
-		// can't read makes it fall back to default settings for the key.
+		// An empty field must become null, never "": the plugin can't read
+		// "" as a threshold and would drop it to its default.
 		function numberOrNull(input) {
 			const n = input.valueAsNumber;
 			return Number.isFinite(n) ? n : null;
