@@ -142,7 +142,6 @@ fn value_reading(metric: Metric, p: &Payload, v: &ActionSettings, unit: TempUnit
         (Metric::Ram, Payload::Utilization(u)) => ram(u, v),
         (Metric::Network, Payload::Utilization(u)) => network(u, v),
         (Metric::SysTemp, Payload::SystemInfo(s)) => sys_temp(s, v, unit),
-        (Metric::Uptime, Payload::SystemInfo(s)) => uptime(s),
         (Metric::DiskTemp, Payload::Storage(s)) => disk_temp(s, v, unit),
         (Metric::DiskHealth, Payload::Storage(s)) => disk_health(s, v),
         (Metric::Volume, Payload::Storage(s)) => volume(s, v),
@@ -259,13 +258,6 @@ fn sys_temp(s: &SystemInfo, v: &ActionSettings, unit: TempUnit) -> Reading {
     )
     .subject("Temperature")
     .bar(c)
-}
-
-fn uptime(s: &SystemInfo) -> Reading {
-    match s.uptime_secs {
-        Some(secs) => Reading::new(Metric::Uptime, format::uptime(secs), Level::Normal),
-        None => Reading::new(Metric::Uptime, "N/A", Level::Normal),
-    }
 }
 
 /// What turning the dial steps through, `None` being the aggregate entry
@@ -643,7 +635,7 @@ pub fn rotate(metric: Metric, view: &mut ActionSettings, latest: Option<&Payload
             let i = index_of(&cycle, &resolved_target(metric, s, view));
             view.target = cycle[step(i, cycle.len(), ticks)].clone();
         }
-        Metric::SysTemp | Metric::Uptime | Metric::Update => {}
+        Metric::SysTemp | Metric::Update => {}
     }
 }
 
@@ -874,12 +866,6 @@ mod tests {
             &ctx,
         );
         assert_eq!(r.value, "118°F");
-    }
-
-    #[test]
-    fn uptime_is_formatted() {
-        let r = read_as(Metric::Uptime, system(fixture("system.json")), &view());
-        assert_eq!(r.value, "12d 5h");
     }
 
     #[test]

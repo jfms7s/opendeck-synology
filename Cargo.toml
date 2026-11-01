@@ -5,7 +5,7 @@ edition = "2024"
 # Let-chains (`if let ... && ...`) and the newest dependencies (rcgen, time) need 1.88.
 rust-version = "1.88"
 license = "MIT"
-description = "OpenDeck plugin: live Synology DSM 7 status - CPU, RAM, temperatures, disks, volumes, storage pools, network, uptime and updates - on Stream Deck keys and dials"
+description = "OpenDeck plugin: live Synology DSM 7 status - CPU, RAM, temperatures, disks, volumes, storage pools, network and updates - on Stream Deck keys and dials"
 repository = "https://github.com/jfms7s/opendeck-synology"
 
 [dependencies]

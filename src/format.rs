@@ -54,17 +54,6 @@ pub fn rate(bytes_per_sec: u64) -> String {
     format!("{n} {}/s", UNITS[i])
 }
 
-pub fn uptime(secs: u64) -> String {
-    let (d, h, m) = (secs / 86_400, secs % 86_400 / 3600, secs % 3600 / 60);
-    if d > 0 {
-        format!("{d}d {h}h")
-    } else if h > 0 {
-        format!("{h}h {m}m")
-    } else {
-        format!("{m}m")
-    }
-}
-
 pub fn load(v: f64) -> String {
     format!("{v:.2}")
 }
@@ -104,13 +93,6 @@ mod tests {
         assert_eq!(rate(524_288), "512 KB/s");
         assert_eq!(rate(13_002_342), "12.4 MB/s");
         assert_eq!(rate(150 * 1024 * 1024), "150 MB/s");
-    }
-
-    #[test]
-    fn uptime_shows_the_two_largest_units() {
-        assert_eq!(uptime(1_055_111), "12d 5h");
-        assert_eq!(uptime(4 * 3600 + 12 * 60), "4h 12m");
-        assert_eq!(uptime(59), "0m");
     }
 
     #[test]

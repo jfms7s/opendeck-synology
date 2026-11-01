@@ -42,7 +42,6 @@ pub struct Utilization {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SystemInfo {
     pub sys_temp_c: Option<f64>,
-    pub uptime_secs: Option<u64>,
     pub firmware: Option<String>,
 }
 
@@ -172,24 +171,6 @@ pub fn parse_utilization(data: &Value) -> Result<Utilization, String> {
     })
 }
 
-/// `up_time` is "hours:minutes:seconds" with unbounded hours (e.g.
-/// "293:05:11"); some firmware sends plain seconds instead.
-fn parse_uptime(v: &Value) -> Option<u64> {
-    if let Some(n) = v.as_u64() {
-        return Some(n);
-    }
-    let parts: Vec<u64> = v
-        .as_str()?
-        .split(':')
-        .map(|p| p.trim().parse().ok())
-        .collect::<Option<_>>()?;
-    match parts.as_slice() {
-        [h, m, s] => Some(h * 3600 + m * 60 + s),
-        [s] => Some(*s),
-        _ => None,
-    }
-}
-
 pub fn parse_system_info(data: &Value) -> Result<SystemInfo, String> {
     if !data.is_object() {
         return Err("expected an object".into());
@@ -197,7 +178,6 @@ pub fn parse_system_info(data: &Value) -> Result<SystemInfo, String> {
     Ok(SystemInfo {
         // Models without a system sensor report 0 or omit the field.
         sys_temp_c: num(&data["sys_temp"]).filter(|t| *t > 0.0),
-        uptime_secs: parse_uptime(&data["up_time"]),
         firmware: text(&data["firmware_ver"]),
     })
 }
@@ -361,14 +341,13 @@ mod tests {
     fn parses_system_info() {
         let s = parse_system_info(&fixture("system.json")).unwrap();
         assert_eq!(s.sys_temp_c, Some(48.0));
-        assert_eq!(s.uptime_secs, Some(293 * 3600 + 5 * 60 + 11));
         assert_eq!(s.firmware.as_deref(), Some("DSM 7.2.2-72806 Update 3"));
     }
 
     #[test]
     fn missing_or_zero_system_temperature_is_none() {
         assert_eq!(
-            parse_system_info(&json!({ "up_time": "1:00:00" }))
+            parse_system_info(&json!({ "firmware_ver": "DSM 7.2.2-72806" }))
                 .unwrap()
                 .sys_temp_c,
             None
@@ -379,12 +358,6 @@ mod tests {
                 .sys_temp_c,
             None
         );
-    }
-
-    #[test]
-    fn uptime_accepts_plain_seconds() {
-        let s = parse_system_info(&json!({ "up_time": 90061 })).unwrap();
-        assert_eq!(s.uptime_secs, Some(90061));
     }
 
     #[test]
@@ -527,7 +500,6 @@ mod tests {
         }
         if let Some(v) = recorded("system.json") {
             let s = parse_system_info(&v).unwrap();
-            assert!(s.uptime_secs.is_some_and(|t| t > 0));
             assert!(s.firmware.is_some_and(|f| f.contains("DSM")));
         }
         if let Some(v) = recorded("storage.json") {
