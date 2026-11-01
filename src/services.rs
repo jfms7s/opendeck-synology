@@ -1621,6 +1621,152 @@ mod tests {
         assert_eq!(s.password_stored(), Some(Stored::Keyring));
     }
 
+    /// Keyring reads of the password key per connect attempt over HTTPS:
+    /// `migrate` checks the new entry name once, then the read itself.
+    const PW_READS_PER_ATTEMPT: usize = 2;
+
+    /// Longer than the whole retry schedule under test (20+40+80+160+320 ms).
+    const PAST_THE_SCHEDULE: Duration = Duration::from_millis(1500);
+
+    /// Mutant F: the retry bound. One failed attempt plus `KEYRING_RETRIES`
+    /// retries, then it waits for the user (each read may show a prompt).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unreadable_keyring_is_retried_a_bounded_number_of_times() {
+        let pw = password_key(&scope());
+        let secrets = Arc::new(MemoryStore::unreadable(&[(&pw, "pw")]));
+        let (s, _) = services_with(healthy_nas(), secrets.clone());
+        s.load_global(GlobalSettings {
+            connection: conn(),
+            ..GlobalSettings::default()
+        })
+        .await;
+        tokio::time::sleep(PAST_THE_SCHEDULE).await;
+        assert_eq!(
+            secrets.reads_of(&pw),
+            PW_READS_PER_ATTEMPT * (1 + KEYRING_RETRIES as usize)
+        );
+        assert!(matches!(s.current_status(), ConnStatus::Keyring(_)));
+    }
+
+    /// Mutant D2: a retry scheduled for a connection the user has since
+    /// replaced must not reconnect the new one. The first connection's
+    /// failure takes attempt 0 and schedules a retry at +20 ms; the new
+    /// connection is saved before it fires and takes attempts 1-5. With the
+    /// epoch guard the old retry is dropped, so the new connection fails 5
+    /// times; without it the old retry reconnects it once more (6).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retry_for_a_replaced_connection_is_dropped() {
+        let other = Connection {
+            account: "admin".into(),
+            ..conn()
+        };
+        let other_pw = password_key(&other.secret_scope());
+        let secrets = Arc::new(MemoryStore::unreadable(&[]));
+        let (s, _) = services_with(healthy_nas(), secrets.clone());
+        s.load_global(GlobalSettings {
+            connection: conn(),
+            ..GlobalSettings::default()
+        })
+        .await;
+        s.save_connection(other, None).await;
+        assert_eq!(
+            secrets.reads_of(&password_key(&scope())),
+            PW_READS_PER_ATTEMPT,
+            "the first retry fired before the save: this test needs it pending"
+        );
+        tokio::time::sleep(PAST_THE_SCHEDULE).await;
+        assert_eq!(
+            secrets.reads_of(&other_pw),
+            PW_READS_PER_ATTEMPT * KEYRING_RETRIES as usize
+        );
+        assert_eq!(
+            secrets.reads_of(&password_key(&scope())),
+            PW_READS_PER_ATTEMPT,
+            "the old connection was never read again"
+        );
+    }
+
+    /// Mutant P: a successful read resets the retry budget, so a later
+    /// keyring outage gets the full schedule again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_successful_read_resets_the_retry_budget() {
+        let pw = password_key(&scope());
+        let secrets = Arc::new(MemoryStore::unreadable(&[(&pw, "pw")]));
+        let (s, _) = services_with(healthy_nas(), secrets.clone());
+        let _k = s.poller(Endpoint::Utilization).subscribe("key-1");
+        s.load_global(GlobalSettings {
+            connection: conn(),
+            ..GlobalSettings::default()
+        })
+        .await;
+        // Attempt 0 failed; the retry at +20 ms reads it.
+        secrets.set_readable(true);
+        wait_for(&s, connected).await;
+        secrets.set_readable(false);
+        let before = secrets.reads_of(&pw);
+        s.save_connection(conn(), None).await;
+        tokio::time::sleep(PAST_THE_SCHEDULE).await;
+        assert_eq!(
+            secrets.reads_of(&pw) - before,
+            PW_READS_PER_ATTEMPT * (1 + KEYRING_RETRIES as usize)
+        );
+    }
+
+    /// Mutant V: the old session is logged out only once `connect` has
+    /// moved the pollers off it. The new connection's password read waits
+    /// on a prompt; meanwhile nothing may log the old session out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_old_session_is_logged_out_only_after_the_new_connect() {
+        let other = Connection {
+            account: "admin".into(),
+            ..conn()
+        };
+        let other_pw = password_key(&other.secret_scope());
+        let secrets = Arc::new(MemoryStore::default());
+        secrets.set(&other_pw, Some("pw2")).unwrap();
+        let nas = counting_nas();
+        let (s, _) = services_with(nas.clone(), secrets.clone());
+        s.load_global(GlobalSettings::default()).await;
+        s.save_connection(conn(), Some("pw".into())).await;
+        let mut rx = s.poller(Endpoint::Utilization).subscribe("key-1");
+        wait_for_value(&mut rx).await;
+        // `migrate`'s read passes, the connect read waits.
+        secrets.gate_key(&other_pw, 1);
+        let save = {
+            let s = s.clone();
+            tokio::spawn(async move { s.save_connection(other, None).await })
+        };
+        wait_for(&s, |st| *st == ConnStatus::KeyringPending).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            logouts(&nas).is_empty(),
+            "logged out before the pollers moved"
+        );
+        secrets.open_key(&other_pw);
+        save.await.unwrap();
+        eventually("the old session is logged out", || logouts(&nas) == ["s1"]).await;
+    }
+
+    /// Mutant N: a legacy `account@host` entry never overwrites a newer
+    /// entry under the scoped name (say after a downgrade and re-upgrade).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_legacy_keyring_entry_never_overwrites_a_newer_scoped_one() {
+        let secrets = Arc::new(MemoryStore::default());
+        secrets.set("jf@nas.lan/password", Some("old")).unwrap();
+        secrets.set(&password_key(&scope()), Some("new")).unwrap();
+        let nas = healthy_nas();
+        let (s, _) = services_with(nas.clone(), secrets.clone());
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
+        s.load_global(GlobalSettings {
+            connection: conn(),
+            ..GlobalSettings::default()
+        })
+        .await;
+        wait_for(&s, connected).await;
+        assert_eq!(secrets.get(&password_key(&scope())), Ok(Some("new".into())));
+        assert_eq!(last_login_password(&nas).as_deref(), Some("new"));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_new_host_drops_the_certificate_pin() {
         let (s, _) = services_with(healthy_nas(), Arc::new(MemoryStore::default()));
