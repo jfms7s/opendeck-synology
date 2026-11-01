@@ -200,6 +200,8 @@
 			$("direction").value = s.direction || "in";
 			$("amount").value = s.amount || "percent";
 			$("press").value = s.press || "refresh";
+			// A choice this version doesn't know acts as Refresh: show it so.
+			if (!$("press").value) $("press").value = "refresh";
 			$("warn").value = s.warn ?? "";
 			$("crit").value = s.crit ?? "";
 			$("target").value = s.target ?? "";

@@ -100,7 +100,15 @@ impl<K: MetricKind> MetricAction<K> {
 pub fn press_url(press: PressAction, conn: &Connection) -> Option<String> {
     match press {
         PressAction::Refresh => None,
-        PressAction::Dsm if conn.is_complete() && conn.https => {
+        // A host with userinfo, a query or a fragment in it could name
+        // another site than the NAS: refresh instead of opening it.
+        PressAction::Dsm
+            if conn.is_complete()
+                && conn.https
+                && !conn
+                    .host()
+                    .contains(|c: char| c.is_whitespace() || "@?#\\%".contains(c)) =>
+        {
             Some(format!("{}/", conn.base_url()))
         }
         PressAction::Dsm => None,
@@ -283,6 +291,20 @@ mod tests {
             ..nas("nas.lan")
         };
         assert_eq!(press_url(PressAction::Dsm, &http), None);
+    }
+
+    #[test]
+    fn open_dsm_never_opens_a_host_that_could_point_elsewhere() {
+        for host in [
+            "nas.lan@evil.example",
+            "nas.lan?x=evil.example",
+            "nas.lan#evil",
+            "nas lan",
+            "nas%2elan",
+            "nas.lan\\evil.example",
+        ] {
+            assert_eq!(press_url(PressAction::Dsm, &nas(host)), None, "{host}");
+        }
     }
 
     #[test]
