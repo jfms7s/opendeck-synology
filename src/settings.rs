@@ -183,6 +183,9 @@ impl GlobalSettings {
         if let Ok(g) = serde_json::from_value(v.clone()) {
             return (g, Vec::new());
         }
+        if !v.is_object() && !v.is_null() {
+            return (Self::default(), vec!["settings".into()]);
+        }
         let mut bad = Vec::new();
         let c = object_or_note(v, "connection", &mut bad);
         let d = Connection::default();
@@ -263,6 +266,8 @@ impl ActionSettings {
         let s = ActionSettings {
             warn: field(v, "warn", &mut bad),
             crit: field(v, "crit", &mut bad),
+            // An unreadable target falls back to the aggregate (hottest disk,
+            // all interfaces, first volume); the subject line names it.
             target: field(v, "target", &mut bad),
             cpu_view: field(v, "cpu_view", &mut bad),
             direction: field(v, "direction", &mut bad),

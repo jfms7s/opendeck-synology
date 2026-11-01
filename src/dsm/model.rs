@@ -156,32 +156,31 @@ fn parse_memory(m: &Value) -> Result<Memory, String> {
 
 /// CPU, memory and network are parsed apart, so one unreadable section only
 /// costs the keys that read it. The reply is `Bad data` only when none of
-/// the three is there (not a utilization reply at all).
+/// the three yields anything (not a utilization reply at all).
 pub fn parse_utilization(data: &Value) -> Result<Utilization, String> {
     let cpu = parse_cpu(&data["cpu"]);
     let memory = parse_memory(&data["memory"]);
-    let Some(list) = data["network"].as_array() else {
-        if let (Err(c), Err(m)) = (&cpu, &memory) {
-            return Err(format!("cpu: {c}; memory: {m}; no `network` list"));
-        }
-        return Ok(Utilization {
-            cpu: cpu.ok(),
-            memory: memory.ok(),
-            network: Vec::new(),
-        });
-    };
-    let network = list
-        .iter()
-        // An interface without both rates is left out (its key shows
-        // "Missing"): a zero must never stand in for missing data.
-        .filter_map(|n| {
-            Some(NetIf {
-                device: text(&n["device"])?,
-                rx: num(&n["rx"])? as u64,
-                tx: num(&n["tx"])? as u64,
-            })
+    let network: Vec<NetIf> = data["network"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                // An interface without both rates is left out (its key shows
+                // "Missing"): a zero must never stand in for missing data.
+                .filter_map(|n| {
+                    Some(NetIf {
+                        device: text(&n["device"])?,
+                        rx: num(&n["rx"])? as u64,
+                        tx: num(&n["tx"])? as u64,
+                    })
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
+    if let (Err(c), Err(m)) = (&cpu, &memory)
+        && network.is_empty()
+    {
+        return Err(format!("cpu: {c}; memory: {m}; no network interface"));
+    }
     Ok(Utilization {
         cpu: cpu.ok(),
         memory: memory.ok(),
@@ -387,6 +386,15 @@ mod tests {
     #[test]
     fn utilization_without_cpu_is_an_error() {
         assert!(parse_utilization(&json!({ "memory": {} })).is_err());
+        assert!(parse_utilization(&json!({ "network": [] })).is_err());
+        assert!(parse_utilization(&json!({ "foo": 1 })).is_err());
+    }
+
+    #[test]
+    fn network_alone_still_reads() {
+        let network = fixture("utilization.json")["network"].clone();
+        let u = parse_utilization(&json!({ "network": network })).unwrap();
+        assert_eq!((u.cpu, u.memory, u.network.len()), (None, None, 3));
     }
 
     #[test]
