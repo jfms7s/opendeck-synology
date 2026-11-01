@@ -848,7 +848,7 @@ mod tests {
         assert_eq!(secrets.get(&password_key(&scope())), Ok(Some("pw".into())));
         assert_eq!(sink.last().fallback_secrets, None);
         assert_eq!(s.password_stored(), Some(Stored::Keyring));
-        let mut rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let mut rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, connected).await;
         // The status is published before the poller's value: wait for it.
         wait_for_value(&mut rx).await;
@@ -868,7 +868,7 @@ mod tests {
             Some(Stored::SettingsFile),
             "the panel can say where it really is"
         );
-        let _rx = s.poller(Endpoint::SystemInfo).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::SystemInfo).subscribe("key-1");
         wait_for(&s, connected).await;
     }
 
@@ -897,7 +897,7 @@ mod tests {
             "the panel can say where it really is"
         );
         // Still usable for this run.
-        let _rx = s.poller(Endpoint::SystemInfo).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::SystemInfo).subscribe("key-1");
         wait_for(&s, connected).await;
         s.reconnect().await;
         wait_for(&s, connected).await;
@@ -943,7 +943,7 @@ mod tests {
         secrets.set_refusing(false);
         let reads = secrets.reads_of(&key);
         s.reconnect().await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, connected).await;
         assert_eq!(
             last_login_password(&nas).as_deref(),
@@ -972,7 +972,7 @@ mod tests {
             sink.last().fallback_secrets.and_then(|f| f.password),
             Some("new".into())
         );
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, connected).await;
         assert_eq!(
             last_login_password(&nas).as_deref(),
@@ -991,7 +991,7 @@ mod tests {
         s.save_connection(conn(), Some("new".into())).await;
         secrets.set_refusing(false);
         s.reconnect().await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, connected).await;
         assert_eq!(last_login_password(&nas).as_deref(), Some("new"));
         assert_eq!(
@@ -1046,7 +1046,7 @@ mod tests {
             None,
             "neither the new password nor the stale one stays in the file"
         );
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, connected).await;
         let last = nas
             .requests()
@@ -1072,7 +1072,7 @@ mod tests {
                 == Some("pw")),
             "never dropped from the file"
         );
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, connected).await;
     }
 
@@ -1084,7 +1084,7 @@ mod tests {
         let (s, _) = services_with(nas.clone(), Arc::new(MemoryStore::refusing(&[])));
         s.load_global(GlobalSettings::default()).await;
         s.save_connection(conn(), Some("pw".into())).await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, connected).await;
         assert_eq!(s.password_stored(), Some(Stored::Memory));
         assert_ne!(next.secret_scope(), scope(), "the test must change scope");
@@ -1139,7 +1139,7 @@ mod tests {
             s.current_status()
         );
         assert!(!s.has_password());
-        let _k = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _k = s.poller(Endpoint::Utilization).subscribe("key-1");
         let reads = secrets.reads();
         // Longer than every automatic retry would take (20+40+80+160+320 ms).
         tokio::time::sleep(Duration::from_millis(800)).await;
@@ -1163,7 +1163,7 @@ mod tests {
         .await;
         assert!(matches!(s.current_status(), ConnStatus::KeyringRefused(_)));
         secrets.set_refusing(false);
-        let _k = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _k = s.poller(Endpoint::Utilization).subscribe("key-1");
         s.save_connection(conn(), None).await;
         wait_for(&s, connected).await;
     }
@@ -1174,7 +1174,7 @@ mod tests {
         let (s, sink) = services_with(nas.clone(), Arc::new(MemoryStore::broken()));
         s.load_global(GlobalSettings::default()).await;
         s.save_connection(conn(), Some("pw".into())).await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, |st| *st == ConnStatus::Auth(AuthError::NeedOtp)).await;
         s.submit_otp("123456").await.unwrap();
         wait_for(&s, connected).await;
@@ -1209,7 +1209,7 @@ mod tests {
         let (s, _) = services_with(nas.clone(), Arc::new(MemoryStore::broken()));
         s.load_global(GlobalSettings::default()).await;
         s.save_connection(conn(), Some("pw".into())).await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, |st| *st == ConnStatus::Auth(AuthError::NeedOtp)).await;
         s.submit_otp("123456").await.unwrap();
         wait_for(&s, connected).await;
@@ -1278,7 +1278,7 @@ mod tests {
         let f = sink.last().fallback_secrets.unwrap();
         assert_eq!((f.password.as_deref(), f.did), (Some("pw"), None));
         assert_eq!(f.scope, Some(scope()), "re-filed under the new scope");
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, connected).await;
         assert_eq!(nas.count("login"), 1, "the token still worked this run");
     }
@@ -1298,7 +1298,7 @@ mod tests {
         s.load_global(g).await;
         assert_eq!(secrets.get(&password_key(&scope())), Ok(Some("pw".into())));
         assert_eq!(sink.last().fallback_secrets, None);
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, connected).await;
     }
 
@@ -1319,7 +1319,7 @@ mod tests {
             [did_key(&scope()), password_key(&scope())],
             "moved, not copied"
         );
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, connected).await;
         assert_eq!(nas.count("login"), 1, "no 2FA code needed");
     }
@@ -1339,7 +1339,7 @@ mod tests {
             ..GlobalSettings::default()
         })
         .await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(s.current_status(), ConnStatus::HttpsRequired);
         assert!(nas.requests().is_empty(), "{:?}", nas.requests());
@@ -1370,7 +1370,7 @@ mod tests {
         }));
         assert!(bad.is_empty(), "an old settings file still loads: {bad:?}");
         s.load_global(g).await;
-        let mut rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let mut rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, |st| *st == ConnStatus::HttpsRequired).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(s.current_status(), ConnStatus::HttpsRequired);
@@ -1404,7 +1404,7 @@ mod tests {
         let (s, sink) = services_over(transports, Arc::new(MemoryStore::default()));
         s.load_global(GlobalSettings::default()).await;
         s.save_connection(http_conn(), Some("pw".into())).await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, connected).await;
         assert!(s.global().connection.https);
         assert!(sink.last().connection.https);
@@ -1430,7 +1430,7 @@ mod tests {
             ..GlobalSettings::default()
         })
         .await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, |st| *st == ConnStatus::HttpsRequired).await;
         assert!(secrets.keys().is_empty(), "{:?}", secrets.keys());
         assert_eq!(s.global().fallback_secrets, Some(fallback));
@@ -1456,7 +1456,7 @@ mod tests {
             ..GlobalSettings::default()
         })
         .await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, connected).await;
         let logins: Vec<_> = nas
             .requests()
@@ -1487,7 +1487,7 @@ mod tests {
             s.current_status()
         );
         assert_ne!(*rx.borrow_and_update(), ConnStatus::NotConfigured);
-        let _k = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _k = s.poller(Endpoint::Utilization).subscribe("key-1");
         // Read again a little later, when the keyring is up.
         secrets.set_readable(true);
         wait_for(&s, connected).await;
@@ -1538,7 +1538,7 @@ mod tests {
             None,
         )
         .await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!s.has_password(), "other.lan has no password of its own");
         assert!(
@@ -1602,7 +1602,7 @@ mod tests {
         );
         s.load_global(GlobalSettings::default()).await;
         s.save_connection(conn(), Some("pw".into())).await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, |st| {
             matches!(st, ConnStatus::Certificate { changed: false, .. })
         })
@@ -1620,7 +1620,7 @@ mod tests {
         );
         s.load_global(GlobalSettings::default()).await;
         s.save_connection(conn(), Some("pw".into())).await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, |st| matches!(st, ConnStatus::Certificate { .. })).await;
         let saves = sink.0.lock().unwrap().len();
         assert!(
@@ -1637,7 +1637,7 @@ mod tests {
         let (s, _) = services_with(nas_with_2fa(), secrets.clone());
         s.load_global(GlobalSettings::default()).await;
         s.save_connection(conn(), Some("pw".into())).await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, |st| *st == ConnStatus::Auth(AuthError::NeedOtp)).await;
         s.submit_otp("123456").await.unwrap();
         wait_for(&s, connected).await;
@@ -1656,7 +1656,7 @@ mod tests {
         let (s, _) = services_with(nas, Arc::new(MemoryStore::default()));
         s.load_global(GlobalSettings::default()).await;
         s.save_connection(conn(), Some("pw".into())).await;
-        let _rx = s.poller(Endpoint::Storage).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Storage).subscribe("key-1");
         wait_for(&s, connected).await;
     }
 
@@ -1671,7 +1671,7 @@ mod tests {
         let (s, _) = services_over(transports, Arc::new(MemoryStore::default()));
         s.load_global(GlobalSettings::default()).await;
         s.save_connection(conn(), Some("pw".into())).await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         let need_otp = |st: &ConnStatus| *st == ConnStatus::Auth(AuthError::NeedOtp);
         wait_for(&s, need_otp).await;
         assert!(s.submit_otp("123456").await.is_err());
@@ -1695,7 +1695,7 @@ mod tests {
         let (s, _) = services_with(nas, Arc::new(MemoryStore::default()));
         s.load_global(GlobalSettings::default()).await;
         s.save_connection(conn(), Some("pw".into())).await;
-        let mut rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let mut rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, |st| *st == ConnStatus::Auth(AuthError::NeedOtp)).await;
         // The status is published just before the poller stores its error.
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1813,7 +1813,7 @@ mod tests {
         // Startup: reading the keyring waits on its access prompt.
         let secrets = Arc::new(MemoryStore::gated(&[(&password_key(&scope()), "pw")]));
         let (s, _) = services_with(healthy_nas(), secrets.clone());
-        let _k = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _k = s.poller(Endpoint::Utilization).subscribe("key-1");
         let first = GlobalSettings {
             connection: conn(),
             ..GlobalSettings::default()
@@ -1840,7 +1840,7 @@ mod tests {
         let (s, sink) = services_over(cert_then_nas(healthy_nas()), secrets.clone());
         s.load_global(GlobalSettings::default()).await;
         s.save_connection(conn(), Some("pw".into())).await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, |st| {
             matches!(st, ConnStatus::Certificate { changed: false, .. })
         })
@@ -2011,7 +2011,7 @@ mod tests {
         // OpenDeck hands over a newer file password meanwhile.
         s.load_global(with_file_password("new")).await;
         first.await.unwrap();
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, connected).await;
         assert_eq!(secrets.get(&password_key(&scope())), Ok(Some("new".into())));
         assert_eq!(last_login_password(&nas).as_deref(), Some("new"));
@@ -2035,7 +2035,7 @@ mod tests {
             _ => Ok(fixture("utilization.json")),
         });
         let (s, _) = services_with(nas.clone(), secrets);
-        let _k = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _k = s.poller(Endpoint::Utilization).subscribe("key-1");
         let b = GlobalSettings {
             connection: b_conn,
             ..GlobalSettings::default()
@@ -2095,7 +2095,7 @@ mod tests {
         let (s, _) = services_with(nas.clone(), Arc::new(MemoryStore::default()));
         s.load_global(GlobalSettings::default()).await;
         s.save_connection(conn(), Some("pw".into())).await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, connected).await;
         s.load_global(s.global()).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2126,7 +2126,7 @@ mod tests {
         let (s, _) = services_with(nas.clone(), Arc::new(MemoryStore::default()));
         s.load_global(GlobalSettings::default()).await;
         s.save_connection(conn(), Some("pw".into())).await;
-        let mut rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let mut rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for_value(&mut rx).await;
         s.save_connection(
             Connection {
@@ -2178,8 +2178,8 @@ mod tests {
             ..conn()
         };
         s.save_connection(old_conn, Some("pw".into())).await;
-        let _storage = s.poller(Endpoint::Storage).subscribe("key-1", None);
-        let _cpu = s.poller(Endpoint::Utilization).subscribe("key-2", None);
+        let _storage = s.poller(Endpoint::Storage).subscribe("key-1");
+        let _cpu = s.poller(Endpoint::Utilization).subscribe("key-2");
         tokio::time::sleep(Duration::from_millis(100)).await;
         s.save_connection(conn(), Some("pw".into())).await;
         wait_for(&s, connected).await;
@@ -2208,7 +2208,7 @@ mod tests {
         let (s, _) = services_with(healthy_nas(), Arc::new(MemoryStore::default()));
         s.load_global(GlobalSettings::default()).await;
         s.save_connection(conn(), Some("pw".into())).await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
         wait_for(&s, connected).await;
         eventually("firmware looked up", || s.firmware().is_some()).await;
         assert_eq!(s.firmware().as_deref(), Some("DSM 7.2.2-72806 Update 3"));

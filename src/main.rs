@@ -124,9 +124,7 @@ mod tests {
             "pw",
         )]));
         let (services, _) = services_with(healthy_nas(), secrets.clone());
-        let mut key = services
-            .poller(Endpoint::Utilization)
-            .subscribe("key-1", None);
+        let mut key = services.poller(Endpoint::Utilization).subscribe("key-1");
         let events = GlobalEvents {
             services: services.clone(),
         };

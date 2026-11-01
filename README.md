@@ -24,9 +24,10 @@ Every action works on a key and on a dial. Pressing a key or a dial refreshes it
 
 Numeric actions have **warn** and **critical** thresholds (the key turns amber or red).
 The defaults are CPU 70/90 %, RAM 80/95 %, system temperature 60/70 °C, disk temperature
-50/60 °C and volume 80/90 %; network thresholds are off until you set them, in MB/s. Each
-key can also override its **refresh interval** (at least 2 s). Keys reading the same data
-share one request to the NAS at the fastest interval any of them asks for.
+50/60 °C and volume 80/90 %; network thresholds are off until you set them, in MB/s. Keys
+reading the same data share one request to the NAS, every 5 s for CPU, RAM and network,
+30 s for system temperature, 60 s for disks, volumes, pools and NAS Health, and 6 h for
+DSM Update; pressing a key refreshes it at once.
 
 **NAS Health** has no thresholds of its own: it turns red for a degraded or crashed pool
 or volume, a failing disk, or a volume over 90 %, and amber for anything else not normal

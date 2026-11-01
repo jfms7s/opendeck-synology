@@ -12,7 +12,6 @@ use crate::settings::ActionSettings;
 use dashmap::DashMap;
 use openaction::{Instance, OpenActionResult};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
@@ -47,8 +46,7 @@ impl Instances {
             return;
         }
         self.hide(services, id);
-        let interval = settings.interval_secs.map(Duration::from_secs);
-        let rx = services.poller(metric.endpoint()).subscribe(id, interval);
+        let rx = services.poller(metric.endpoint()).subscribe(id);
         let view = Arc::new(Mutex::new(settings.clone()));
         let redraw = Arc::new(Notify::new());
         let task = tokio::spawn(render_loop(
@@ -186,14 +184,16 @@ mod tests {
             s.poller(Endpoint::Utilization).effective_interval(),
             Some(StdDuration::from_secs(5))
         );
-        let faster = ActionSettings {
-            interval_secs: Some(3),
-            ..ActionSettings::default()
-        };
-        live.show(&s, Metric::Cpu, "k1", true, faster);
+        // A key saved before 0.7.0 with its own interval still loads, and
+        // polls at the endpoint default.
+        let old: ActionSettings =
+            serde_json::from_value(serde_json::json!({ "interval_secs": 3, "warn": 75.0 }))
+                .expect("old settings still load");
+        assert_eq!(old.warn, Some(75.0));
+        live.show(&s, Metric::Cpu, "k1", true, old);
         assert_eq!(
             s.poller(Endpoint::Utilization).effective_interval(),
-            Some(StdDuration::from_secs(3))
+            Some(StdDuration::from_secs(5))
         );
         live.hide(&s, "k1");
         assert_eq!(s.poller(Endpoint::Utilization).effective_interval(), None);

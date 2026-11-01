@@ -113,7 +113,6 @@ pub fn state_message(services: &Services, metric: Metric, notice: Option<&str>) 
         "defaults": {
             "warn": defaults.map(|d| d.0),
             "crit": defaults.map(|d| d.1),
-            "interval": metric.endpoint().default_interval().as_secs(),
         },
     })
 }
@@ -559,7 +558,7 @@ mod tests {
         let (s, _) = services_with(nas.clone(), Arc::new(MemoryStore::default()));
         s.load_global(GlobalSettings::default()).await;
         apply(&s, save(Some("pw"))).await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("k", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("k");
         eventually("asks for a code", || s.current_status().kind() == "needOtp").await;
         let sent = nas.requests().len();
         let notice = apply(&s, Request::SubmitOtp { code: " ".into() }).await;
@@ -581,7 +580,7 @@ mod tests {
         let (s, _) = services_with(healthy_nas(), Arc::new(MemoryStore::default()));
         s.load_global(GlobalSettings::default()).await;
         apply(&s, save(Some("pw"))).await;
-        let _rx = s.poller(Endpoint::Storage).subscribe("k", None);
+        let _rx = s.poller(Endpoint::Storage).subscribe("k");
         eventually("storage polled", || {
             s.poller(Endpoint::Storage).latest().value.is_some()
         })
@@ -595,10 +594,7 @@ mod tests {
             msg["targets"][1],
             json!({ "id": "sata1", "label": "Drive 1" })
         );
-        assert_eq!(
-            msg["defaults"],
-            json!({ "warn": 50.0, "crit": 60.0, "interval": 60 })
-        );
+        assert_eq!(msg["defaults"], json!({ "warn": 50.0, "crit": 60.0 }));
         assert_eq!(
             msg["fields"],
             json!({ "target": "Disk", "cpuView": false, "direction": false, "amount": false, "thresholdUnit": "°C" })
@@ -612,7 +608,7 @@ mod tests {
         let (s, _) = services_with(healthy_nas(), Arc::new(MemoryStore::default()));
         s.load_global(GlobalSettings::default()).await;
         apply(&s, save(Some("pw"))).await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("k", None);
+        let _rx = s.poller(Endpoint::Utilization).subscribe("k");
         eventually("firmware in the status", || {
             state_message(&s, Metric::Cpu, None)["status"]["firmware"] == "DSM 7.2.2-72806 Update 3"
         })

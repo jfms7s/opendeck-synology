@@ -229,8 +229,8 @@ pub enum Amount {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ActionSettings {
-    /// Refresh interval override in seconds (clamped to at least 2).
-    pub interval_secs: Option<u64>,
+    // The per-key refresh override (before 0.7.0) is gone;
+    // settings saved with it still load, since unknown fields are ignored.
     pub warn: Option<f64>,
     pub crit: Option<f64>,
     /// Disk, volume or pool id, or a network interface. `None` selects the

@@ -116,11 +116,6 @@
 					<input id="crit" type="number" step="any" />
 				</div>
 			</div>
-			<div class="field">
-				<label for="interval_secs">Refresh every (seconds)</label>
-				<input id="interval_secs" type="number" min="2" step="1" />
-				<p class="hint">Keys reading the same data share one request, at the fastest interval any of them asks for.</p>
-			</div>
 		</section>
 	</main>
 
@@ -192,11 +187,6 @@
 			return Number.isFinite(n) ? n : null;
 		}
 
-		function secondsOrNull(input) {
-			const n = numberOrNull(input);
-			return n === null ? null : Math.max(2, Math.round(n));
-		}
-
 		function applySettings(s) {
 			settings = s;
 			$("cpu_view").value = s.cpu_view || "total";
@@ -204,7 +194,6 @@
 			$("amount").value = s.amount || "percent";
 			$("warn").value = s.warn ?? "";
 			$("crit").value = s.crit ?? "";
-			$("interval_secs").value = s.interval_secs ?? "";
 			$("target").value = s.target ?? "";
 		}
 
@@ -255,7 +244,6 @@
 
 			$("warn").placeholder = st.defaults.warn ?? "";
 			$("crit").placeholder = st.defaults.crit ?? "";
-			$("interval_secs").placeholder = st.defaults.interval;
 			fillTargets(st.targets);
 		}
 
@@ -333,10 +321,6 @@
 				sendSettings();
 			});
 		}
-		$("interval_secs").addEventListener("change", () => {
-			settings.interval_secs = secondsOrNull($("interval_secs"));
-			sendSettings();
-		});
 	</script>
 </body>
 </html>

@@ -5,13 +5,12 @@
 
 use crate::dsm::error::DsmError;
 use futures::future::BoxFuture;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 
-pub const MIN_INTERVAL: Duration = Duration::from_secs(2);
 pub const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
@@ -56,7 +55,7 @@ pub fn backoff(interval: Duration, failures: u32) -> Duration {
 }
 
 struct Registry<T> {
-    subscribers: HashMap<String, Duration>,
+    subscribers: HashSet<String>,
     fetch: Option<Fetch<T>>,
     /// Bumped by `set_fetch`, so a request started on the old connection
     /// can't overwrite the new connection's state when it finishes. (The
@@ -95,7 +94,7 @@ impl<T: Send + Sync + 'static> Poller<T> {
             inner: Arc::new(Inner {
                 default_interval,
                 registry: Mutex::new(Registry {
-                    subscribers: HashMap::new(),
+                    subscribers: HashSet::new(),
                     fetch: None,
                     generation: 0,
                     running: false,
@@ -110,19 +109,15 @@ impl<T: Send + Sync + 'static> Poller<T> {
     }
 
     /// Registers (or re-registers) a subscriber, starting the poll loop if
-    /// it isn't running. `interval: None` means the endpoint's default.
-    /// Polls right away unless the last value is younger than the (new)
-    /// effective interval, or an outage's backoff is still running; fresh
-    /// data is shared as is, and the next poll is rescheduled for the new
-    /// interval.
-    pub fn subscribe(&self, id: &str, interval: Option<Duration>) -> watch::Receiver<PollState<T>> {
-        let interval = interval
-            .unwrap_or(self.inner.default_interval)
-            .max(MIN_INTERVAL);
+    /// it isn't running. Every endpoint polls at its own default interval.
+    /// Polls right away unless the last value is younger than that
+    /// interval, or an outage's backoff is still running; fresh data is
+    /// shared as is.
+    pub fn subscribe(&self, id: &str) -> watch::Receiver<PollState<T>> {
         let rx = self.inner.tx.subscribe();
         let start = {
             let mut reg = self.inner.registry.lock().unwrap();
-            reg.subscribers.insert(id.to_string(), interval);
+            reg.subscribers.insert(id.to_string());
             !std::mem::replace(&mut reg.running, true)
         };
         if start {
@@ -196,14 +191,8 @@ impl<T: Send + Sync + 'static> Poller<T> {
 
     #[cfg(test)]
     pub fn effective_interval(&self) -> Option<Duration> {
-        self.inner
-            .registry
-            .lock()
-            .unwrap()
-            .subscribers
-            .values()
-            .min()
-            .copied()
+        let reg = self.inner.registry.lock().unwrap();
+        (!reg.subscribers.is_empty()).then_some(self.inner.default_interval)
     }
 
     pub fn latest(&self) -> PollState<T> {
@@ -250,10 +239,11 @@ async fn run<T: Send + Sync + 'static>(inner: Arc<Inner<T>>) {
         // connection changed.
         let plan = {
             let mut reg = inner.registry.lock().unwrap();
-            let Some(interval) = reg.subscribers.values().min().copied() else {
+            if reg.subscribers.is_empty() {
                 reg.running = false;
                 return;
-            };
+            }
+            let interval = inner.default_interval;
             let force = std::mem::take(&mut reg.force);
             let due = if force {
                 Some(Instant::now())
@@ -349,19 +339,19 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn polls_at_the_shortest_subscriber_interval() {
-        let p = Poller::new(S(60));
+    async fn every_subscriber_shares_the_endpoint_default_interval() {
+        let p = Poller::new(S(10));
         let n = Arc::new(AtomicU32::new(0));
         p.set_fetch(Some(counting(n.clone())));
-        let _a = p.subscribe("a", Some(S(10)));
+        let _a = p.subscribe("a");
         tokio::time::sleep(Duration::from_millis(1)).await;
         assert_eq!(n.load(SeqCst), 1, "polls as soon as someone subscribes");
-        let _b = p.subscribe("b", Some(S(5)));
-        assert_eq!(p.effective_interval(), Some(S(5)));
+        let _b = p.subscribe("b");
+        assert_eq!(p.effective_interval(), Some(S(10)));
         tokio::time::sleep(Duration::from_millis(20_500)).await;
-        // No extra poll for the new subscriber (the data is fresh), but the
-        // schedule tightens to every 5 s: at 5, 10, 15 and 20 s.
-        assert_eq!(n.load(SeqCst), 5);
+        // No extra poll for the new subscriber (the data is fresh): at 10
+        // and 20 s.
+        assert_eq!(n.load(SeqCst), 3);
     }
 
     #[tokio::test(start_paused = true)]
@@ -369,11 +359,11 @@ mod tests {
         let p = Poller::new(S(60));
         let n = Arc::new(AtomicU32::new(0));
         p.set_fetch(Some(counting(n.clone())));
-        let _a = p.subscribe("a", None);
+        let _a = p.subscribe("a");
         tokio::time::sleep(Duration::from_millis(1)).await;
         assert_eq!(n.load(SeqCst), 1);
         tokio::time::sleep(S(30)).await;
-        let _b = p.subscribe("b", None);
+        let _b = p.subscribe("b");
         tokio::time::sleep(Duration::from_millis(1)).await;
         assert_eq!(
             n.load(SeqCst),
@@ -392,11 +382,11 @@ mod tests {
         let p = Poller::new(S(60));
         let n = Arc::new(AtomicU32::new(0));
         p.set_fetch(Some(counting(n.clone())));
-        let _a = p.subscribe("a", None);
+        let _a = p.subscribe("a");
         tokio::time::sleep(Duration::from_millis(1)).await;
         p.unsubscribe("a");
         tokio::time::sleep(S(10)).await;
-        let _b = p.subscribe("b", None);
+        let _b = p.subscribe("b");
         tokio::time::sleep(Duration::from_millis(1)).await;
         assert_eq!(
             n.load(SeqCst),
@@ -412,23 +402,16 @@ mod tests {
         let p = Poller::new(S(5));
         let n = Arc::new(AtomicU32::new(0));
         p.set_fetch(Some(counting(n.clone())));
-        let _a = p.subscribe("a", None);
+        let _a = p.subscribe("a");
         tokio::time::sleep(Duration::from_millis(1)).await;
         p.unsubscribe("a");
         tokio::time::sleep(S(60)).await;
         assert_eq!(n.load(SeqCst), 1);
         assert_eq!(p.effective_interval(), None);
         // ...and starts again for a new subscriber.
-        let _b = p.subscribe("b", None);
+        let _b = p.subscribe("b");
         tokio::time::sleep(Duration::from_millis(1)).await;
         assert_eq!(n.load(SeqCst), 2);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn clamps_intervals_to_the_minimum() {
-        let p: Poller<u32> = Poller::new(S(5));
-        let _a = p.subscribe("a", Some(Duration::from_millis(100)));
-        assert_eq!(p.effective_interval(), Some(MIN_INTERVAL));
     }
 
     #[tokio::test(start_paused = true)]
@@ -436,7 +419,7 @@ mod tests {
         let p = Poller::new(S(5));
         let n = Arc::new(AtomicU32::new(0));
         p.set_fetch(Some(counting(n.clone())));
-        let mut rx = p.subscribe("a", None);
+        let mut rx = p.subscribe("a");
         rx.changed().await.unwrap();
         assert_eq!(rx.borrow().value.as_deref(), Some(&1));
 
@@ -462,7 +445,7 @@ mod tests {
         let p = Poller::new(S(5));
         let n = Arc::new(AtomicU32::new(0));
         p.set_fetch(Some(failing(n.clone(), DsmError::Transport("down".into()))));
-        let _a = p.subscribe("a", None);
+        let _a = p.subscribe("a");
         // Polls at t=0, then waits 10 s (1 failure), then 20 s (2 failures).
         tokio::time::sleep(Duration::from_millis(29_000)).await;
         assert_eq!(n.load(SeqCst), 2);
@@ -478,7 +461,7 @@ mod tests {
             n.clone(),
             DsmError::Auth(AuthError::BadCredentials),
         )));
-        let _a = p.subscribe("a", None);
+        let _a = p.subscribe("a");
         tokio::time::sleep(S(3600)).await;
         assert_eq!(n.load(SeqCst), 1, "no retry of a wrong password");
         p.refresh_now();
@@ -491,7 +474,7 @@ mod tests {
         let p = Poller::new(S(5));
         let n = Arc::new(AtomicU32::new(0));
         p.set_fetch(Some(counting(n.clone())));
-        let _a = p.subscribe("a", None);
+        let _a = p.subscribe("a");
         tokio::time::sleep(Duration::from_millis(1)).await;
         let fail = failing(n.clone(), DsmError::Auth(AuthError::NeedOtp));
         p.inner.registry.lock().unwrap().fetch = Some(fail);
@@ -527,7 +510,7 @@ mod tests {
         let n = Arc::new(AtomicU32::new(0));
         let ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
         p.set_fetch(Some(flaky(n.clone(), ok.clone())));
-        let _a = p.subscribe("a", None);
+        let _a = p.subscribe("a");
         // Fails at 0, 10 and 30 s.
         tokio::time::sleep(Duration::from_millis(30_500)).await;
         assert_eq!((n.load(SeqCst), p.latest().failures), (3, 3));
@@ -553,13 +536,13 @@ mod tests {
         let p = Poller::new(S(5));
         let n = Arc::new(AtomicU32::new(0));
         p.set_fetch(Some(failing(n.clone(), DsmError::Transport("down".into()))));
-        let _a = p.subscribe("a", None);
+        let _a = p.subscribe("a");
         tokio::time::sleep(Duration::from_millis(1)).await;
         assert_eq!(n.load(SeqCst), 1);
         // Page flips during the 10 s backoff.
         for i in 0..5 {
             let id = format!("k{i}");
-            let _rx = p.subscribe(&id, None);
+            let _rx = p.subscribe(&id);
             tokio::time::sleep(Duration::from_millis(1)).await;
             p.unsubscribe(&id);
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -575,7 +558,7 @@ mod tests {
         let n = Arc::new(AtomicU32::new(0));
         let ok = Arc::new(std::sync::atomic::AtomicBool::new(true));
         p.set_fetch(Some(flaky(n.clone(), ok.clone())));
-        let _a = p.subscribe("a", None);
+        let _a = p.subscribe("a");
         tokio::time::sleep(Duration::from_millis(1)).await;
         ok.store(false, SeqCst);
         // Failures at 5, 15 and 35 s: the third one marks the value stale.
@@ -596,7 +579,7 @@ mod tests {
             })
         });
         p.set_fetch(Some(slow));
-        let _a = p.subscribe("a", None);
+        let _a = p.subscribe("a");
         tokio::time::sleep(S(1)).await;
         let never: Fetch<u32> = Arc::new(|| Box::pin(std::future::pending()));
         p.set_fetch(Some(never));
@@ -640,7 +623,7 @@ mod tests {
                 })
             });
             p.set_fetch(Some(old));
-            let _a = p.subscribe("a", None);
+            let _a = p.subscribe("a");
             gate.wait();
             p.set_fetch(None);
             // Let the poller finish whatever it was doing.
@@ -659,11 +642,11 @@ mod tests {
         let p = Poller::new(S(5));
         let boom: Fetch<u32> = Arc::new(|| Box::pin(async { panic!("malformed reply") }));
         p.set_fetch(Some(boom));
-        let _a = p.subscribe("a", None);
+        let _a = p.subscribe("a");
         tokio::time::sleep(Duration::from_millis(1)).await;
         let n = Arc::new(AtomicU32::new(0));
         p.set_fetch(Some(counting(n.clone())));
-        let _b = p.subscribe("b", None);
+        let _b = p.subscribe("b");
         tokio::time::sleep(Duration::from_millis(1)).await;
         assert_eq!(n.load(SeqCst), 1, "a new loop started");
     }
@@ -671,7 +654,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn without_a_fetch_it_idles_until_one_is_set() {
         let p = Poller::new(S(5));
-        let mut rx = p.subscribe("a", None);
+        let mut rx = p.subscribe("a");
         tokio::time::sleep(S(60)).await;
         assert!(rx.borrow_and_update().value.is_none());
         let n = Arc::new(AtomicU32::new(0));
