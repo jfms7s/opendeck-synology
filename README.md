@@ -127,17 +127,28 @@ nothing secret is written to the log.
 
 Download the latest `.streamDeckPlugin` and `SHA256SUMS` from
 [Releases](https://github.com/jfms7s/opendeck-synology/releases) and check the download
-with `sha256sum -c SHA256SUMS` (on macOS: `shasum -a 256 -c SHA256SUMS`). Then either
+with `sha256sum -c SHA256SUMS` (on macOS: `shasum -a 256 -c SHA256SUMS`). The checksum
+file comes from the same release, so it only catches a corrupt download; to check the
+bundle was built by this repository's Release workflow, verify its provenance with the
+[GitHub CLI](https://cli.github.com/):
+
+```bash
+gh attestation verify opendeck-synology.streamDeckPlugin --repo jfms7s/opendeck-synology
+```
+
+Then either
 double-click it (if your file manager associates the extension with OpenDeck) or unzip
 it into OpenDeck's plugin folder - `~/.config/opendeck/plugins/` on Linux,
 `~/Library/Application Support/opendeck/plugins/` on macOS - and restart OpenDeck. The
 bundle runs on Linux x86_64 and aarch64 and on macOS with Apple Silicon.
 
-On macOS, a bundle unzipped by hand (e.g. in Finder) is marked as downloaded and
-Gatekeeper refuses to start the binary. Clear the mark once:
+On macOS, installing through OpenDeck is expected to leave no quarantine mark (the Mac
+smoke test checks this). A bundle unzipped by hand (e.g. in Finder) is marked as
+downloaded and Gatekeeper refuses to start the binary. Only after the checksum and
+attestation checks passed, clear the mark on the plugin binary alone:
 
 ```bash
-xattr -dr com.apple.quarantine ~/Library/Application\ Support/opendeck/plugins/com.jfms7s.synology.sdPlugin
+xattr -d com.apple.quarantine ~/Library/Application\ Support/opendeck/plugins/com.jfms7s.synology.sdPlugin/opendeck-synology-aarch64-apple-darwin
 ```
 
 ## Development
