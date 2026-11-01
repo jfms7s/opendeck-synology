@@ -15,7 +15,6 @@ pub fn paths(metric: Metric) -> &'static str {
         Metric::SysTemp | Metric::DiskTemp => {
             r#"<path d="M14 14.8V4a2 2 0 0 0-4 0v10.8a4 4 0 1 0 4 0z"/><path d="M12 18v-6"/>"#
         }
-        Metric::Uptime => r#"<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>"#,
         Metric::DiskHealth => r#"<path d="M3 12h4l2-5 4 10 2-5h6"/>"#,
         Metric::Volume => {
             r#"<ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>"#

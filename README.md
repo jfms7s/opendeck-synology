@@ -15,7 +15,6 @@ Every action works on a key and on a dial. Pressing a key or a dial refreshes it
 | RAM | memory in use | percent → used of total |
 | Network | throughput of all interfaces or one | in → out → combined |
 | System Temperature | the NAS's system sensor | - |
-| Uptime | e.g. `12d 5h` | - |
 | Disk Temperature | one disk, or the hottest | each disk → hottest |
 | Disk Health | S.M.A.R.T. OK / Warning / Failing, one disk or the worst | each disk → worst |
 | Volume | how full, as % or used of total | each volume |
@@ -207,7 +206,7 @@ pass against a NAS with a publicly trusted one.
       a key brings the prompt back, and unlocking connects.
 - [ ] A wrong password shows *Wrong account or password* and DSM's log shows exactly one
       failed login, not one per refresh.
-- [ ] Each of the eleven actions shows a sensible value on a key and on a dial; rotating each
+- [ ] Each of the ten actions shows a sensible value on a key and on a dial; rotating each
       dial cycles as described above and the subject line shows `‹ … n/m ›`.
 - [ ] Setting a CPU warn threshold below the current load turns the key amber.
 - [ ] Unplugging the NAS's network cable: keys turn grey with `!` about seven refresh
