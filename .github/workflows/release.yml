@@ -1,7 +1,8 @@
 # Pushing a version tag (vX.Y.Z, matching Cargo.toml and manifest.json)
 # checks, builds (Linux binaries on Ubuntu, the macOS one on a macOS
 # runner) and creates a *draft* release with the bundle and its SHA256SUMS
-# attached. The draft's notes are the README's smoke-test checklist, unticked
+# attached, after attesting the bundle's build provenance (verify with
+# `gh attestation verify`). The draft's notes are the README's smoke-test checklist, unticked
 # (scripts/release-body.mjs). Publish it by hand only after running that
 # checklist on a device and linking the release's smoke log in the notes: a
 # release is never visible without its asset.
@@ -120,17 +121,26 @@ jobs:
             dist/RELEASE_BODY.md
           if-no-files-found: error
 
-  # The only job that can write to the repository, and it runs no build.
+  # The only job that can write to the repository, and it runs no build:
+  # it checks, attests and attaches what `build` produced.
   release:
     needs: build
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: bundle
           path: dist
+      - name: Check the bundle against SHA256SUMS
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/opendeck-synology.streamDeckPlugin
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           draft: true
