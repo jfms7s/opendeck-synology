@@ -1471,6 +1471,133 @@ mod tests {
         );
     }
 
+    /// Each `keyring_step` in `connect` is pinned on its own: a prompt on
+    /// the password read (after `migrate`'s read of the same key went
+    /// through) shows `KeyringPending`, and answering it connects.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prompt_on_the_password_read_shows_keyring_pending() {
+        let pw = password_key(&scope());
+        let secrets = Arc::new(MemoryStore::default());
+        secrets.set(&pw, Some("pw")).unwrap();
+        secrets.gate_key(&pw, 1);
+        let nas = healthy_nas();
+        let (s, _) = services_with(nas.clone(), secrets.clone());
+        let load = {
+            let s = s.clone();
+            tokio::spawn(async move {
+                s.load_global(GlobalSettings {
+                    connection: conn(),
+                    ..GlobalSettings::default()
+                })
+                .await
+            })
+        };
+        wait_for(&s, |st| *st == ConnStatus::KeyringPending).await;
+        assert_eq!(secrets.reads_of(&pw), 2, "migrate's read, then connect's");
+        assert_eq!(nas.count("login"), 0);
+        secrets.open_key(&pw);
+        load.await.unwrap();
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
+        wait_for(&s, connected).await;
+    }
+
+    /// The same for the device-token read: the password was allowed, the
+    /// device token's own prompt (macOS asks per secret) is still open.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prompt_on_the_device_token_read_shows_keyring_pending() {
+        let did = did_key(&scope());
+        let secrets = Arc::new(MemoryStore::default());
+        secrets.set(&password_key(&scope()), Some("pw")).unwrap();
+        secrets.set(&did, Some("dev-1")).unwrap();
+        secrets.gate_key(&did, 1);
+        let nas = nas_with_2fa();
+        let (s, _) = services_with(nas.clone(), secrets.clone());
+        let load = {
+            let s = s.clone();
+            tokio::spawn(async move {
+                s.load_global(GlobalSettings {
+                    connection: conn(),
+                    ..GlobalSettings::default()
+                })
+                .await
+            })
+        };
+        wait_for(&s, |st| *st == ConnStatus::KeyringPending).await;
+        assert_eq!(secrets.reads_of(&did), 2, "migrate's read, then connect's");
+        assert_eq!(nas.count("login"), 0);
+        secrets.open_key(&did);
+        load.await.unwrap();
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1");
+        wait_for(&s, connected).await;
+        assert_eq!(nas.count("login"), 1, "the device token spared a 2FA code");
+    }
+
+    /// While a prompt for the new connection is open, nothing polls the
+    /// old session, even when a key press asks for fresh data.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nothing_polls_the_old_session_while_a_prompt_is_open() {
+        let other = Connection {
+            account: "admin".into(),
+            ..conn()
+        };
+        let other_pw = password_key(&other.secret_scope());
+        let secrets = Arc::new(MemoryStore::default());
+        secrets.set(&other_pw, Some("pw2")).unwrap();
+        let nas = healthy_nas();
+        let (s, _) = services_with(nas.clone(), secrets.clone());
+        s.load_global(GlobalSettings::default()).await;
+        s.save_connection(conn(), Some("pw".into())).await;
+        let mut rx = s.poller(Endpoint::Utilization).subscribe("key-1");
+        wait_for(&s, connected).await;
+        wait_for_value(&mut rx).await;
+        let old_sid = |r: &Req| r.get("_sid").map(String::as_str) == Some("s1");
+        assert!(nas.requests().iter().any(old_sid), "the old session polled");
+        secrets.gate_key(&other_pw, 1);
+        let save = {
+            let s = s.clone();
+            tokio::spawn(async move { s.save_connection(other, None).await })
+        };
+        wait_for(&s, |st| *st == ConnStatus::KeyringPending).await;
+        let before = nas.requests().iter().filter(|r| old_sid(r)).count();
+        s.poller(Endpoint::Utilization).refresh_now();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after = nas.requests().iter().filter(|r| old_sid(r)).count();
+        assert_eq!(
+            after, before,
+            "the old session was polled during the prompt"
+        );
+        secrets.open_key(&other_pw);
+        save.await.unwrap();
+        wait_for(&s, connected).await;
+    }
+
+    /// Denying the prompt: the keys say so and nothing signs in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_denied_prompt_shows_keyring_refused() {
+        let pw = password_key(&scope());
+        let secrets = Arc::new(MemoryStore::default());
+        secrets.set(&pw, Some("pw")).unwrap();
+        secrets.gate_key(&pw, 1);
+        let nas = healthy_nas();
+        let (s, _) = services_with(nas.clone(), secrets.clone());
+        let load = {
+            let s = s.clone();
+            tokio::spawn(async move {
+                s.load_global(GlobalSettings {
+                    connection: conn(),
+                    ..GlobalSettings::default()
+                })
+                .await
+            })
+        };
+        wait_for(&s, |st| *st == ConnStatus::KeyringPending).await;
+        secrets.deny_key(&pw);
+        load.await.unwrap();
+        wait_for(&s, |st| matches!(st, ConnStatus::KeyringRefused(_))).await;
+        assert!(!s.has_password());
+        assert_eq!(nas.count("login"), 0);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn an_unreadable_keyring_is_not_mistaken_for_no_password() {
         let secrets = Arc::new(MemoryStore::unreadable(&[(&password_key(&scope()), "pw")]));

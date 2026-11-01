@@ -443,6 +443,32 @@ pub struct MemoryStore {
     refusing: std::sync::atomic::AtomicBool,
     /// The keys of every read attempted so far, refused ones included.
     reads: std::sync::Mutex<Vec<String>>,
+    /// Per-key prompts (`gate_key`): macOS asks once per secret, so one
+    /// secret's prompt can be open while another's was answered.
+    key_gates: KeyGates,
+}
+
+/// One unanswered prompt per gated key.
+#[cfg(test)]
+#[derive(Default)]
+struct KeyGates {
+    gates: std::sync::Mutex<std::collections::HashMap<String, KeyGate>>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyGateState {
+    Closed,
+    Open,
+    Denied,
+}
+
+#[cfg(test)]
+struct KeyGate {
+    /// Reads still let through before the gate holds them.
+    pass: usize,
+    state: KeyGateState,
 }
 
 /// Holds keyring reads until opened.
@@ -559,6 +585,61 @@ impl MemoryStore {
         }
     }
 
+    /// Puts a prompt in front of `key`: the first `pass` reads go through,
+    /// later ones wait until `open_key` (they then succeed) or `deny_key`
+    /// (they, and every read after, are refused). Other keys are untouched.
+    pub fn gate_key(&self, key: &str, pass: usize) {
+        self.key_gates.gates.lock().unwrap().insert(
+            key.to_string(),
+            KeyGate {
+                pass,
+                state: KeyGateState::Closed,
+            },
+        );
+    }
+
+    /// The user allows access to `key`.
+    pub fn open_key(&self, key: &str) {
+        self.set_key_gate(key, KeyGateState::Open);
+    }
+
+    /// The user denies access to `key`.
+    pub fn deny_key(&self, key: &str) {
+        self.set_key_gate(key, KeyGateState::Denied);
+    }
+
+    fn set_key_gate(&self, key: &str, state: KeyGateState) {
+        if let Some(g) = self.key_gates.gates.lock().unwrap().get_mut(key) {
+            g.state = state;
+        }
+        self.key_gates.changed.notify_all();
+    }
+
+    /// Waits at `key`'s gate, if it has one; `Err` if access was denied.
+    /// Bounded like the shared gate, so a failing test can't hang.
+    fn pass_key_gate(&self, key: &str) -> Result<(), StoreError> {
+        let mut gates = self.key_gates.gates.lock().unwrap();
+        match gates.get_mut(key) {
+            None => return Ok(()),
+            Some(g) if g.state == KeyGateState::Closed && g.pass > 0 => {
+                g.pass -= 1;
+                return Ok(());
+            }
+            Some(_) => {}
+        }
+        let (gates, _) = self
+            .key_gates
+            .changed
+            .wait_timeout_while(gates, std::time::Duration::from_secs(10), |g| {
+                g.get(key).is_some_and(|g| g.state == KeyGateState::Closed)
+            })
+            .unwrap();
+        match gates.get(key).map(|g| g.state) {
+            Some(KeyGateState::Denied) => Err(StoreError::Refused("the user denied access".into())),
+            _ => Ok(()),
+        }
+    }
+
     pub fn keys(&self) -> Vec<String> {
         let mut k: Vec<_> = self.map.lock().unwrap().keys().cloned().collect();
         k.sort();
@@ -591,6 +672,7 @@ impl SecretStore for MemoryStore {
             .wait_timeout_while(closed, std::time::Duration::from_secs(10), |c| *c)
             .unwrap();
         drop(closed);
+        self.pass_key_gate(key)?;
         Ok(self.map.lock().unwrap().get(key).cloned())
     }
 
@@ -651,6 +733,44 @@ mod tests {
         assert!(!reader.is_finished(), "the read waits for the gate");
         s.open_gate();
         assert_eq!(reader.join().unwrap(), Ok(Some("v".into())));
+    }
+
+    #[test]
+    fn a_key_gate_holds_only_its_key_after_the_reads_it_lets_through() {
+        let s = Arc::new(MemoryStore::default());
+        s.set("a", Some("1")).unwrap();
+        s.set("b", Some("2")).unwrap();
+        s.gate_key("a", 1);
+        assert_eq!(s.get("a"), Ok(Some("1".into())), "the first read passes");
+        assert_eq!(s.get("b"), Ok(Some("2".into())), "other keys are free");
+        let reader = {
+            let s = s.clone();
+            std::thread::spawn(move || s.get("a"))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!reader.is_finished(), "the second read waits");
+        s.open_key("a");
+        assert_eq!(reader.join().unwrap(), Ok(Some("1".into())));
+        assert_eq!(s.get("a"), Ok(Some("1".into())), "and later reads too");
+    }
+
+    #[test]
+    fn a_denied_key_gate_refuses_waiting_and_later_reads() {
+        let s = Arc::new(MemoryStore::default());
+        s.set("a", Some("1")).unwrap();
+        s.gate_key("a", 0);
+        let reader = {
+            let s = s.clone();
+            std::thread::spawn(move || s.get("a"))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!reader.is_finished());
+        s.deny_key("a");
+        assert!(matches!(
+            reader.join().unwrap(),
+            Err(StoreError::Refused(_))
+        ));
+        assert!(matches!(s.get("a"), Err(StoreError::Refused(_))));
     }
 
     #[test]
