@@ -7,6 +7,8 @@ use crate::instances::Instances;
 use crate::metric::Metric;
 use crate::services::Services;
 use crate::settings::ActionSettings;
+use crate::settings::{Connection, PressAction};
+use crate::status::ConnStatus;
 use async_trait::async_trait;
 use openaction::{Action, Instance, OpenActionResult, register_action};
 use serde_json::Value;
@@ -71,6 +73,46 @@ impl<K: MetricKind> MetricAction<K> {
     fn refresh(&self) {
         self.services.refresh(K::METRIC.endpoint());
     }
+
+    /// A key press, dial push or touch tap: refreshes, or opens DSM in the
+    /// browser when the key is set to. While the keyring refuses the
+    /// password, a press is how the user asks it again, so it refreshes.
+    async fn press(&self, settings: &ActionSettings) {
+        let refused = matches!(
+            self.services.current_status(),
+            ConnStatus::KeyringRefused(_)
+        );
+        let url = press_url(settings.press, &self.services.global().connection);
+        match url.filter(|_| !refused) {
+            Some(url) => {
+                if let Err(e) = openaction::open_url(url).await {
+                    log::warn!("couldn't ask OpenDeck to open DSM: {e}");
+                }
+            }
+            None => self.refresh(),
+        }
+    }
+}
+
+/// The page a press opens, or `None` to refresh. Only the configured NAS's
+/// own address: no account, session id or other secret, and only HTTPS
+/// (a connection from before 0.7.0 saved as HTTP never connects).
+pub fn press_url(press: PressAction, conn: &Connection) -> Option<String> {
+    match press {
+        PressAction::Refresh => None,
+        // A host with userinfo, a query or a fragment in it could name
+        // another site than the NAS: refresh instead of opening it.
+        PressAction::Dsm
+            if conn.is_complete()
+                && conn.https
+                && !conn
+                    .host()
+                    .contains(|c: char| c.is_whitespace() || "@?#\\%".contains(c)) =>
+        {
+            Some(format!("{}/", conn.base_url()))
+        }
+        PressAction::Dsm => None,
+    }
 }
 
 #[async_trait]
@@ -111,24 +153,24 @@ impl<K: MetricKind> Action for MetricAction<K> {
         Ok(())
     }
 
-    async fn key_up(&self, _: &Instance, _: &ActionSettings) -> OpenActionResult<()> {
-        self.refresh();
+    async fn key_up(&self, _: &Instance, settings: &ActionSettings) -> OpenActionResult<()> {
+        self.press(settings).await;
         Ok(())
     }
 
-    async fn dial_up(&self, _: &Instance, _: &ActionSettings) -> OpenActionResult<()> {
-        self.refresh();
+    async fn dial_up(&self, _: &Instance, settings: &ActionSettings) -> OpenActionResult<()> {
+        self.press(settings).await;
         Ok(())
     }
 
     async fn touch_tap(
         &self,
         _: &Instance,
-        _: &ActionSettings,
+        settings: &ActionSettings,
         _: (u16, u16),
         _: bool,
     ) -> OpenActionResult<()> {
-        self.refresh();
+        self.press(settings).await;
         Ok(())
     }
 
@@ -200,6 +242,81 @@ mod tests {
         assert_eq!(registered.len(), Metric::ALL.len());
         for m in Metric::ALL {
             assert!(REGISTERED.contains(&m), "{m:?} is never registered");
+        }
+    }
+
+    fn nas(host: &str) -> Connection {
+        Connection {
+            host: host.into(),
+            account: "jf".into(),
+            ..Connection::default()
+        }
+    }
+
+    #[test]
+    fn refresh_opens_nothing() {
+        assert_eq!(press_url(PressAction::Refresh, &nas("nas.lan")), None);
+    }
+
+    #[test]
+    fn open_dsm_opens_the_configured_nas() {
+        assert_eq!(
+            press_url(PressAction::Dsm, &nas("nas.lan")).as_deref(),
+            Some("https://nas.lan:5001/")
+        );
+        let c = Connection {
+            port: 443,
+            ..nas("https://nas.lan:5001/webman")
+        };
+        assert_eq!(
+            press_url(PressAction::Dsm, &c).as_deref(),
+            Some("https://nas.lan:443/")
+        );
+    }
+
+    #[test]
+    fn open_dsm_brackets_an_ipv6_host() {
+        assert_eq!(
+            press_url(PressAction::Dsm, &nas("fe80::1")).as_deref(),
+            Some("https://[fe80::1]:5001/")
+        );
+    }
+
+    #[test]
+    fn open_dsm_without_a_usable_connection_refreshes() {
+        assert_eq!(press_url(PressAction::Dsm, &Connection::default()), None);
+        assert_eq!(press_url(PressAction::Dsm, &nas("  ")), None);
+        let http = Connection {
+            https: false,
+            ..nas("nas.lan")
+        };
+        assert_eq!(press_url(PressAction::Dsm, &http), None);
+    }
+
+    #[test]
+    fn open_dsm_never_opens_a_host_that_could_point_elsewhere() {
+        for host in [
+            "nas.lan@evil.example",
+            "nas.lan?x=evil.example",
+            "nas.lan#evil",
+            "nas lan",
+            "nas%2elan",
+            "nas.lan\\evil.example",
+        ] {
+            assert_eq!(press_url(PressAction::Dsm, &nas(host)), None, "{host}");
+        }
+    }
+
+    #[test]
+    fn the_dsm_url_carries_no_account_or_session() {
+        let c = Connection {
+            account: "secret-admin".into(),
+            pinned_sha256: Some("ab".repeat(32)),
+            ..nas("nas.lan")
+        };
+        let url = press_url(PressAction::Dsm, &c).unwrap();
+        for leak in ["secret-admin", "@", "sid", "_sid", "?", "abab"] {
+            assert!(!url.contains(leak), "{url} contains {leak}");
         }
     }
 

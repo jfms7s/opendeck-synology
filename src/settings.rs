@@ -234,6 +234,18 @@ pub enum Amount {
     Used,
 }
 
+/// What pressing a key, pushing a dial or tapping its touch strip does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PressAction {
+    /// Poll the key's endpoint now (and, after a refused keyring read, ask
+    /// the keyring again).
+    #[default]
+    Refresh,
+    /// Open the NAS's DSM web UI in the default browser.
+    Dsm,
+}
+
 /// One key's or dial's settings. A single struct serves all ten actions;
 /// each reads only the fields that apply to it. Deserialising is lenient
 /// (see the `Deserialize` impl): openaction falls back to
@@ -251,6 +263,7 @@ pub struct ActionSettings {
     pub cpu_view: CpuView,
     pub direction: Direction,
     pub amount: Amount,
+    pub press: PressAction,
 }
 
 impl ActionSettings {
@@ -272,6 +285,7 @@ impl ActionSettings {
             cpu_view: field(v, "cpu_view", &mut bad),
             direction: field(v, "direction", &mut bad),
             amount: field(v, "amount", &mut bad),
+            press: field(v, "press", &mut bad),
         };
         (s, bad)
     }
@@ -441,6 +455,18 @@ mod tests {
     }
 
     #[test]
+    fn settings_saved_before_the_press_setting_refresh_on_press() {
+        let s: ActionSettings = serde_json::from_value(json!({
+            "target": "volume_2", "warn": 70, "interval": 10,
+        }))
+        .unwrap();
+        assert_eq!(s.press, PressAction::Refresh);
+        assert_eq!(s.target.as_deref(), Some("volume_2"));
+        let s: ActionSettings = serde_json::from_value(json!({ "press": "storage" })).unwrap();
+        assert_eq!(s.press, PressAction::Refresh, "an unknown choice refreshes");
+    }
+
+    #[test]
     fn key_settings_that_are_not_an_object_are_the_defaults() {
         for v in [json!("volume_2"), json!([1, 2]), json!(7)] {
             let s: ActionSettings = serde_json::from_value(v.clone()).unwrap();
@@ -462,8 +488,10 @@ mod tests {
             cpu_view: CpuView::Load15,
             direction: Direction::Combined,
             amount: Amount::Used,
+            press: PressAction::Dsm,
         };
         let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["press"], "dsm");
         assert_eq!(v["cpu_view"], "load15");
         assert_eq!(v["direction"], "combined");
         assert_eq!(v["amount"], "used");

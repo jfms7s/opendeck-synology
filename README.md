@@ -7,7 +7,12 @@ dial support and sign-in for DSM accounts with **2-factor authentication**.
 
 ## Actions
 
-Every action works on a key and on a dial. Pressing a key or a dial refreshes it now.
+Every action works on a key and on a dial. Pressing a key or a dial refreshes it now,
+unless its **On press** setting says *Open DSM*: then a press (a dial push or a touch
+tap too) opens the NAS's DSM login page in your default browser instead, at the host and
+port saved in the connection. The browser warns about a self-signed certificate on the
+way in, as for any visit. While keys show `Keyring` / `Press to retry`, a press asks the
+keyring again even on an *Open DSM* key.
 
 | Action | Shows | Turning the dial |
 |---|---|---|
@@ -211,6 +216,9 @@ pass against a NAS with a publicly trusted one.
 - [ ] Each of the ten actions shows a sensible value on a key and on a dial; rotating each
       dial cycles as described above and the subject line shows `‹ … n/m ›`.
 - [ ] Setting a CPU warn threshold below the current load turns the key amber.
+- [ ] A key, and a dial (push and touch), set to **On press: Open DSM** opens the DSM
+      login page of the saved NAS in the browser and does not refresh; a key left on
+      *Refresh* still refreshes.
 - [ ] Unplugging the NAS's network cable: keys turn grey with `!` about seven refresh
       intervals after the last good value (35 s for CPU) and recover by themselves after
       reconnecting.
