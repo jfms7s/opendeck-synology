@@ -146,6 +146,7 @@ xattr -dr com.apple.quarantine ~/Library/Application\ Support/opendeck/plugins/c
 cargo fmt --check                                  # the same checks CI runs
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked                                # unit tests, no NAS needed
+cargo +1.88.0 check --all-targets --locked         # MSRV (CI: msrv, msrv-macos); needs the 1.88.0 toolchain
 cargo build --release --locked && node build.mjs   # dist/opendeck-synology.streamDeckPlugin
 cargo test keyring_round_trip -- --ignored         # check the system keyring works (CI does this on macOS)
 scripts/render-icons.sh                            # regenerate icons (needs ImageMagick 7)
@@ -157,7 +158,9 @@ REQUIRE_REAL_FIXTURES=1 cargo test recorded        # then check the parsers agai
 ```
 
 The toolchain is pinned in CI (`rust-version` in `Cargo.toml` is the oldest supported
-Rust). Releases: bump the version in `Cargo.toml`, `Cargo.lock` and
+Rust). CI also cross-builds aarch64 and starts it under qemu (`aarch64`), runs the macOS
+job with the real Keychain round trip (`macos`) and `cargo-deny` (`advisories`); none of
+these run locally. Releases: bump the version in `Cargo.toml`, `Cargo.lock` and
 `assets/manifest.json`, then push a `vX.Y.Z` tag; the Release workflow checks, builds both
 Linux architectures and the macOS one, and creates a **draft** release with the bundle
 and `SHA256SUMS`. The draft's notes hold the smoke-test checklist below, unticked

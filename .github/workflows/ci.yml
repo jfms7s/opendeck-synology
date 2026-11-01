@@ -32,6 +32,11 @@ jobs:
       # RUNNER_TEMP until every test in the job has passed (see the collect step).
       - name: Test with coverage (eng-metrics-lab)
         run: cargo llvm-cov --locked --lcov --output-path "$RUNNER_TEMP/coverage-rust.lcov"
+      # keyring silently falls back to an in-memory mock store when the OS
+      # backend is missing; fail if the Secret Service backend leaves the graph.
+      # (`cargo tree -i` only warns and exits 0 when nothing matches, hence grep.)
+      - name: Linux keyring backend is linked
+        run: cargo tree --locked -e normal --target x86_64-unknown-linux-gnu -i secret-service --depth 0 | grep -q '^secret-service '
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
