@@ -106,6 +106,13 @@
 					<option value="used">Used of total</option>
 				</select>
 			</div>
+			<div class="field">
+				<label for="press">On press</label>
+				<select id="press">
+					<option value="refresh">Refresh</option>
+					<option value="dsm">Open DSM in the browser</option>
+				</select>
+			</div>
 			<div id="threshold-field" class="row hidden">
 				<div class="field">
 					<label for="warn" id="warn-label">Warn at</label>
@@ -192,6 +199,7 @@
 			$("cpu_view").value = s.cpu_view || "total";
 			$("direction").value = s.direction || "in";
 			$("amount").value = s.amount || "percent";
+			$("press").value = s.press || "refresh";
 			$("warn").value = s.warn ?? "";
 			$("crit").value = s.crit ?? "";
 			$("target").value = s.target ?? "";
@@ -309,7 +317,7 @@
 			settings.target = $("target").value || null;
 			sendSettings();
 		});
-		for (const id of ["cpu_view", "direction", "amount"]) {
+		for (const id of ["cpu_view", "direction", "amount", "press"]) {
 			$(id).addEventListener("change", () => {
 				settings[id] = $(id).value;
 				sendSettings();
