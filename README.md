@@ -20,6 +20,7 @@ Every action works on a key and on a dial. Pressing a key or a dial refreshes it
 | Disk Health | S.M.A.R.T. OK / Warning / Failing, one disk or the worst | each disk → worst |
 | Volume | how full, as % or used of total | each volume |
 | Storage Pool | Normal / Degraded / Rebuild 43 % | each pool |
+| NAS Health | `OK` and `1 pool · 3 disks · 1 volume`, or the worst problem by name (`Failing` · `Drive 2`) | each problem (doesn't move when all is well) |
 | DSM Update | up to date, or the pending version | - |
 
 Numeric actions have **warn** and **critical** thresholds (the key turns amber or red).
@@ -27,6 +28,13 @@ The defaults are CPU 70/90 %, RAM 80/95 %, system temperature 60/70 °C, disk te
 50/60 °C and volume 80/90 %; network thresholds are off until you set them, in MB/s. Each
 key can also override its **refresh interval** (at least 2 s). Keys reading the same data
 share one request to the NAS at the fastest interval any of them asks for.
+
+**NAS Health** has no thresholds of its own: it turns red for a degraded or crashed pool
+or volume, a failing disk, or a volume over 90 %, and amber for anything else not normal
+(a rebuild, a check, an unknown state word), a volume over 80 % or a disk at 50 °C or
+more. It names the worst item; its colour is always the worst level, even while the dial
+shows a lesser problem. It reads the same storage data as the other storage keys, so it
+adds no request to the NAS.
 
 When the NAS stops answering, keys keep the last value and turn grey with a `!` after
 three failed refreshes in a row; they never drop to a misleading zero. Retries back off
@@ -69,9 +77,9 @@ first successful refresh.
    so you're not asked again - not even after restarting OpenDeck or the NAS. Removing the
    device there makes the plugin ask for a code once more.
 
-The **Disk Temperature**, **Disk Health**, **Volume** and **Storage Pool** actions read
-DSM's storage manager API, which DSM usually only allows for members of the
-*administrators* group. With a non-admin account those four show `Denied`; the rest work.
+The **Disk Temperature**, **Disk Health**, **Volume**, **Storage Pool** and **NAS Health**
+actions read DSM's storage manager API, which DSM usually only allows for members of the
+*administrators* group. With a non-admin account those five show `Denied`; the rest work.
 
 A wrong password or 2FA code is never retried automatically, so the plugin can't trip
 DSM's auto-block. An empty or malformed 2FA code is never sent at all. If your IP does
@@ -182,7 +190,7 @@ pass against a NAS with a publicly trusted one.
       a key brings the prompt back, and unlocking connects.
 - [ ] A wrong password shows *Wrong account or password* and DSM's log shows exactly one
       failed login, not one per refresh.
-- [ ] Each of the ten actions shows a sensible value on a key and on a dial; rotating each
+- [ ] Each of the eleven actions shows a sensible value on a key and on a dial; rotating each
       dial cycles as described above and the subject line shows `‹ … n/m ›`.
 - [ ] Setting a CPU warn threshold below the current load turns the key amber.
 - [ ] Unplugging the NAS's network cable: keys turn grey with `!` about seven refresh

@@ -223,7 +223,7 @@ pub enum Amount {
     Used,
 }
 
-/// One key's or dial's settings. A single struct serves all ten actions;
+/// One key's or dial's settings. A single struct serves all eleven actions;
 /// each reads only the fields that apply to it.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]

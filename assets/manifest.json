@@ -105,6 +105,16 @@
 			"Encoder": { "layout": "layouts/metric.json", "TriggerDescription": { "Rotate": "Next pool", "Push": "Refresh", "Touch": "Refresh" } }
 		},
 		{
+			"UUID": "com.jfms7s.synology.health",
+			"Name": "NAS Health",
+			"Icon": "icons/health",
+			"Tooltip": "One key for every storage pool, disk and volume: OK, or the worst problem by name. On a dial, rotate through the problems. Press to refresh",
+			"Controllers": ["Keypad", "Encoder"],
+			"PropertyInspectorPath": "propertyInspector/index.html",
+			"States": [{ "Image": "icons/health" }],
+			"Encoder": { "layout": "layouts/metric.json", "TriggerDescription": { "Rotate": "Next problem", "Push": "Refresh", "Touch": "Refresh" } }
+		},
+		{
 			"UUID": "com.jfms7s.synology.update",
 			"Name": "DSM Update",
 			"Icon": "icons/update",
