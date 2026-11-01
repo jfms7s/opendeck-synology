@@ -112,6 +112,7 @@ fn connection_reading(metric: Metric, status: &ConnStatus) -> Option<Reading> {
         ConnStatus::Keyring(_) => ("Keyring", "Open settings", Level::Error),
         ConnStatus::KeyringRefused(_) => ("Keyring", "Press to retry", Level::Error),
         ConnStatus::KeyringPending => ("Keyring", "Allow access", Level::Warn),
+        ConnStatus::HttpsRequired => ("HTTPS", "Open settings", Level::Error),
         ConnStatus::Connecting | ConnStatus::Connected { .. } | ConnStatus::Unreachable(_) => {
             return None;
         }
@@ -1198,6 +1199,18 @@ mod tests {
         let r = read(Metric::Cpu, &state(util()), &view(), &ctx);
         assert_eq!((r.value.as_str(), r.level), ("Keyring", Level::Error));
         assert_eq!(r.subject, "Press to retry");
+    }
+
+    #[test]
+    fn a_saved_http_connection_shows_https_required_on_every_key() {
+        let status = ConnStatus::HttpsRequired;
+        let ctx = Context {
+            status: &status,
+            unit: TempUnit::Celsius,
+        };
+        let r = read(Metric::Cpu, &state(util()), &view(), &ctx);
+        assert_eq!((r.value.as_str(), r.level), ("HTTPS", Level::Error));
+        assert_eq!(r.subject, "Open settings");
     }
 
     #[test]

@@ -165,7 +165,7 @@ mod tests {
         }
     }
 
-    /// Plain-HTTP server answering one request with `reply`; hands back the
+    /// Unencrypted HTTP server answering one request with `reply`; hands back the
     /// raw request.
     async fn http_server_replying(reply: String) -> (u16, oneshot::Receiver<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

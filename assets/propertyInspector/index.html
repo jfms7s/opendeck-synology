@@ -10,7 +10,6 @@
 		.field > button {
 			align-self: flex-start;
 		}
-		#http-warning,
 		#storage-warning,
 		#cert-changed,
 		#notice {
@@ -33,7 +32,7 @@
 				</div>
 				<div class="field narrow">
 					<label for="port">Port</label>
-					<input id="port" type="number" min="1" max="65535" />
+					<input id="port" type="number" min="1" max="65535" placeholder="5001" />
 				</div>
 			</div>
 			<div class="field">
@@ -41,10 +40,6 @@
 				<input id="password" type="password" autocomplete="current-password" />
 				<p class="hint" id="password-hint"></p>
 				<p class="hint" id="storage-warning"></p>
-			</div>
-			<div class="field">
-				<label class="check"><input type="checkbox" id="https" /> HTTPS</label>
-				<p class="hint hidden" id="http-warning">Unencrypted: the password you type crosses the network in the clear at every sign-in. A password saved for HTTPS is never reused here, and with 2FA a code is asked for at every sign-in, since this computer can't be remembered without HTTPS.</p>
 			</div>
 			<button id="save" class="primary">Save and connect</button>
 			<p class="hint" id="notice" role="status"></p>
@@ -220,11 +215,9 @@
 				$("host").value = st.connection.host;
 				$("port").value = st.connection.port;
 				$("account").value = st.connection.account;
-				$("https").checked = st.connection.https;
 				$("temp-unit").value = st.tempUnit;
 			}
 			applyFields(st.fields || {});
-			$("http-warning").classList.toggle("hidden", $("https").checked);
 			// Say where the password really is - never claim a keyring the
 			// plugin couldn't use.
 			const where = {
@@ -288,7 +281,7 @@
 		}
 
 		$("save").addEventListener("click", () => {
-			const port = $("port").value.trim() === "" ? ($("https").checked ? 5001 : 5000) : Number($("port").value);
+			const port = $("port").value.trim() === "" ? 5001 : Number($("port").value);
 			if (!Number.isInteger(port) || port < 1 || port > 65535) {
 				// Keep what was typed (the password too) and say why.
 				$("notice").textContent = "The port must be a whole number from 1 to 65535.";
@@ -298,16 +291,11 @@
 				event: "saveConnection",
 				host: $("host").value.trim(),
 				port,
-				https: $("https").checked,
 				account: $("account").value.trim(),
 				password: $("password").value || null,
 			});
 			$("password").value = "";
 			$("notice").textContent = "";
-		});
-		$("https").addEventListener("change", () => {
-			$("http-warning").classList.toggle("hidden", $("https").checked);
-			$("port").value = $("https").checked ? 5001 : 5000;
 		});
 		$("submit-otp").addEventListener("click", () => {
 			const code = $("otp").value.replace(/\s/g, "");
