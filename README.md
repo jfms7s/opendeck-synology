@@ -87,13 +87,14 @@ A wrong password or 2FA code is never retried automatically, so the plugin can't
 DSM's auto-block. An empty or malformed 2FA code is never sent at all. If your IP does
 get blocked, unblock it in Control Panel › Security › Protection.
 
-### Plain HTTP
+### HTTPS only
 
-Unticking **HTTPS** (port 5000) sends the password unencrypted at every sign-in. Saved
-secrets belong to one account, scheme, host and port: a password saved for HTTPS is
-never sent over HTTP - switching asks for it again - and over HTTP no 2FA device token is
-used or stored, so with 2FA you're asked for a code at every sign-in (a password plus a
-device token sniffed off the network would get past 2FA).
+The plugin only connects over HTTPS (DSM's default port is 5001), so the password never
+crosses the network unencrypted. Versions before 0.7.0 had an HTTPS checkbox; a
+connection saved with it unticked still loads, but nothing is sent: every key shows
+`HTTPS` / `Open settings` and the panel says HTTPS is required. Set the port to 5001
+(enable HTTPS in DSM under Control Panel › Login Portal if needed), enter the password
+again and **Save and connect**.
 
 ### Without a keyring (Flatpak)
 
@@ -220,8 +221,6 @@ pass against a NAS with a publicly trusted one.
 - [ ] OpenDeck's config folder (`~/.config/opendeck/`, or
       `~/Library/Application Support/opendeck/` on macOS) contains no password (grep for
       it), unless the panel says the password is in OpenDeck's settings file.
-- [ ] Unticking HTTPS and saving with an empty password field asks for the password
-      instead of connecting.
 - [ ] An out-of-range port (e.g. 70000) shows an error and keeps what was typed.
 - [ ] Pressing Verify with an empty 2FA field sends nothing (DSM's log shows no failed
       sign-in).

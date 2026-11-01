@@ -76,7 +76,8 @@ impl Connection {
 
     /// Namespaces keyring entries by account, scheme, host and port, so a
     /// password or device token saved for one NAS - or for HTTPS - is never
-    /// sent to another one, or over plain HTTP.
+    /// sent to another one, or over unencrypted HTTP (which only settings
+    /// from before 0.7.0 can name, and which never connects).
     pub fn secret_scope(&self) -> String {
         format!("{}@{}", self.account.trim(), self.base_url())
     }
@@ -123,7 +124,7 @@ impl FallbackSecrets {
     /// Whether these secrets may be used for `conn`. Secrets from before
     /// the scope included the scheme and port (no scope, or the legacy
     /// `account@host` one) are only trusted over HTTPS: they may have been
-    /// saved for an HTTPS connection, and must not leak over plain HTTP.
+    /// saved for an HTTPS connection, and must not leak over unencrypted HTTP.
     pub fn belongs_to(&self, conn: &Connection) -> bool {
         match self.scope.as_deref() {
             Some(s) if s == conn.secret_scope() => true,
@@ -360,7 +361,7 @@ mod tests {
         let https = conn("nas.lan", 5001, true);
         let http = conn("nas.lan", 5000, false);
         assert!(f.belongs_to(&https), "older files: the saved connection's");
-        assert!(!f.belongs_to(&http), "but never over plain HTTP");
+        assert!(!f.belongs_to(&http), "but never over unencrypted HTTP");
         let legacy = FallbackSecrets {
             scope: Some("jf@nas.lan".into()),
             ..f.clone()

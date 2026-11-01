@@ -38,10 +38,6 @@ pub struct Credentials {
     pub did: Option<String>,
     /// How this device appears in DSM's trusted-device list.
     pub device_name: String,
-    /// Whether to send and ask for a device token. Off over plain HTTP:
-    /// the password and the token together would let anyone sniffing the
-    /// link sign in without a 2FA code.
-    pub remember_device: bool,
 }
 
 impl fmt::Debug for Credentials {
@@ -51,7 +47,6 @@ impl fmt::Debug for Credentials {
             .field("password", &"<redacted>")
             .field("did", &self.did.as_ref().map(|_| "<redacted>"))
             .field("device_name", &self.device_name)
-            .field("remember_device", &self.remember_device)
             .finish()
     }
 }
@@ -283,14 +278,12 @@ impl Session {
             ("session", SESSION_NAME),
             ("format", "sid"),
         ];
-        let did = c.did.as_deref().filter(|_| c.remember_device);
-        match (otp, did) {
-            (Some(code), _) if c.remember_device => form.extend([
+        match (otp, c.did.as_deref()) {
+            (Some(code), _) => form.extend([
                 ("otp_code", code),
                 ("enable_device_token", "yes"),
                 ("device_name", c.device_name.as_str()),
             ]),
-            (Some(code), _) => form.push(("otp_code", code)),
             (None, Some(did)) => {
                 form.extend([("device_id", did), ("device_name", c.device_name.as_str())])
             }
@@ -308,7 +301,6 @@ impl Session {
                 st.sid = Some(sid.to_string());
                 st.generation += 1;
                 if otp.is_some()
-                    && c.remember_device
                     && let Some(did) = data["did"].as_str().filter(|d| !d.is_empty())
                 {
                     st.creds.did = Some(did.to_string());
@@ -323,7 +315,7 @@ impl Session {
                         code,
                     });
                 };
-                if err == AuthError::NeedOtp && otp.is_none() && did.is_some() {
+                if err == AuthError::NeedOtp && otp.is_none() && c.did.is_some() {
                     // DSM no longer honours the device token we sent.
                     st.creds.did = None;
                     (self.on_did)(None);
@@ -356,7 +348,6 @@ mod tests {
             password: "p&ss=w+rd%ü".into(),
             did: did.map(str::to_string),
             device_name: "OpenDeck-desk".into(),
-            remember_device: true,
         }
     }
 
@@ -722,34 +713,6 @@ mod tests {
             "still connected"
         );
         assert_eq!(fake.count("logout"), 0);
-    }
-
-    #[tokio::test]
-    async fn without_remember_device_no_token_is_sent_or_asked_for() {
-        let fake =
-            FakeDsm::new(
-                |r| match (get(r, "method").as_deref(), get(r, "otp_code").as_deref()) {
-                    (Some("login"), Some(_)) => Ok(json!({ "sid": "s1", "did": "dev-2" })),
-                    (Some("login"), None) => Err(403),
-                    _ => Ok(json!({ "ok": true })),
-                },
-            );
-        let (on_did, dids) = did_log();
-        let c = Credentials {
-            remember_device: false,
-            ..creds(Some("dev-1"))
-        };
-        let s = Session::new(fake.clone(), c, on_did);
-        assert_eq!(
-            s.call(UTILIZATION, "get", &[]).await,
-            Err(DsmError::Auth(AuthError::NeedOtp))
-        );
-        s.submit_otp("123456").await.unwrap();
-        for r in fake.requests() {
-            assert_eq!(get(&r, "device_id"), None, "{r:?}");
-            assert_eq!(get(&r, "enable_device_token"), None, "{r:?}");
-        }
-        assert!(dids.lock().unwrap().is_empty(), "nothing to store");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

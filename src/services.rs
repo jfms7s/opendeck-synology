@@ -263,9 +263,11 @@ impl Services {
 
     /// Saves the connection block of the settings panel. `password: None`
     /// keeps the stored password for the same account and NAS (scheme, host
-    /// and port), while any other connection starts without one: a password
-    /// saved for HTTPS is never sent over plain HTTP unless typed in again.
+    /// and port), while any other connection starts without one. A plain
+    /// HTTP connection is saved but never connects (`HttpsRequired`).
     pub async fn save_connection(self: &Arc<Self>, mut conn: Connection, password: Option<String>) {
+        // Only settings from before 0.7.0 can name plain HTTP; a save never does.
+        conn.https = true;
         let _saving = Saving::start(&self.saving);
         {
             let _s = self.secrets.lock().await;
@@ -420,7 +422,14 @@ impl Services {
         let g = self
             .keyring_step(async {
                 let _s = self.secrets.lock().await;
-                let moved = self.vault.migrate(&self.global()).await;
+                // An `https: false` connection is refused below: its
+                // settings-file secrets stay where they are, untouched.
+                let current = self.global();
+                let moved = if current.connection.https {
+                    self.vault.migrate(&current).await
+                } else {
+                    Vec::new()
+                };
                 let _w = self.writing.lock().await;
                 let mut g = self.global();
                 self.connected_gen
@@ -438,6 +447,13 @@ impl Services {
         if !g.connection.is_complete() {
             *self.password.lock().unwrap() = None;
             return self.go_idle(ConnStatus::NotConfigured);
+        }
+        // Only settings from before 0.7.0 can say `https: false`. Refuse them
+        // before the keyring or the NAS is asked anything: no password
+        // ever crosses the network in the clear.
+        if !g.connection.https {
+            *self.password.lock().unwrap() = None;
+            return self.go_idle(ConnStatus::HttpsRequired);
         }
         let password = match self
             .keyring_step(self.vault.read(&g, Secret::Password))
@@ -476,24 +492,19 @@ impl Services {
                 return self.go_idle(status);
             }
         };
-        // Over plain HTTP no device token is sent or asked for.
-        let did = if g.connection.https {
-            self.keyring_step(self.vault.read(&g, Secret::Did))
-                .await
-                .unwrap_or_else(|e| {
-                    log::warn!("can't read the 2FA device token from the system keyring: {e}");
-                    None
-                })
-                .map(|(d, _)| d)
-        } else {
-            None
-        };
+        let did = self
+            .keyring_step(self.vault.read(&g, Secret::Did))
+            .await
+            .unwrap_or_else(|e| {
+                log::warn!("can't read the 2FA device token from the system keyring: {e}");
+                None
+            })
+            .map(|(d, _)| d);
         let creds = Credentials {
             account: g.connection.account.trim().to_string(),
             password,
             did,
             device_name: self.device_name.clone(),
-            remember_device: g.connection.https,
         };
         let listener = self.did_listener(epoch, g.connection.secret_scope());
         let session = Arc::new(Session::new(transport, creds, listener));
@@ -1330,8 +1341,8 @@ mod tests {
         .await;
         let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(s.current_status(), ConnStatus::NotConfigured);
-        assert_eq!(nas.count("login"), 0);
+        assert_eq!(s.current_status(), ConnStatus::HttpsRequired);
+        assert!(nas.requests().is_empty(), "{:?}", nas.requests());
         assert_eq!(
             secrets.keys(),
             ["jf@nas.lan/password"],
@@ -1339,8 +1350,13 @@ mod tests {
         );
     }
 
+    /// Settings saved by a version before 0.7.0 may hold `https: false`.
+    /// They still load, but nothing is read from the keyring and nothing
+    /// is sent: every key and the panel say HTTPS is required.
     #[tokio::test(flavor = "multi_thread")]
-    async fn switching_to_http_never_sends_the_saved_password() {
+    async fn a_saved_http_connection_is_refused_without_a_request() {
+        let http_pw = password_key(&http_conn().secret_scope());
+        let secrets = Arc::new(MemoryStore::refusing(&[(&http_pw, "pw")]));
         let nas = healthy_nas();
         let targets = Arc::new(Mutex::new(Vec::<Target>::new()));
         let (t, n) = (targets.clone(), nas.clone());
@@ -1348,46 +1364,111 @@ mod tests {
             t.lock().unwrap().push(target.clone());
             Ok(n.clone() as Arc<dyn Transport>)
         });
-        let (s, _) = services_over(transports, Arc::new(MemoryStore::default()));
-        s.load_global(GlobalSettings::default()).await;
-        s.save_connection(conn(), Some("pw".into())).await;
-        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
-        wait_for(&s, connected).await;
-        let logins = nas.count("login");
-        // Untick HTTPS and save with the password field left empty.
-        s.save_connection(http_conn(), None).await;
+        let (s, _) = services_over(transports, secrets.clone());
+        let (g, bad) = GlobalSettings::from_value_lenient(&json!({
+            "connection": { "host": "nas.lan", "port": 5000, "https": false, "account": "jf" }
+        }));
+        assert!(bad.is_empty(), "an old settings file still loads: {bad:?}");
+        s.load_global(g).await;
+        let mut rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        wait_for(&s, |st| *st == ConnStatus::HttpsRequired).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(s.current_status(), ConnStatus::NotConfigured);
-        assert!(!s.has_password(), "the panel asks for the password again");
-        assert_eq!(nas.count("login"), logins, "nothing sent in the clear");
+        assert_eq!(s.current_status(), ConnStatus::HttpsRequired);
+        assert!(nas.requests().is_empty(), "{:?}", nas.requests());
+        assert!(targets.lock().unwrap().is_empty(), "no transport was made");
+        assert_eq!(secrets.reads_of(&http_pw), 0, "the keyring is not asked");
+        assert!(!s.has_password());
+        assert!(rx.borrow_and_update().value.is_none());
+        // A key press asks again, with the same answer.
+        s.reconnect().await;
+        assert_eq!(s.current_status(), ConnStatus::HttpsRequired);
+        assert!(nas.requests().is_empty());
+        // Saving an HTTPS connection connects (the password is typed again:
+        // it was saved for another scope).
+        s.save_connection(conn(), Some("pw".into())).await;
+        wait_for(&s, connected).await;
         assert!(targets.lock().unwrap().iter().all(|t| t.https));
-        // Typing it in again is an explicit choice to send it unencrypted.
-        s.save_connection(http_conn(), Some("pw".into())).await;
-        wait_for(&s, connected).await;
-        // And HTTPS still has its own.
-        s.save_connection(conn(), None).await;
-        wait_for(&s, connected).await;
-        assert_eq!(s.password_stored(), Some(Stored::Keyring));
     }
 
+    /// Only settings from before 0.7.0 can name plain HTTP: a save is
+    /// always HTTPS, whatever the caller passes.
     #[tokio::test(flavor = "multi_thread")]
-    async fn over_http_no_device_token_is_sent_or_stored() {
+    async fn a_saved_connection_is_always_https() {
+        let nas = healthy_nas();
+        let targets = Arc::new(Mutex::new(Vec::<Target>::new()));
+        let (t, n) = (targets.clone(), nas.clone());
+        let transports: TransportFactory = Arc::new(move |target: &Target| {
+            t.lock().unwrap().push(target.clone());
+            Ok(n.clone() as Arc<dyn Transport>)
+        });
+        let (s, sink) = services_over(transports, Arc::new(MemoryStore::default()));
+        s.load_global(GlobalSettings::default()).await;
+        s.save_connection(http_conn(), Some("pw".into())).await;
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        wait_for(&s, connected).await;
+        assert!(s.global().connection.https);
+        assert!(sink.last().connection.https);
+        assert!(!targets.lock().unwrap().is_empty());
+        assert!(targets.lock().unwrap().iter().all(|t| t.https));
+    }
+
+    /// A refused HTTP connection leaves its settings-file secrets alone:
+    /// nothing moves into the keyring under the HTTP scope.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saved_http_connection_moves_no_secrets_into_the_keyring() {
+        let secrets = Arc::new(MemoryStore::default());
+        let nas = healthy_nas();
+        let (s, sink) = services_with(nas.clone(), secrets.clone());
+        let fallback = FallbackSecrets {
+            scope: Some(http_conn().secret_scope()),
+            password: Some("pw".into()),
+            ..FallbackSecrets::default()
+        };
+        s.load_global(GlobalSettings {
+            connection: http_conn(),
+            fallback_secrets: Some(fallback.clone()),
+            ..GlobalSettings::default()
+        })
+        .await;
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        wait_for(&s, |st| *st == ConnStatus::HttpsRequired).await;
+        assert!(secrets.keys().is_empty(), "{:?}", secrets.keys());
+        assert_eq!(s.global().fallback_secrets, Some(fallback));
+        assert!(sink.0.lock().unwrap().is_empty(), "nothing rewritten");
+        assert!(nas.requests().is_empty());
+    }
+
+    /// The keyring names are unchanged from before 0.7.0: secrets saved
+    /// for HTTPS are still found, and the device token is still sent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn https_secrets_are_still_found_under_their_old_keyring_names() {
         let secrets = Arc::new(MemoryStore::default());
         secrets
-            .set(&did_key(&http_conn().secret_scope()), Some("dev-1"))
+            .set("jf@https://nas.lan:5001/password", Some("pw"))
+            .unwrap();
+        secrets
+            .set("jf@https://nas.lan:5001/did", Some("dev-1"))
             .unwrap();
         let nas = nas_with_2fa();
         let (s, _) = services_with(nas.clone(), secrets.clone());
-        s.load_global(GlobalSettings::default()).await;
-        s.save_connection(http_conn(), Some("pw".into())).await;
+        s.load_global(GlobalSettings {
+            connection: conn(),
+            ..GlobalSettings::default()
+        })
+        .await;
         let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
-        wait_for(&s, |st| *st == ConnStatus::Auth(AuthError::NeedOtp)).await;
-        s.submit_otp("123456").await.unwrap();
         wait_for(&s, connected).await;
-        for r in nas.requests() {
-            assert_eq!(r.get("device_id"), None, "{r:?}");
-            assert_eq!(r.get("enable_device_token"), None, "{r:?}");
-        }
+        let logins: Vec<_> = nas
+            .requests()
+            .into_iter()
+            .filter(|r| r.get("method").map(String::as_str) == Some("login"))
+            .collect();
+        assert_eq!(logins.len(), 1, "no 2FA code needed");
+        assert_eq!(logins[0].get("passwd").map(String::as_str), Some("pw"));
+        assert_eq!(
+            logins[0].get("device_id").map(String::as_str),
+            Some("dev-1")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -32,7 +32,8 @@ pub enum Request {
         /// Checked by `port()`, so a bad value gets an answer instead of
         /// failing the whole message.
         port: Value,
-        https: bool,
+        // A panel from before 0.7.0 also sends `https`; serde ignores it:
+        // every saved connection is HTTPS.
         account: String,
         #[serde(default)]
         password: Option<String>,
@@ -90,7 +91,6 @@ pub fn state_message(services: &Services, metric: Metric, notice: Option<&str>) 
         "connection": {
             "host": g.connection.host,
             "port": g.connection.port,
-            "https": g.connection.https,
             "account": g.connection.account,
         },
         "hasPassword": services.has_password(),
@@ -231,7 +231,6 @@ async fn apply(services: &Arc<Services>, req: Request) -> Option<String> {
         Request::SaveConnection {
             host,
             port: p,
-            https,
             account,
             password,
         } => {
@@ -241,7 +240,7 @@ async fn apply(services: &Arc<Services>, req: Request) -> Option<String> {
             let conn = Connection {
                 host,
                 port,
-                https,
+                https: true,
                 account,
                 pinned_sha256: None,
             };
@@ -312,18 +311,26 @@ mod tests {
             }
         );
         let save = req(
-            json!({ "event": "saveConnection", "host": "nas.lan", "port": 5001, "https": true, "account": "jf", "password": null }),
+            json!({ "event": "saveConnection", "host": "nas.lan", "port": 5001, "account": "jf", "password": null }),
         );
         assert_eq!(
             save,
             Request::SaveConnection {
                 host: "nas.lan".into(),
                 port: json!(5001),
-                https: true,
                 account: "jf".into(),
                 password: None
             }
         );
+        // An old panel page still sends `https`: accepted and ignored.
+        for https in [true, false] {
+            assert_eq!(
+                req(
+                    json!({ "event": "saveConnection", "host": "nas.lan", "port": 5001, "https": https, "account": "jf", "password": null })
+                ),
+                save
+            );
+        }
         assert!(serde_json::from_value::<Request>(json!({ "event": "reboot" })).is_err());
         assert!(
             serde_json::from_value::<Request>(json!({ "event": "trustCertificate" })).is_err(),
@@ -355,7 +362,6 @@ mod tests {
         Request::SaveConnection {
             host: "nas.lan".into(),
             port,
-            https: true,
             account: "jf".into(),
             password: password.map(str::to_string),
         }
@@ -454,6 +460,27 @@ mod tests {
         assert_eq!(s.global().temp_unit, TempUnit::Celsius);
         assert_eq!(sink.last().temp_unit, TempUnit::Celsius);
         assert!(s.has_password());
+    }
+
+    /// After an upgrade from an unencrypted (`https: false`) setup the panel shows
+    /// `HttpsRequired`; saving from it always gives an HTTPS connection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn saving_from_the_panel_replaces_a_plain_http_connection_with_https() {
+        let (s, sink) = services_with(healthy_nas(), Arc::new(MemoryStore::default()));
+        let mut g = GlobalSettings::default();
+        g.connection.host = "nas.lan".into();
+        g.connection.account = "jf".into();
+        g.connection.port = 5000;
+        g.connection.https = false;
+        s.load_global(g).await;
+        assert_eq!(s.current_status(), ConnStatus::HttpsRequired);
+        let msg = state_message(&s, Metric::Cpu, None);
+        assert_eq!(msg["status"]["kind"], "httpsRequired");
+        assert!(msg["connection"].get("https").is_none());
+        apply(&s, save(Some("pw"))).await;
+        assert!(s.global().connection.https);
+        assert!(sink.last().connection.https);
+        assert_eq!(s.global().connection.port, 5001);
     }
 
     #[tokio::test(flavor = "multi_thread")]

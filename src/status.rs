@@ -26,6 +26,10 @@ pub enum ConnStatus {
     /// A keyring call is waiting on the user: macOS's Keychain access
     /// prompt (shown after each update) or a Secret Service unlock prompt.
     KeyringPending,
+    /// The saved connection is unencrypted HTTP (`https: false`, from a version
+    /// before 0.7.0). The plugin only speaks HTTPS: nothing is read from
+    /// the keyring and nothing is sent until the user saves an HTTPS one.
+    HttpsRequired,
 }
 
 impl ConnStatus {
@@ -72,6 +76,12 @@ impl ConnStatus {
             Self::KeyringPending => {
                 "Waiting for the system keyring - allow access in the system prompt".into()
             }
+            Self::HttpsRequired => {
+                "HTTPS required: unencrypted HTTP is no longer supported. Enable \
+                 HTTPS in DSM (Control Panel › Login Portal), set the port to 5001 \
+                 and save"
+                    .into()
+            }
         }
     }
 
@@ -88,6 +98,7 @@ impl ConnStatus {
             Self::Keyring(_) => "keyring",
             Self::KeyringRefused(_) => "keyringRefused",
             Self::KeyringPending => "keyringPending",
+            Self::HttpsRequired => "httpsRequired",
         }
     }
 
@@ -104,7 +115,8 @@ impl ConnStatus {
             | Self::Certificate { .. }
             | Self::Unreachable(_)
             | Self::Keyring(_)
-            | Self::KeyringRefused(_) => "bad",
+            | Self::KeyringRefused(_)
+            | Self::HttpsRequired => "bad",
         }
     }
 }
@@ -170,6 +182,14 @@ mod tests {
         );
         assert_eq!(ConnStatus::Keyring("locked".into()).kind(), "keyring");
         assert_eq!(ConnStatus::KeyringPending.kind(), "keyringPending");
+        assert_eq!(ConnStatus::HttpsRequired.kind(), "httpsRequired");
+        assert!(
+            ConnStatus::HttpsRequired
+                .describe()
+                .contains("port to 5001"),
+            "says what to do: {}",
+            ConnStatus::HttpsRequired.describe()
+        );
         assert_eq!(
             ConnStatus::KeyringRefused("denied".into()).kind(),
             "keyringRefused"
@@ -197,6 +217,7 @@ mod tests {
         assert_eq!(ConnStatus::Auth(AuthError::BadOtp).severity(), "bad");
         assert_eq!(ConnStatus::Keyring("x".into()).severity(), "bad");
         assert_eq!(ConnStatus::KeyringRefused("x".into()).severity(), "bad");
+        assert_eq!(ConnStatus::HttpsRequired.severity(), "bad");
         assert_eq!(ConnStatus::Connecting.severity(), "neutral");
         // Waiting on the user, not failed.
         assert_eq!(ConnStatus::KeyringPending.severity(), "neutral");
