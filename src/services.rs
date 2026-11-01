@@ -266,6 +266,8 @@ impl Services {
     /// and port), while any other connection starts without one. A plain
     /// HTTP connection is saved but never connects (`HttpsRequired`).
     pub async fn save_connection(self: &Arc<Self>, mut conn: Connection, password: Option<String>) {
+        // Only settings from before 0.7.0 can name plain HTTP; a save never does.
+        conn.https = true;
         let _saving = Saving::start(&self.saving);
         {
             let _s = self.secrets.lock().await;
@@ -420,7 +422,14 @@ impl Services {
         let g = self
             .keyring_step(async {
                 let _s = self.secrets.lock().await;
-                let moved = self.vault.migrate(&self.global()).await;
+                // An `https: false` connection is refused below: its
+                // settings-file secrets stay where they are, untouched.
+                let current = self.global();
+                let moved = if current.connection.https {
+                    self.vault.migrate(&current).await
+                } else {
+                    Vec::new()
+                };
                 let _w = self.writing.lock().await;
                 let mut g = self.global();
                 self.connected_gen
@@ -1381,8 +1390,10 @@ mod tests {
         assert!(targets.lock().unwrap().iter().all(|t| t.https));
     }
 
+    /// Only settings from before 0.7.0 can name plain HTTP: a save is
+    /// always HTTPS, whatever the caller passes.
     #[tokio::test(flavor = "multi_thread")]
-    async fn switching_to_http_never_sends_the_saved_password() {
+    async fn a_saved_connection_is_always_https() {
         let nas = healthy_nas();
         let targets = Arc::new(Mutex::new(Vec::<Target>::new()));
         let (t, n) = (targets.clone(), nas.clone());
@@ -1390,25 +1401,41 @@ mod tests {
             t.lock().unwrap().push(target.clone());
             Ok(n.clone() as Arc<dyn Transport>)
         });
-        let (s, _) = services_over(transports, Arc::new(MemoryStore::default()));
+        let (s, sink) = services_over(transports, Arc::new(MemoryStore::default()));
         s.load_global(GlobalSettings::default()).await;
-        s.save_connection(conn(), Some("pw".into())).await;
+        s.save_connection(http_conn(), Some("pw".into())).await;
         let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
         wait_for(&s, connected).await;
-        let logins = nas.count("login");
-        // Neither without a password nor with one typed in again.
-        for pw in [None, Some("pw".to_string())] {
-            s.save_connection(http_conn(), pw).await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            assert_eq!(s.current_status(), ConnStatus::HttpsRequired);
-            assert!(!s.has_password());
-            assert_eq!(nas.count("login"), logins, "nothing sent in the clear");
-            assert!(targets.lock().unwrap().iter().all(|t| t.https));
-        }
-        // And HTTPS still has its own.
-        s.save_connection(conn(), None).await;
-        wait_for(&s, connected).await;
-        assert_eq!(s.password_stored(), Some(Stored::Keyring));
+        assert!(s.global().connection.https);
+        assert!(sink.last().connection.https);
+        assert!(!targets.lock().unwrap().is_empty());
+        assert!(targets.lock().unwrap().iter().all(|t| t.https));
+    }
+
+    /// A refused HTTP connection leaves its settings-file secrets alone:
+    /// nothing moves into the keyring under the HTTP scope.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saved_http_connection_moves_no_secrets_into_the_keyring() {
+        let secrets = Arc::new(MemoryStore::default());
+        let nas = healthy_nas();
+        let (s, sink) = services_with(nas.clone(), secrets.clone());
+        let fallback = FallbackSecrets {
+            scope: Some(http_conn().secret_scope()),
+            password: Some("pw".into()),
+            ..FallbackSecrets::default()
+        };
+        s.load_global(GlobalSettings {
+            connection: http_conn(),
+            fallback_secrets: Some(fallback.clone()),
+            ..GlobalSettings::default()
+        })
+        .await;
+        let _rx = s.poller(Endpoint::Utilization).subscribe("key-1", None);
+        wait_for(&s, |st| *st == ConnStatus::HttpsRequired).await;
+        assert!(secrets.keys().is_empty(), "{:?}", secrets.keys());
+        assert_eq!(s.global().fallback_secrets, Some(fallback));
+        assert!(sink.0.lock().unwrap().is_empty(), "nothing rewritten");
+        assert!(nas.requests().is_empty());
     }
 
     /// The keyring names are unchanged from before 0.7.0: secrets saved
