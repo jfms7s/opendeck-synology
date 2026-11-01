@@ -1,8 +1,10 @@
 # Pushing a version tag (vX.Y.Z, matching Cargo.toml and manifest.json)
 # checks, builds (Linux binaries on Ubuntu, the macOS one on a macOS
 # runner) and creates a *draft* release with the bundle and its SHA256SUMS
-# attached. Review the draft and publish it by hand: a release is never
-# visible without its asset.
+# attached. The draft's notes are the README's smoke-test checklist, unticked
+# (scripts/release-body.mjs). Publish it by hand only after running that
+# checklist on a device and linking the release's smoke log in the notes: a
+# release is never visible without its asset.
 name: Release
 on:
   push:
@@ -105,12 +107,17 @@ jobs:
       - run: node build.mjs --require-all --tag "$GITHUB_REF_NAME"
       - name: Check the bundle holds an executable macOS binary
         run: unzip -Z dist/opendeck-synology.streamDeckPlugin | grep -E '^-rwx.*opendeck-synology-aarch64-apple-darwin$'
+      # Written after build.mjs (which empties dist/), so it is in neither the
+      # bundle nor SHA256SUMS; it only becomes the draft's notes.
+      - name: Write the draft's notes (the README smoke checklist, unticked)
+        run: node scripts/release-body.mjs > dist/RELEASE_BODY.md
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bundle
           path: |
             dist/opendeck-synology.streamDeckPlugin
             dist/SHA256SUMS
+            dist/RELEASE_BODY.md
           if-no-files-found: error
 
   # The only job that can write to the repository, and it runs no build.
@@ -127,6 +134,7 @@ jobs:
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           draft: true
+          body_path: dist/RELEASE_BODY.md
           fail_on_unmatched_files: true
           files: |
             dist/opendeck-synology.streamDeckPlugin

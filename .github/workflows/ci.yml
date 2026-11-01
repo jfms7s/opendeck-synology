@@ -36,6 +36,9 @@ jobs:
         with:
           node-version: 24
       - run: node build.mjs --check-version
+      # The Release workflow builds the draft's notes from the README's smoke
+      # checklist markers; catch a broken marker here, not on a pushed tag.
+      - run: node scripts/release-body.mjs > /dev/null
       # Only reached when every step above passed, so a red test leaves no fragment.
       - name: Collect coverage fragment (eng-metrics-lab)
         run: |

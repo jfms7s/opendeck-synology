@@ -30,7 +30,7 @@ REQUIRE_REAL_FIXTURES=1 cargo test recorded         # parsers vs. local real NAS
 - **Keep `keyring`'s `apple-native` feature.** keyring enables backends per OS; without it a macOS build silently uses an in-memory mock store and loses every secret.
 - **Certificates:** trust only the fingerprint the user saw (`trust_certificate(fp)`); never add an "accept any certificate" path. Redirects are never followed.
 - **No zero for missing data**: an absent field shows `N/A`/`Missing`, unknown DSM state words count as a warning.
-- Version lives in `Cargo.toml`, `Cargo.lock` and `assets/manifest.json`; `build.mjs` refuses a mismatch. Releases: push a `vX.Y.Z` tag → draft release with bundle + `SHA256SUMS` → publish by hand after the smoke checklist.
+- Version lives in `Cargo.toml`, `Cargo.lock` and `assets/manifest.json`; `build.mjs` refuses a mismatch. Releases: push a `vX.Y.Z` tag → draft release with bundle + `SHA256SUMS`, its notes holding the README smoke checklist unticked (`scripts/release-body.mjs`, between the README's `smoke-checklist` markers) → publish by hand after the smoke checklist. The run is recorded per release in the vault at `personal/projects/opendeck-synology/releases/vX.Y.Z-smoke.md` (template: `releases/smoke-template.md`) and linked from the release notes.
 - `tests/fixtures/real/` holds captures from the author's NAS and stays git-ignored; committed fixtures are hand-written (`tests/fixtures/dsm7/` copies the real response shapes).
 
 ## Conventions
