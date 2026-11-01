@@ -146,12 +146,31 @@ pub struct GlobalSettings {
 /// Reads `obj[name]`, or the default (noting `name` in `bad`) when it is
 /// there but unreadable.
 fn field<T: DeserializeOwned + Default>(obj: &Value, name: &str, bad: &mut Vec<String>) -> T {
+    field_or(obj, name, T::default(), bad)
+}
+
+/// [`field`] with an explicit default, for fields whose default is not
+/// `T::default()` (a port of 5001, HTTPS on).
+fn field_or<T: DeserializeOwned>(obj: &Value, name: &str, default: T, bad: &mut Vec<String>) -> T {
     match obj.get(name) {
-        None | Some(Value::Null) => T::default(),
+        None | Some(Value::Null) => default,
         Some(v) => serde_json::from_value(v.clone()).unwrap_or_else(|_| {
             bad.push(name.to_string());
-            T::default()
+            default
         }),
+    }
+}
+
+/// A block that is there but is not an object (`"connection": "nas.lan"`)
+/// loses every field in it: name it in `bad` rather than dropping it silently.
+fn object_or_note(v: &Value, name: &str, bad: &mut Vec<String>) -> Value {
+    match v.get(name) {
+        None | Some(Value::Null) => Value::Null,
+        Some(o) if o.is_object() => o.clone(),
+        Some(_) => {
+            bad.push(name.to_string());
+            Value::Null
+        }
     }
 }
 
@@ -165,25 +184,13 @@ impl GlobalSettings {
             return (g, Vec::new());
         }
         let mut bad = Vec::new();
-        let c = v.get("connection").cloned().unwrap_or(Value::Null);
+        let c = object_or_note(v, "connection", &mut bad);
         let d = Connection::default();
         let mut conn_bad = Vec::new();
         let connection = Connection {
             host: field(&c, "host", &mut conn_bad),
-            port: match c.get("port") {
-                None | Some(Value::Null) => d.port,
-                Some(p) => serde_json::from_value(p.clone()).unwrap_or_else(|_| {
-                    conn_bad.push("port".into());
-                    d.port
-                }),
-            },
-            https: match c.get("https") {
-                None | Some(Value::Null) => d.https,
-                Some(h) => h.as_bool().unwrap_or_else(|| {
-                    conn_bad.push("https".into());
-                    d.https
-                }),
-            },
+            port: field_or(&c, "port", d.port, &mut conn_bad),
+            https: field_or(&c, "https", d.https, &mut conn_bad),
             account: field(&c, "account", &mut conn_bad),
             pinned_sha256: field(&c, "pinned_sha256", &mut conn_bad),
         };
@@ -225,9 +232,11 @@ pub enum Amount {
 }
 
 /// One key's or dial's settings. A single struct serves all ten actions;
-/// each reads only the fields that apply to it.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(default)]
+/// each reads only the fields that apply to it. Deserialising is lenient
+/// (see the `Deserialize` impl): openaction falls back to
+/// `Default::default()` for the whole key on any error, so one unreadable
+/// field would otherwise reset its target, thresholds and view.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct ActionSettings {
     // The per-key refresh override (before 0.7.0) is gone;
     // settings saved with it still load, since unknown fields are ignored.
@@ -239,6 +248,54 @@ pub struct ActionSettings {
     pub cpu_view: CpuView,
     pub direction: Direction,
     pub amount: Amount,
+}
+
+impl ActionSettings {
+    /// Reads a key's settings field by field: an unreadable value (a view
+    /// from a newer plugin version, a hand-edited profile) costs that field
+    /// only. Returns the names of the fields that were dropped; a value that
+    /// is not an object at all yields the defaults and `["settings"]`.
+    pub fn from_value_lenient(v: &Value) -> (Self, Vec<String>) {
+        let mut bad = Vec::new();
+        if !v.is_object() && !v.is_null() {
+            return (Self::default(), vec!["settings".into()]);
+        }
+        let s = ActionSettings {
+            warn: field(v, "warn", &mut bad),
+            crit: field(v, "crit", &mut bad),
+            target: field(v, "target", &mut bad),
+            cpu_view: field(v, "cpu_view", &mut bad),
+            direction: field(v, "direction", &mut bad),
+            amount: field(v, "amount", &mut bad),
+        };
+        (s, bad)
+    }
+}
+
+impl<'de> Deserialize<'de> for ActionSettings {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let (s, bad) = Self::from_value_lenient(&Value::deserialize(d)?);
+        if !bad.is_empty() {
+            warn_unreadable_once(&bad);
+        }
+        Ok(s)
+    }
+}
+
+/// Logs dropped key-setting names (never values) once per distinct set:
+/// openaction deserialises a key's settings on every event, and a press
+/// should not add a log line each time.
+fn warn_unreadable_once(bad: &[String]) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<Vec<String>>>> = OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if seen.insert(bad.to_vec()) {
+        log::warn!("unreadable key settings {bad:?}: using their defaults, keeping the rest");
+    }
 }
 
 #[cfg(test)]
@@ -334,6 +391,78 @@ mod tests {
         assert_eq!(bad, ["connection.port", "temp_unit"]);
         let (_, bad) = GlobalSettings::from_value_lenient(&json!({}));
         assert!(bad.is_empty());
+    }
+
+    #[test]
+    fn a_connection_that_is_not_an_object_is_named() {
+        let (g, bad) = GlobalSettings::from_value_lenient(&json!({
+            "connection": "nas.lan",
+            "temp_unit": "fahrenheit",
+        }));
+        assert_eq!(bad, ["connection"]);
+        assert_eq!(g.connection, Connection::default());
+        assert_eq!(g.temp_unit, TempUnit::Fahrenheit);
+        let (_, bad) =
+            GlobalSettings::from_value_lenient(&json!({ "connection": null, "temp_unit": 1 }));
+        assert_eq!(bad, ["temp_unit"]);
+    }
+
+    #[test]
+    fn unreadable_port_or_https_take_their_own_defaults() {
+        let (g, bad) = GlobalSettings::from_value_lenient(&json!({
+            "connection": { "host": "nas.lan", "port": -1, "https": "yes", "account": "jf" },
+        }));
+        assert_eq!((g.connection.port, g.connection.https), (5001, true));
+        assert_eq!(g.connection.host, "nas.lan");
+        assert_eq!(bad, ["connection.port", "connection.https"]);
+    }
+
+    #[test]
+    fn one_unknown_key_setting_keeps_the_others() {
+        let s: ActionSettings = serde_json::from_value(json!({
+            "target": "volume_2", "cpu_view": "load60", "warn": 70, "crit": "high",
+            "direction": "out", "interval": 10,
+        }))
+        .unwrap();
+        assert_eq!(s.target.as_deref(), Some("volume_2"));
+        assert_eq!(s.warn, Some(70.0));
+        assert_eq!(s.crit, None);
+        assert_eq!(s.cpu_view, CpuView::Total);
+        assert_eq!(s.direction, Direction::Out);
+        let (_, bad) = ActionSettings::from_value_lenient(&json!({
+            "cpu_view": "load60", "crit": "high", "interval": 10,
+        }));
+        assert_eq!(bad, ["crit", "cpu_view"]);
+    }
+
+    #[test]
+    fn key_settings_that_are_not_an_object_are_the_defaults() {
+        for v in [json!("volume_2"), json!([1, 2]), json!(7)] {
+            let s: ActionSettings = serde_json::from_value(v.clone()).unwrap();
+            assert_eq!(s, ActionSettings::default());
+            assert_eq!(ActionSettings::from_value_lenient(&v).1, ["settings"]);
+        }
+        let s: ActionSettings = serde_json::from_value(json!(null)).unwrap();
+        assert_eq!(s, ActionSettings::default());
+        let s: ActionSettings = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(s, ActionSettings::default());
+    }
+
+    #[test]
+    fn key_settings_round_trip_with_the_same_wire_names() {
+        let s = ActionSettings {
+            warn: Some(1.5),
+            crit: None,
+            target: Some("eth0".into()),
+            cpu_view: CpuView::Load15,
+            direction: Direction::Combined,
+            amount: Amount::Used,
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["cpu_view"], "load15");
+        assert_eq!(v["direction"], "combined");
+        assert_eq!(v["amount"], "used");
+        assert_eq!(serde_json::from_value::<ActionSettings>(v).unwrap(), s);
     }
 
     #[test]

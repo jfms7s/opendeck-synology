@@ -34,8 +34,11 @@ pub struct NetIf {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Utilization {
-    pub cpu: Cpu,
-    pub memory: Memory,
+    /// `None` when a CPU field DSM must send is unreadable: only the CPU
+    /// key shows `Missing`, RAM and Network still read.
+    pub cpu: Option<Cpu>,
+    /// `None` when a memory field is unreadable (only RAM is lost).
+    pub memory: Option<Memory>,
     pub network: Vec<NetIf>,
 }
 
@@ -125,48 +128,63 @@ fn numbered(prefix: &str, id: &str) -> String {
     }
 }
 
-pub fn parse_utilization(data: &Value) -> Result<Utilization, String> {
-    let c = &data["cpu"];
+fn parse_cpu(c: &Value) -> Result<Cpu, String> {
     // DSM reports load averages multiplied by 100 (a load of 0.42 arrives as 42).
-    let cpu = Cpu {
+    Ok(Cpu {
         total_pct: req_num(c, "user_load")?
             + req_num(c, "system_load")?
             + num(&c["other_load"]).unwrap_or(0.0),
         load1: num(&c["1min_load"]).map(|l| l / 100.0),
         load5: num(&c["5min_load"]).map(|l| l / 100.0),
         load15: num(&c["15min_load"]).map(|l| l / 100.0),
-    };
-    let m = &data["memory"];
+    })
+}
+
+fn parse_memory(m: &Value) -> Result<Memory, String> {
     // Memory sizes are in KiB.
     let total_kib = req_num(m, "total_real")?;
     // Page cache and buffers count as free, as in DSM's own `real_usage`.
     let free_kib = req_num(m, "avail_real")?
         + num(&m["buffer"]).unwrap_or(0.0)
         + num(&m["cached"]).unwrap_or(0.0);
-    let memory = Memory {
+    Ok(Memory {
         used_pct: req_num(m, "real_usage")?,
         total_bytes: (total_kib * 1024.0) as u64,
         used_bytes: ((total_kib - free_kib).max(0.0) * 1024.0) as u64,
+    })
+}
+
+/// CPU, memory and network are parsed apart, so one unreadable section only
+/// costs the keys that read it. The reply is `Bad data` only when none of
+/// the three is there (not a utilization reply at all).
+pub fn parse_utilization(data: &Value) -> Result<Utilization, String> {
+    let cpu = parse_cpu(&data["cpu"]);
+    let memory = parse_memory(&data["memory"]);
+    let Some(list) = data["network"].as_array() else {
+        if let (Err(c), Err(m)) = (&cpu, &memory) {
+            return Err(format!("cpu: {c}; memory: {m}; no `network` list"));
+        }
+        return Ok(Utilization {
+            cpu: cpu.ok(),
+            memory: memory.ok(),
+            network: Vec::new(),
+        });
     };
-    let network = data["network"]
-        .as_array()
-        .map(|list| {
-            list.iter()
-                // An interface without both rates is left out (its key shows
-                // "Missing"): a zero must never stand in for missing data.
-                .filter_map(|n| {
-                    Some(NetIf {
-                        device: text(&n["device"])?,
-                        rx: num(&n["rx"])? as u64,
-                        tx: num(&n["tx"])? as u64,
-                    })
-                })
-                .collect()
+    let network = list
+        .iter()
+        // An interface without both rates is left out (its key shows
+        // "Missing"): a zero must never stand in for missing data.
+        .filter_map(|n| {
+            Some(NetIf {
+                device: text(&n["device"])?,
+                rx: num(&n["rx"])? as u64,
+                tx: num(&n["tx"])? as u64,
+            })
         })
-        .unwrap_or_default();
+        .collect();
     Ok(Utilization {
-        cpu,
-        memory,
+        cpu: cpu.ok(),
+        memory: memory.ok(),
         network,
     })
 }
@@ -265,7 +283,7 @@ mod tests {
             "total_real": 3_856_556, "avail_real": 143_596, "buffer": 11_648,
             "cached": 2_272_688, "real_usage": 37
         });
-        let m = parse_utilization(&v).unwrap().memory;
+        let m = parse_utilization(&v).unwrap().memory.unwrap();
         assert_eq!(m.used_bytes, 1_428_624 * 1024);
         let pct = m.used_bytes as f64 / m.total_bytes as f64 * 100.0;
         assert_eq!(pct.round(), m.used_pct);
@@ -274,12 +292,13 @@ mod tests {
     #[test]
     fn parses_utilization() {
         let u = parse_utilization(&fixture("utilization.json")).unwrap();
-        assert_eq!(u.cpu.total_pct, 37.0);
-        assert_eq!(u.cpu.load1, Some(0.42));
-        assert_eq!(u.cpu.load15, Some(0.35));
-        assert_eq!(u.memory.used_pct, 37.0);
-        assert_eq!(u.memory.total_bytes, 17_179_869_184);
-        assert_eq!(u.memory.used_bytes, 6_442_450_944);
+        let (cpu, mem) = (u.cpu.unwrap(), u.memory.unwrap());
+        assert_eq!(cpu.total_pct, 37.0);
+        assert_eq!(cpu.load1, Some(0.42));
+        assert_eq!(cpu.load15, Some(0.35));
+        assert_eq!(mem.used_pct, 37.0);
+        assert_eq!(mem.total_bytes, 17_179_869_184);
+        assert_eq!(mem.used_bytes, 6_442_450_944);
         assert_eq!(u.network.len(), 3);
         assert_eq!(
             u.network[0],
@@ -326,9 +345,42 @@ mod tests {
         cpu.as_object_mut().unwrap().remove("5min_load");
         let network = fixture("utilization.json")["network"].clone();
         let u = parse_utilization(&utilization_with(network, cpu)).unwrap();
-        assert_eq!(u.cpu.total_pct, 37.0);
-        assert_eq!((u.cpu.load1, u.cpu.load5), (Some(0.42), None));
-        assert_eq!(u.memory.used_pct, 37.0);
+        let c = u.cpu.unwrap();
+        assert_eq!(c.total_pct, 37.0);
+        assert_eq!((c.load1, c.load5), (Some(0.42), None));
+        assert_eq!(u.memory.unwrap().used_pct, 37.0);
+        assert_eq!(u.network.len(), 3);
+    }
+
+    #[test]
+    fn a_missing_memory_block_costs_only_memory() {
+        let mut v = fixture("utilization.json");
+        v.as_object_mut().unwrap().remove("memory");
+        let u = parse_utilization(&v).unwrap();
+        assert_eq!(u.memory, None);
+        assert_eq!(u.cpu.unwrap().total_pct, 37.0);
+        assert_eq!(u.network.len(), 3);
+    }
+
+    #[test]
+    fn a_missing_cpu_field_costs_only_cpu() {
+        let mut v = fixture("utilization.json");
+        v["cpu"].as_object_mut().unwrap().remove("user_load");
+        let u = parse_utilization(&v).unwrap();
+        assert_eq!(u.cpu, None);
+        assert_eq!(u.memory.unwrap().used_pct, 37.0);
+        assert_eq!(u.network.len(), 3);
+    }
+
+    #[test]
+    fn a_renamed_memory_field_does_not_touch_network() {
+        let mut v = fixture("utilization.json");
+        let m = v["memory"].as_object_mut().unwrap();
+        let usage = m.remove("real_usage").unwrap();
+        m.insert("real_usage_pct".into(), usage);
+        let u = parse_utilization(&v).unwrap();
+        assert_eq!(u.memory, None);
+        assert!(u.cpu.is_some());
         assert_eq!(u.network.len(), 3);
     }
 
@@ -493,9 +545,10 @@ mod tests {
     fn recorded_fixtures_parse_to_sensible_values() {
         if let Some(v) = recorded("utilization.json") {
             let u = parse_utilization(&v).unwrap();
-            assert!((0.0..=100.0).contains(&u.cpu.total_pct), "{:?}", u.cpu);
-            assert!(u.cpu.load1.is_some() && u.memory.total_bytes > 0);
-            assert!(u.memory.used_bytes <= u.memory.total_bytes);
+            let (cpu, mem) = (u.cpu.unwrap(), u.memory.unwrap());
+            assert!((0.0..=100.0).contains(&cpu.total_pct), "{cpu:?}");
+            assert!(cpu.load1.is_some() && mem.total_bytes > 0);
+            assert!(mem.used_bytes <= mem.total_bytes);
             assert!(u.network.iter().any(|n| n.device == "total"));
         }
         if let Some(v) = recorded("system.json") {
