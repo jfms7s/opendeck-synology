@@ -152,14 +152,22 @@ The toolchain is pinned in CI (`rust-version` in `Cargo.toml` is the oldest supp
 Rust). Releases: bump the version in `Cargo.toml`, `Cargo.lock` and
 `assets/manifest.json`, then push a `vX.Y.Z` tag; the Release workflow checks, builds both
 Linux architectures and the macOS one, and creates a **draft** release with the bundle
-and `SHA256SUMS`, which you publish after a look.
+and `SHA256SUMS`. The draft's notes hold the smoke-test checklist below, unticked
+(`scripts/release-body.mjs` copies it from this README); publish the draft only after
+running it.
 
 ## Manual smoke-test checklist
 
 Run this against a live OpenDeck + Stream Deck (with dials) and a DSM 7 NAS with 2FA,
 before publishing a release, and record the result per item (pass / fail / **not run**, with
-why - e.g. "NAS has a public certificate") in that release's smoke log. Items that need a
-self-signed certificate can't pass against a NAS with a publicly trusted one.
+why - e.g. "NAS has a public certificate"). Each release's draft notes start with this list,
+unticked: tick or annotate each item there before publishing. The full run (date, OpenDeck
+and DSM versions, certificate type, platform, and per-item notes) goes in that release's
+smoke log, `releases/vX.Y.Z-smoke.md` in the maintainer's project notes (kept outside this
+repository), which the release notes link. Items that need a self-signed certificate can't
+pass against a NAS with a publicly trusted one.
+
+<!-- smoke-checklist:start (scripts/release-body.mjs copies everything up to the end marker into each draft release) -->
 
 - [ ] Fresh install: keys show `Set up`; saving the connection with a self-signed
       certificate shows its fingerprint; trusting it moves on to *Needs 2FA code*.
@@ -219,6 +227,7 @@ On a Mac (Apple Silicon), with the release bundle installed through OpenDeck:
 - [ ] After a 2FA login, restarting OpenDeck reconnects without a code and without a
       Keychain prompt.
 - [ ] Keys and a dial show values and update.
+<!-- smoke-checklist:end -->
 
 ## License
 
