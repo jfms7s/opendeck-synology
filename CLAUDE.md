@@ -14,8 +14,11 @@ cargo clippy --all-targets --locked -- -D warnings  # CI gate
 cargo test --locked                                 # no NAS, no OpenDeck, no keyring needed
 cargo build --release --locked && node build.mjs    # dist/opendeck-synology.streamDeckPlugin + SHA256SUMS
 node build.mjs --check-version                      # Cargo.toml and manifest.json versions agree
+cargo +1.88.0 check --all-targets --locked          # MSRV (CI: msrv, msrv-macos); needs the 1.88.0 toolchain
 REQUIRE_REAL_FIXTURES=1 cargo test recorded         # parsers vs. local real NAS captures
 ```
+
+CI also cross-builds aarch64 and starts it under qemu (`aarch64`), runs the macOS job with the real Keychain round trip (`macos`) and `cargo-deny` (`advisories`); none of these run locally.
 
 ## Architecture
 
@@ -27,7 +30,7 @@ REQUIRE_REAL_FIXTURES=1 cargo test recorded         # parsers vs. local real NAS
 - **One session, one connection epoch.** Every late callback (poll result, device token, firmware lookup) checks `Services::is_current(epoch)`; the poller's `generation` guards its own state. Log the old session out only after the pollers moved off it.
 - **No secret in a URL, a log line or `Debug` output.** All DSM parameters go in the POST body; settings-panel payloads are never logged; `Credentials` and `FallbackSecrets` redact `Debug`; error text drops URLs.
 - **Secrets are scoped to account + scheme + host + port** (`Connection::secret_scope`). A secret saved for HTTPS is never sent over HTTP; over HTTP no device token is sent or stored. Only with no keyring at all (`StoreError::Unavailable`: no Secret Service on the bus, no macOS keychain) may the password go to the settings file (the panel must say so); a keyring that refuses (`StoreError::Refused`: denied/dismissed prompt, locked collection) keeps it in memory for this run only, under the same scope check; `Vault::read` checks that memory copy before the keyring, since the keyring may still hold the value it replaced. The device token never goes to the file. A refused read is not retried automatically (each try may prompt): it waits for a key press or a save. `secrets::classify` decides the split per OS.
-- **Keep `keyring`'s `apple-native` feature.** keyring enables backends per OS; without it a macOS build silently uses an in-memory mock store and loses every secret.
+- **Keep `keyring`'s `async-secret-service` (Linux) and `apple-native` (macOS) features.** keyring enables backends per OS; without the OS's feature a build silently uses an in-memory mock store and loses every secret. CI guards both: the `test` job's "Linux keyring backend is linked" step (`cargo tree … -i secret-service | grep`) and the `macos` job's real Keychain round trip.
 - **Certificates:** trust only the fingerprint the user saw (`trust_certificate(fp)`); never add an "accept any certificate" path. Redirects are never followed.
 - **No zero for missing data**: an absent field shows `N/A`/`Missing`, unknown DSM state words count as a warning.
 - Version lives in `Cargo.toml`, `Cargo.lock` and `assets/manifest.json`; `build.mjs` refuses a mismatch. Releases: push a `vX.Y.Z` tag → draft release with bundle + `SHA256SUMS`, its notes holding the README smoke checklist unticked (`scripts/release-body.mjs`, between the README's `smoke-checklist` markers) → publish by hand after the smoke checklist. The run is recorded per release in the vault at `personal/projects/opendeck-synology/releases/vX.Y.Z-smoke.md` (template: `releases/smoke-template.md`) and linked from the release notes.

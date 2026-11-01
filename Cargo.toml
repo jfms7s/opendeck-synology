@@ -26,7 +26,9 @@ rustls-native-certs = "0.8"
 sha2 = "0.10"
 # keyring enables each backend only on its own OS: Secret Service on Linux,
 # the Keychain on macOS. Without a backend for the OS it silently falls back
-# to an in-memory mock store.
+# to an in-memory mock store. CI guards both: the `test` job's "Linux keyring
+# backend is linked" step (`secret-service` in the graph) and the `macos` job's
+# real Keychain round trip.
 keyring = { version = "3.6", default-features = false, features = ["apple-native", "async-secret-service", "tokio", "crypto-rust"] }
 gethostname = "1"
 
