@@ -187,28 +187,41 @@ fn parse_memory(m: &Value) -> Result<Memory, String> {
     })
 }
 
-/// One I/O entry; `None` (left out, its key shows `Missing`) when any of
-/// the numbers is unreadable: a zero must never stand in for missing data.
-fn io_stat(v: &Value, name: Option<String>) -> Option<IoStat> {
-    let id = text(&v["device"])?;
+/// A count or rate DSM sent: finite, not negative, and below 2^53 (a
+/// petabyte per second is already absurd), so `as u64` never saturates.
+fn io_count(v: &Value) -> Option<u64> {
+    num(v)
+        .filter(|n| n.is_finite() && (0.0..9_007_199_254_740_992.0).contains(n))
+        .map(|n| n as u64)
+}
+
+/// One I/O entry named `id`; `None` (left out, its key shows `Missing`)
+/// when any of the numbers is unreadable: a zero must never stand in for
+/// missing data.
+fn io_stat(v: &Value, id: String, name: String) -> Option<IoStat> {
     Some(IoStat {
-        name: name.unwrap_or_else(|| id.clone()),
         id,
+        name,
         busy_pct: num(&v["utilization"]).filter(|u| (0.0..=100.0).contains(u))?,
-        read_bps: num(&v["read_byte"]).filter(|n| *n >= 0.0)? as u64,
-        write_bps: num(&v["write_byte"]).filter(|n| *n >= 0.0)? as u64,
-        read_iops: num(&v["read_access"]).filter(|n| *n >= 0.0)? as u64,
-        write_iops: num(&v["write_access"]).filter(|n| *n >= 0.0)? as u64,
+        read_bps: io_count(&v["read_byte"])?,
+        write_bps: io_count(&v["write_byte"])?,
+        read_iops: io_count(&v["read_access"])?,
+        write_iops: io_count(&v["write_access"])?,
     })
 }
 
 fn parse_io(data: &Value) -> StorageIo {
     let list = |v: &Value| v.as_array().cloned().unwrap_or_default();
     StorageIo {
-        all_disks: io_stat(&data["disk"]["total"], Some("All disks".into())),
+        all_disks: io_stat(&data["disk"]["total"], "total".into(), "All disks".into()),
         disks: list(&data["disk"]["disk"])
             .iter()
-            .filter_map(|d| io_stat(d, text(&d["display_name"])))
+            .filter_map(|d| {
+                // A disk's `device` is the storage endpoint's disk id (`sata1`).
+                let id = text(&d["device"])?;
+                let name = text(&d["display_name"]).unwrap_or_else(|| id.clone());
+                io_stat(d, id, name)
+            })
             .collect(),
         volumes: list(&data["space"]["volume"])
             .iter()
@@ -217,8 +230,7 @@ fn parse_io(data: &Value) -> StorageIo {
                 // `device` is a mapper name (`dm-1`) nobody recognises.
                 let path = text(&v["display_name"])?;
                 let path = path.trim_start_matches('/').to_string();
-                let stat = io_stat(v, Some(volume_label(&path)))?;
-                Some(IoStat { id: path, ..stat })
+                io_stat(v, path.clone(), volume_label(&path))
             })
             .collect(),
     }
@@ -232,9 +244,9 @@ fn volume_label(path: &str) -> String {
     }
 }
 
-/// CPU, memory and network are parsed apart, so one unreadable section only
-/// costs the keys that read it. The reply is `Bad data` only when none of
-/// the three yields anything (not a utilization reply at all).
+/// CPU, memory, network and storage I/O are parsed apart, so one unreadable
+/// section only costs the keys that read it. The reply is `Bad data` only
+/// when none of them yields anything (not a utilization reply at all).
 pub fn parse_utilization(data: &Value) -> Result<Utilization, String> {
     let cpu = parse_cpu(&data["cpu"]);
     let memory = parse_memory(&data["memory"]);
@@ -259,7 +271,9 @@ pub fn parse_utilization(data: &Value) -> Result<Utilization, String> {
         && network.is_empty()
         && io.is_empty()
     {
-        return Err(format!("cpu: {c}; memory: {m}; no network interface"));
+        return Err(format!(
+            "cpu: {c}; memory: {m}; no network interface; no storage I/O"
+        ));
     }
     Ok(Utilization {
         cpu: cpu.ok(),
@@ -525,6 +539,29 @@ mod tests {
         let u = parse_utilization(&v).unwrap();
         assert_eq!(u.io.all_disks, None, "left out, never a zero");
         assert_eq!(u.io.disks.len(), 2);
+    }
+
+    #[test]
+    fn absurd_io_numbers_are_left_out_not_saturated() {
+        for bad in [json!("inf"), json!(1e30), json!(-1), json!("NaN")] {
+            let mut v = fixture("dsm7/utilization_io.json");
+            v["disk"]["total"]["read_byte"] = bad.clone();
+            let u = parse_utilization(&v).unwrap();
+            assert_eq!(u.io.all_disks, None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn io_entries_need_no_device_field_where_it_is_unused() {
+        let mut v = fixture("dsm7/utilization_io.json");
+        v["disk"]["total"].as_object_mut().unwrap().remove("device");
+        v["space"]["volume"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("device");
+        let u = parse_utilization(&v).unwrap();
+        assert_eq!(u.io.all_disks.unwrap().id, "total");
+        assert_eq!(u.io.volumes[0].id, "volume1");
     }
 
     #[test]

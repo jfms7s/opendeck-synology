@@ -210,6 +210,7 @@
 			$("direction").value = s.direction || "in";
 			$("amount").value = s.amount || "percent";
 			$("io_view").value = s.io_view || "busy";
+			if (!$("io_view").value) $("io_view").value = "busy";
 			$("press").value = s.press || "refresh";
 			// A choice this version doesn't know acts as Refresh: show it so.
 			if (!$("press").value) $("press").value = "refresh";

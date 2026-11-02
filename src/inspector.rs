@@ -601,6 +601,11 @@ mod tests {
         );
         assert_eq!(msg["connection"]["host"], "nas.lan");
         assert_eq!(msg["notice"], "hello");
+        let io = serde_json::to_value(Metric::StorageIo.fields()).unwrap();
+        assert_eq!(
+            io,
+            json!({ "target": "Disk or volume", "cpuView": false, "direction": false, "amount": false, "ioView": true, "thresholdUnit": "%" })
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
