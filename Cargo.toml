@@ -19,11 +19,11 @@ dashmap = "6"
 futures = "0.3"
 log = "0.4"
 simplelog = "0.12"
-base64 = "0.22"
+base64 = "0.23"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "form"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-native-certs = "0.8"
-sha2 = "0.10"
+sha2 = "0.11"
 # keyring enables each backend only on its own OS: Secret Service on Linux,
 # the Keychain on macOS. Without a backend for the OS it silently falls back
 # to an in-memory mock store. CI guards both: the `test` job's "Linux keyring
