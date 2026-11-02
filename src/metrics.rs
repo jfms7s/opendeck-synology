@@ -8,7 +8,7 @@ use crate::dsm::model::{
 use crate::format;
 use crate::metric::Metric;
 use crate::poller::PollState;
-use crate::settings::{ActionSettings, Amount, CpuView, Direction, TempUnit};
+use crate::settings::{ActionSettings, Amount, CpuView, Direction, IoView, TempUnit};
 use crate::status::ConnStatus;
 use std::cmp::Ordering;
 
@@ -76,6 +76,7 @@ const CPU_VIEWS: [CpuView; 4] = [
 ];
 const AMOUNTS: [Amount; 2] = [Amount::Percent, Amount::Used];
 const DIRECTIONS: [Direction; 3] = [Direction::In, Direction::Out, Direction::Combined];
+const IO_VIEWS: [IoView; 4] = [IoView::Busy, IoView::Read, IoView::Write, IoView::Iops];
 
 pub fn read(
     metric: Metric,
@@ -142,6 +143,7 @@ fn value_reading(metric: Metric, p: &Payload, v: &ActionSettings, unit: TempUnit
         (Metric::Cpu, Payload::Utilization(u)) => cpu(u, v),
         (Metric::Ram, Payload::Utilization(u)) => ram(u, v),
         (Metric::Network, Payload::Utilization(u)) => network(u, v),
+        (Metric::StorageIo, Payload::Utilization(u)) => storage_io(u, v),
         (Metric::SysTemp, Payload::SystemInfo(s)) => sys_temp(s, v, unit),
         (Metric::DiskTemp, Payload::Storage(s)) => disk_temp(s, v, unit),
         (Metric::DiskHealth, Payload::Storage(s)) => disk_health(s, v),
@@ -258,6 +260,39 @@ fn network(u: &Utilization, v: &ActionSettings) -> Reading {
         Some(crit) => r.bar(mbps / crit * 100.0),
         None => r,
     }
+}
+
+/// Busy %, read or write rate, or IOPS of all disks, one disk or one
+/// volume. The level and the bar follow busy % in every view: it is the
+/// one 0-100 scale, and the thresholds are about it.
+fn storage_io(u: &Utilization, v: &ActionSettings) -> Reading {
+    let pager = (index_of(&IO_VIEWS, &v.io_view), IO_VIEWS.len());
+    let io = &u.io;
+    let stat = match v.target.as_deref() {
+        None => io.all_disks.as_ref(),
+        Some(id) => io.disks.iter().chain(&io.volumes).find(|s| s.id == id),
+    };
+    let Some(stat) = stat else {
+        let what = v.target.as_deref().unwrap_or("All disks");
+        return missing(Metric::StorageIo, what).pager(pager.0, pager.1);
+    };
+    let (value, what) = match v.io_view {
+        IoView::Busy => (format::percent(stat.busy_pct), "busy"),
+        IoView::Read => (format::rate(stat.read_bps), "read"),
+        IoView::Write => (format::rate(stat.write_bps), "write"),
+        IoView::Iops => (
+            stat.read_iops.saturating_add(stat.write_iops).to_string(),
+            "IOPS",
+        ),
+    };
+    Reading::new(
+        Metric::StorageIo,
+        value,
+        level_for(stat.busy_pct, thresholds(Metric::StorageIo, v)),
+    )
+    .subject(format!("{} {what}", stat.name))
+    .bar(stat.busy_pct)
+    .pager(pager.0, pager.1)
 }
 
 fn sys_temp(s: &SystemInfo, v: &ActionSettings, unit: TempUnit) -> Reading {
@@ -637,6 +672,9 @@ pub fn rotate(metric: Metric, view: &mut ActionSettings, latest: Option<&Payload
                 ticks,
             )]
         }
+        Metric::StorageIo => {
+            view.io_view = IO_VIEWS[step(index_of(&IO_VIEWS, &view.io_view), IO_VIEWS.len(), ticks)]
+        }
         Metric::DiskTemp | Metric::DiskHealth | Metric::Volume | Metric::Pool | Metric::Health => {
             let Some(Payload::Storage(s)) = latest else {
                 return;
@@ -668,6 +706,16 @@ pub fn target_options(metric: Metric, p: &Payload) -> Vec<(Option<String>, Strin
                         .iter()
                         .filter(|n| n.device != "total")
                         .map(|n| (Some(n.device.clone()), n.device.clone())),
+                )
+                .collect()
+        }
+        (Metric::StorageIo, Payload::Utilization(u)) => {
+            std::iter::once((None, "All disks".to_string()))
+                .chain(
+                    u.io.disks
+                        .iter()
+                        .chain(&u.io.volumes)
+                        .map(|x| (Some(x.id.clone()), x.name.clone())),
                 )
                 .collect()
         }
@@ -837,6 +885,117 @@ mod tests {
             read_as(Metric::Network, p(), &view()).value,
             read_as(Metric::Network, util(), &view()).value
         );
+    }
+
+    fn io() -> Payload {
+        Payload::Utilization(parse_utilization(&fixture("dsm7/utilization_io.json")).unwrap())
+    }
+
+    fn io_as(target: Option<&str>, io_view: IoView) -> Reading {
+        let v = ActionSettings {
+            target: target.map(str::to_string),
+            io_view,
+            ..view()
+        };
+        read_as(Metric::StorageIo, io(), &v)
+    }
+
+    #[test]
+    fn storage_io_views_of_all_disks() {
+        let r = io_as(None, IoView::Busy);
+        assert_eq!(
+            (r.title, r.value.as_str(), r.subject.as_str()),
+            ("I/O", "45%", "All disks busy")
+        );
+        assert_eq!(
+            (r.level, r.bar, r.pager),
+            (Level::Normal, Some(45.0), Some((0, 4)))
+        );
+        let r = io_as(None, IoView::Read);
+        assert_eq!(
+            (r.value.as_str(), r.subject.as_str(), r.pager),
+            ("50.0 MB/s", "All disks read", Some((1, 4)))
+        );
+        assert_eq!(io_as(None, IoView::Write).value, "10.0 MB/s");
+        let r = io_as(None, IoView::Iops);
+        assert_eq!(
+            (r.value.as_str(), r.subject.as_str()),
+            ("400", "All disks IOPS")
+        );
+        assert_eq!(r.bar, Some(45.0), "the bar is busy % in every view");
+    }
+
+    #[test]
+    fn storage_io_of_one_disk_or_volume() {
+        let r = io_as(Some("sata1"), IoView::Busy);
+        assert_eq!(
+            (r.value.as_str(), r.subject.as_str()),
+            ("82%", "Drive 1 busy")
+        );
+        assert_eq!(r.level, Level::Warn);
+        let r = io_as(Some("volume1"), IoView::Read);
+        assert_eq!(
+            (r.value.as_str(), r.subject.as_str()),
+            ("50.0 MB/s", "Volume 1 read")
+        );
+        assert_eq!(r.level, Level::Crit, "96 % busy colours every view");
+    }
+
+    #[test]
+    fn storage_io_busy_thresholds() {
+        let mut u = parse_utilization(&fixture("dsm7/utilization_io.json")).unwrap();
+        for (busy, want) in [
+            (79.0, Level::Normal),
+            (80.0, Level::Warn),
+            (94.9, Level::Warn),
+            (95.0, Level::Crit),
+        ] {
+            u.io.all_disks.as_mut().unwrap().busy_pct = busy;
+            let r = read_as(Metric::StorageIo, Payload::Utilization(u.clone()), &view());
+            assert_eq!(r.level, want, "{busy}");
+        }
+        let v = ActionSettings {
+            warn: Some(40.0),
+            crit: Some(99.0),
+            ..view()
+        };
+        assert_eq!(read_as(Metric::StorageIo, io(), &v).level, Level::Warn);
+    }
+
+    #[test]
+    fn storage_io_of_an_unknown_or_unreadable_target_is_missing() {
+        let r = io_as(Some("sata9"), IoView::Read);
+        assert_eq!(
+            (r.value.as_str(), r.subject.as_str(), r.level, r.pager),
+            ("Missing", "sata9", Level::Crit, Some((1, 4)))
+        );
+        assert_eq!(io_as(Some("nvme0n1"), IoView::Busy).value, "Missing");
+        // A NAS whose reply has no I/O blocks: missing, never a zero.
+        let r = read_as(Metric::StorageIo, util(), &view());
+        assert_eq!(
+            (r.value.as_str(), r.subject.as_str()),
+            ("Missing", "All disks")
+        );
+    }
+
+    #[test]
+    fn storage_io_targets_and_rotation() {
+        let opts = target_options(Metric::StorageIo, &io());
+        assert_eq!(
+            opts,
+            [
+                (None, "All disks".to_string()),
+                (Some("sata1".to_string()), "Drive 1".to_string()),
+                (Some("sata2".to_string()), "Drive 2".to_string()),
+                (Some("volume1".to_string()), "Volume 1".to_string()),
+            ]
+        );
+        let mut v = view();
+        rotate(Metric::StorageIo, &mut v, Some(&io()), 1);
+        assert_eq!(v.io_view, IoView::Read);
+        rotate(Metric::StorageIo, &mut v, None, -2);
+        assert_eq!(v.io_view, IoView::Iops);
+        assert_eq!(v.target, None, "turning changes the view, not the target");
     }
 
     #[test]

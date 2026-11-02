@@ -99,6 +99,15 @@
 					<option value="combined">Combined</option>
 				</select>
 			</div>
+			<div id="io-field" class="field hidden">
+				<label for="io_view">Show</label>
+				<select id="io_view">
+					<option value="busy">Busy %</option>
+					<option value="read">Read rate</option>
+					<option value="write">Write rate</option>
+					<option value="iops">IOPS (read + write)</option>
+				</select>
+			</div>
 			<div id="amount-field" class="field hidden">
 				<label for="amount">Show as</label>
 				<select id="amount">
@@ -174,6 +183,7 @@
 			$("cpu-field").classList.toggle("hidden", !fields.cpuView);
 			$("direction-field").classList.toggle("hidden", !fields.direction);
 			$("amount-field").classList.toggle("hidden", !fields.amount);
+			$("io-field").classList.toggle("hidden", !fields.ioView);
 			$("threshold-field").classList.toggle("hidden", !fields.thresholdUnit);
 			$("warn-label").textContent = `Warn at (${fields.thresholdUnit || ""})`;
 			$("crit-label").textContent = `Critical at (${fields.thresholdUnit || ""})`;
@@ -199,6 +209,8 @@
 			$("cpu_view").value = s.cpu_view || "total";
 			$("direction").value = s.direction || "in";
 			$("amount").value = s.amount || "percent";
+			$("io_view").value = s.io_view || "busy";
+			if (!$("io_view").value) $("io_view").value = "busy";
 			$("press").value = s.press || "refresh";
 			// A choice this version doesn't know acts as Refresh: show it so.
 			if (!$("press").value) $("press").value = "refresh";
@@ -319,7 +331,7 @@
 			settings.target = $("target").value || null;
 			sendSettings();
 		});
-		for (const id of ["cpu_view", "direction", "amount", "press"]) {
+		for (const id of ["cpu_view", "direction", "amount", "io_view", "press"]) {
 			$(id).addEventListener("change", () => {
 				settings[id] = $(id).value;
 				sendSettings();

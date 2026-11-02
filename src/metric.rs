@@ -14,6 +14,7 @@ pub struct Fields {
     pub cpu_view: bool,
     pub direction: bool,
     pub amount: bool,
+    pub io_view: bool,
     /// Unit of the warn/critical thresholds, if the metric has them.
     pub threshold_unit: Option<&'static str>,
 }
@@ -29,12 +30,13 @@ pub enum Metric {
     Volume,
     Pool,
     Health,
+    StorageIo,
     Update,
 }
 
 impl Metric {
     #[cfg(test)]
-    pub const ALL: [Metric; 10] = [
+    pub const ALL: [Metric; 11] = [
         Self::Cpu,
         Self::Ram,
         Self::Network,
@@ -44,12 +46,13 @@ impl Metric {
         Self::Volume,
         Self::Pool,
         Self::Health,
+        Self::StorageIo,
         Self::Update,
     ];
 
     pub fn endpoint(self) -> Endpoint {
         match self {
-            Self::Cpu | Self::Ram | Self::Network => Endpoint::Utilization,
+            Self::Cpu | Self::Ram | Self::Network | Self::StorageIo => Endpoint::Utilization,
             Self::SysTemp => Endpoint::SystemInfo,
             Self::DiskTemp | Self::DiskHealth | Self::Volume | Self::Pool | Self::Health => {
                 Endpoint::Storage
@@ -70,6 +73,7 @@ impl Metric {
             Self::Volume => "com.jfms7s.synology.volume",
             Self::Pool => "com.jfms7s.synology.pool",
             Self::Health => "com.jfms7s.synology.health",
+            Self::StorageIo => "com.jfms7s.synology.storageio",
             Self::Update => "com.jfms7s.synology.update",
         }
     }
@@ -86,6 +90,7 @@ impl Metric {
             Self::Volume => "Volume",
             Self::Pool => "Pool",
             Self::Health => "NAS",
+            Self::StorageIo => "I/O",
             Self::Update => "DSM",
         }
     }
@@ -132,6 +137,12 @@ impl Metric {
                 target: Some("Pool"),
                 ..none
             },
+            Self::StorageIo => Fields {
+                target: Some("Disk or volume"),
+                io_view: true,
+                threshold_unit: Some("%"),
+                ..none
+            },
             // Health reads every pool, disk and volume at the Disk
             // Temperature and Volume defaults: no target, no thresholds.
             Self::Update | Self::Health => none,
@@ -147,6 +158,8 @@ impl Metric {
             Self::SysTemp => Some((60.0, 70.0)),
             Self::DiskTemp => Some((50.0, 60.0)),
             Self::Volume => Some((80.0, 90.0)),
+            // Busy %: a disk pinned near 100 % is what makes I/O latency climb.
+            Self::StorageIo => Some((80.0, 95.0)),
             _ => None,
         }
     }
@@ -160,7 +173,8 @@ mod tests {
     #[test]
     fn uuids_are_unique_and_namespaced() {
         let uuids: HashSet<_> = Metric::ALL.iter().map(|m| m.uuid()).collect();
-        assert_eq!(uuids.len(), 10);
+        assert_eq!(uuids.len(), Metric::ALL.len());
+        assert_eq!(uuids.len(), 11);
         assert!(uuids.iter().all(|u| u.starts_with("com.jfms7s.synology.")));
     }
 
@@ -176,6 +190,11 @@ mod tests {
             assert_eq!(m.endpoint(), Endpoint::Storage);
         }
         assert_eq!(Metric::Cpu.endpoint(), Endpoint::Utilization);
+        assert_eq!(
+            Metric::StorageIo.endpoint(),
+            Endpoint::Utilization,
+            "no new request"
+        );
         assert_eq!(Metric::SysTemp.endpoint(), Endpoint::SystemInfo);
         assert_eq!(Metric::Update.endpoint(), Endpoint::Update);
     }
@@ -199,5 +218,7 @@ mod tests {
         assert_eq!(Metric::DiskTemp.default_thresholds(), Some((50.0, 60.0)));
         assert_eq!(Metric::Network.default_thresholds(), None);
         assert_eq!(Metric::Pool.default_thresholds(), None);
+        assert_eq!(Metric::StorageIo.default_thresholds(), Some((80.0, 95.0)));
+        assert_eq!(Metric::StorageIo.fields().threshold_unit, Some("%"));
     }
 }

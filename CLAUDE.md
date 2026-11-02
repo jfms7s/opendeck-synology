@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Rust [OpenDeck](https://github.com/nekename/OpenDeck) plugin (Linux x86_64 + aarch64 and Apple Silicon macOS, on the `openaction` crate) showing live, read-only status of one Synology NAS running DSM 7 on Stream Deck keys and dials: ten actions (CPU, RAM, network, temperatures, disks, volumes, pools, a NAS Health summary of pools/disks/volumes, DSM update). It signs in with 2FA (device token), pins self-signed certificates, and keeps secrets in the system keyring (Secret Service on Linux, the login Keychain on macOS). The README is the user-facing spec and holds the manual smoke-test checklist.
+A Rust [OpenDeck](https://github.com/nekename/OpenDeck) plugin (Linux x86_64 + aarch64 and Apple Silicon macOS, on the `openaction` crate) showing live, read-only status of one Synology NAS running DSM 7 on Stream Deck keys and dials: eleven actions (CPU, RAM, network, temperatures, disks, volumes, pools, a NAS Health summary of pools/disks/volumes, Storage I/O, DSM update). It signs in with 2FA (device token), pins self-signed certificates, and keeps secrets in the system keyring (Secret Service on Linux, the login Keychain on macOS). The README is the user-facing spec and holds the manual smoke-test checklist.
 
 ## Commands
 

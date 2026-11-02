@@ -32,6 +32,38 @@ pub struct NetIf {
     pub tx: u64,
 }
 
+/// One disk's, one volume's or all disks' I/O right now.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IoStat {
+    /// The storage endpoint's disk id (`sata1`) for a disk, the volume path
+    /// without the slash (`volume1`) for a volume, `total` for all disks.
+    pub id: String,
+    pub name: String,
+    /// How busy, 0-100.
+    pub busy_pct: f64,
+    /// Bytes per second.
+    pub read_bps: u64,
+    pub write_bps: u64,
+    /// Operations per second.
+    pub read_iops: u64,
+    pub write_iops: u64,
+}
+
+/// The disk and volume I/O blocks of the utilization reply; empty when
+/// DSM sends none (older firmware, or the committed basic fixture).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct StorageIo {
+    pub all_disks: Option<IoStat>,
+    pub disks: Vec<IoStat>,
+    pub volumes: Vec<IoStat>,
+}
+
+impl StorageIo {
+    pub fn is_empty(&self) -> bool {
+        self.all_disks.is_none() && self.disks.is_empty() && self.volumes.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Utilization {
     /// `None` when a CPU field DSM must send is unreadable: only the CPU
@@ -40,6 +72,7 @@ pub struct Utilization {
     /// `None` when a memory field is unreadable (only RAM is lost).
     pub memory: Option<Memory>,
     pub network: Vec<NetIf>,
+    pub io: StorageIo,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -154,9 +187,66 @@ fn parse_memory(m: &Value) -> Result<Memory, String> {
     })
 }
 
-/// CPU, memory and network are parsed apart, so one unreadable section only
-/// costs the keys that read it. The reply is `Bad data` only when none of
-/// the three yields anything (not a utilization reply at all).
+/// A count or rate DSM sent: finite, not negative, and below 2^53 (a
+/// petabyte per second is already absurd), so `as u64` never saturates.
+fn io_count(v: &Value) -> Option<u64> {
+    num(v)
+        .filter(|n| n.is_finite() && (0.0..9_007_199_254_740_992.0).contains(n))
+        .map(|n| n as u64)
+}
+
+/// One I/O entry named `id`; `None` (left out, its key shows `Missing`)
+/// when any of the numbers is unreadable: a zero must never stand in for
+/// missing data.
+fn io_stat(v: &Value, id: String, name: String) -> Option<IoStat> {
+    Some(IoStat {
+        id,
+        name,
+        busy_pct: num(&v["utilization"]).filter(|u| (0.0..=100.0).contains(u))?,
+        read_bps: io_count(&v["read_byte"])?,
+        write_bps: io_count(&v["write_byte"])?,
+        read_iops: io_count(&v["read_access"])?,
+        write_iops: io_count(&v["write_access"])?,
+    })
+}
+
+fn parse_io(data: &Value) -> StorageIo {
+    let list = |v: &Value| v.as_array().cloned().unwrap_or_default();
+    StorageIo {
+        all_disks: io_stat(&data["disk"]["total"], "total".into(), "All disks".into()),
+        disks: list(&data["disk"]["disk"])
+            .iter()
+            .filter_map(|d| {
+                // A disk's `device` is the storage endpoint's disk id (`sata1`).
+                let id = text(&d["device"])?;
+                let name = text(&d["display_name"]).unwrap_or_else(|| id.clone());
+                io_stat(d, id, name)
+            })
+            .collect(),
+        volumes: list(&data["space"]["volume"])
+            .iter()
+            .filter_map(|v| {
+                // The volume path without its slash (`volume1`) names it;
+                // `device` is a mapper name (`dm-1`) nobody recognises.
+                let path = text(&v["display_name"])?;
+                let path = path.trim_start_matches('/').to_string();
+                io_stat(v, path.clone(), volume_label(&path))
+            })
+            .collect(),
+    }
+}
+
+/// "volume1" -> "Volume 1"; anything else stays as is.
+fn volume_label(path: &str) -> String {
+    match path.strip_prefix("volume") {
+        Some(n) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => format!("Volume {n}"),
+        _ => path.to_string(),
+    }
+}
+
+/// CPU, memory, network and storage I/O are parsed apart, so one unreadable
+/// section only costs the keys that read it. The reply is `Bad data` only
+/// when none of them yields anything (not a utilization reply at all).
 pub fn parse_utilization(data: &Value) -> Result<Utilization, String> {
     let cpu = parse_cpu(&data["cpu"]);
     let memory = parse_memory(&data["memory"]);
@@ -176,15 +266,20 @@ pub fn parse_utilization(data: &Value) -> Result<Utilization, String> {
                 .collect()
         })
         .unwrap_or_default();
+    let io = parse_io(data);
     if let (Err(c), Err(m)) = (&cpu, &memory)
         && network.is_empty()
+        && io.is_empty()
     {
-        return Err(format!("cpu: {c}; memory: {m}; no network interface"));
+        return Err(format!(
+            "cpu: {c}; memory: {m}; no network interface; no storage I/O"
+        ));
     }
     Ok(Utilization {
         cpu: cpu.ok(),
         memory: memory.ok(),
         network,
+        io,
     })
 }
 
@@ -391,6 +486,95 @@ mod tests {
     }
 
     #[test]
+    fn parses_disk_and_volume_io() {
+        let u = parse_utilization(&fixture("dsm7/utilization_io.json")).unwrap();
+        let all = u.io.all_disks.unwrap();
+        assert_eq!((all.id.as_str(), all.name.as_str()), ("total", "All disks"));
+        assert_eq!(all.busy_pct, 45.0);
+        assert_eq!((all.read_bps, all.write_bps), (52_428_800, 10_485_760));
+        assert_eq!((all.read_iops, all.write_iops), (320, 80));
+        let ids: Vec<_> = u.io.disks.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, ["sata1", "sata2"], "nvme0n1's busy % is unreadable");
+        assert_eq!(u.io.disks[0].name, "Drive 1");
+        assert_eq!(u.io.disks[0].busy_pct, 82.0);
+        assert_eq!(
+            u.io.volumes,
+            [IoStat {
+                id: "volume1".into(),
+                name: "Volume 1".into(),
+                busy_pct: 96.0,
+                read_bps: 52_428_800,
+                write_bps: 10_485_760,
+                read_iops: 320,
+                write_iops: 80,
+            }]
+        );
+        assert!(u.cpu.is_some() && u.memory.is_some());
+        assert_eq!(u.network.len(), 2);
+    }
+
+    #[test]
+    fn a_reply_without_io_blocks_parses_as_before() {
+        let u = parse_utilization(&fixture("utilization.json")).unwrap();
+        assert!(u.io.is_empty());
+        assert_eq!(u.cpu.unwrap().total_pct, 37.0);
+        assert_eq!(u.memory.unwrap().used_pct, 37.0);
+        assert_eq!(u.network.len(), 3);
+    }
+
+    #[test]
+    fn malformed_io_blocks_cost_only_io() {
+        let mut v = fixture("dsm7/utilization_io.json");
+        v["disk"] = json!("busy");
+        v["space"] = json!({ "volume": { "device": "dm-1" } });
+        let u = parse_utilization(&v).unwrap();
+        assert!(u.io.is_empty());
+        assert!(u.cpu.is_some() && u.memory.is_some());
+        assert_eq!(u.network.len(), 2);
+        let mut v = fixture("dsm7/utilization_io.json");
+        v["disk"]["total"]
+            .as_object_mut()
+            .unwrap()
+            .remove("read_access");
+        let u = parse_utilization(&v).unwrap();
+        assert_eq!(u.io.all_disks, None, "left out, never a zero");
+        assert_eq!(u.io.disks.len(), 2);
+    }
+
+    #[test]
+    fn absurd_io_numbers_are_left_out_not_saturated() {
+        for bad in [json!("inf"), json!(1e30), json!(-1), json!("NaN")] {
+            let mut v = fixture("dsm7/utilization_io.json");
+            v["disk"]["total"]["read_byte"] = bad.clone();
+            let u = parse_utilization(&v).unwrap();
+            assert_eq!(u.io.all_disks, None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn io_entries_need_no_device_field_where_it_is_unused() {
+        let mut v = fixture("dsm7/utilization_io.json");
+        v["disk"]["total"].as_object_mut().unwrap().remove("device");
+        v["space"]["volume"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("device");
+        let u = parse_utilization(&v).unwrap();
+        assert_eq!(u.io.all_disks.unwrap().id, "total");
+        assert_eq!(u.io.volumes[0].id, "volume1");
+    }
+
+    #[test]
+    fn io_alone_is_still_a_utilization_reply() {
+        let mut v = fixture("dsm7/utilization_io.json");
+        let o = v.as_object_mut().unwrap();
+        for k in ["cpu", "memory", "network"] {
+            o.remove(k);
+        }
+        assert!(!parse_utilization(&v).unwrap().io.is_empty());
+    }
+
+    #[test]
     fn network_alone_still_reads() {
         let network = fixture("utilization.json")["network"].clone();
         let u = parse_utilization(&json!({ "network": network })).unwrap();
@@ -558,6 +742,10 @@ mod tests {
             assert!(cpu.load1.is_some() && mem.total_bytes > 0);
             assert!(mem.used_bytes <= mem.total_bytes);
             assert!(u.network.iter().any(|n| n.device == "total"));
+            let all = u.io.all_disks.expect("disk.total");
+            assert!((0.0..=100.0).contains(&all.busy_pct));
+            assert!(!u.io.disks.is_empty() && !u.io.volumes.is_empty());
+            assert!(u.io.volumes.iter().all(|v| v.id.starts_with("volume")));
         }
         if let Some(v) = recorded("system.json") {
             let s = parse_system_info(&v).unwrap();

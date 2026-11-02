@@ -234,6 +234,19 @@ pub enum Amount {
     Used,
 }
 
+/// What a Storage I/O key shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IoView {
+    /// Busy %, the view the thresholds and the bar are about.
+    #[default]
+    Busy,
+    Read,
+    Write,
+    /// Read plus write operations per second.
+    Iops,
+}
+
 /// What pressing a key, pushing a dial or tapping its touch strip does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -246,7 +259,7 @@ pub enum PressAction {
     Dsm,
 }
 
-/// One key's or dial's settings. A single struct serves all ten actions;
+/// One key's or dial's settings. A single struct serves all eleven actions;
 /// each reads only the fields that apply to it. Deserialising is lenient
 /// (see the `Deserialize` impl): openaction falls back to
 /// `Default::default()` for the whole key on any error, so one unreadable
@@ -263,6 +276,7 @@ pub struct ActionSettings {
     pub cpu_view: CpuView,
     pub direction: Direction,
     pub amount: Amount,
+    pub io_view: IoView,
     pub press: PressAction,
 }
 
@@ -285,6 +299,7 @@ impl ActionSettings {
             cpu_view: field(v, "cpu_view", &mut bad),
             direction: field(v, "direction", &mut bad),
             amount: field(v, "amount", &mut bad),
+            io_view: field(v, "io_view", &mut bad),
             press: field(v, "press", &mut bad),
         };
         (s, bad)
@@ -461,6 +476,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(s.press, PressAction::Refresh);
+        assert_eq!(s.io_view, IoView::Busy);
         assert_eq!(s.target.as_deref(), Some("volume_2"));
         let s: ActionSettings = serde_json::from_value(json!({ "press": "storage" })).unwrap();
         assert_eq!(s.press, PressAction::Refresh, "an unknown choice refreshes");
@@ -488,10 +504,12 @@ mod tests {
             cpu_view: CpuView::Load15,
             direction: Direction::Combined,
             amount: Amount::Used,
+            io_view: IoView::Iops,
             press: PressAction::Dsm,
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["press"], "dsm");
+        assert_eq!(v["io_view"], "iops");
         assert_eq!(v["cpu_view"], "load15");
         assert_eq!(v["direction"], "combined");
         assert_eq!(v["amount"], "used");

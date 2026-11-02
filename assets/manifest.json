@@ -105,6 +105,16 @@
 			"Encoder": { "layout": "layouts/metric.json", "TriggerDescription": { "Rotate": "Next problem", "Push": "Refresh or open DSM", "Touch": "Refresh or open DSM" } }
 		},
 		{
+			"UUID": "com.jfms7s.synology.storageio",
+			"Name": "Storage I/O",
+			"Icon": "icons/storageio",
+			"Tooltip": "How busy the disks are right now: busy %, read and write rates or IOPS, for all disks, one disk or one volume. On a dial, rotate through the views. Press to refresh, or set a key to open DSM",
+			"Controllers": ["Keypad", "Encoder"],
+			"PropertyInspectorPath": "propertyInspector/index.html",
+			"States": [{ "Image": "icons/storageio" }],
+			"Encoder": { "layout": "layouts/metric.json", "TriggerDescription": { "Rotate": "Busy / read / write / IOPS", "Push": "Refresh or open DSM", "Touch": "Refresh or open DSM" } }
+		},
+		{
 			"UUID": "com.jfms7s.synology.update",
 			"Name": "DSM Update",
 			"Icon": "icons/update",
