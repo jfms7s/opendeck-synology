@@ -597,7 +597,7 @@ mod tests {
         assert_eq!(msg["defaults"], json!({ "warn": 50.0, "crit": 60.0 }));
         assert_eq!(
             msg["fields"],
-            json!({ "target": "Disk", "cpuView": false, "direction": false, "amount": false, "thresholdUnit": "°C" })
+            json!({ "target": "Disk", "cpuView": false, "direction": false, "amount": false, "ioView": false, "thresholdUnit": "°C" })
         );
         assert_eq!(msg["connection"]["host"], "nas.lan");
         assert_eq!(msg["notice"], "hello");

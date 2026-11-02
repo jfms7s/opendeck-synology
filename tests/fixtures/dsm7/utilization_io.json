@@ -1,0 +1,23 @@
+{
+  "cpu": { "user_load": 20, "system_load": 12, "other_load": 5, "1min_load": 42, "5min_load": 38, "15min_load": 35 },
+  "memory": { "total_real": 16777216, "avail_real": 6291456, "buffer": 1048576, "cached": 3145728, "real_usage": 37 },
+  "network": [
+    { "device": "total", "rx": 13002342, "tx": 524288 },
+    { "device": "eth0", "rx": 13002342, "tx": 524288 }
+  ],
+  "disk": {
+    "total": { "device": "total", "utilization": 45, "read_byte": 52428800, "write_byte": 10485760, "read_access": 320, "write_access": 80 },
+    "disk": [
+      { "device": "sata1", "display_name": "Drive 1", "type": "internal", "utilization": 82, "read_byte": 31457280, "write_byte": 5242880, "read_access": 200, "write_access": 40 },
+      { "device": "sata2", "display_name": "Drive 2", "type": "internal", "utilization": 8, "read_byte": 20971520, "write_byte": 5242880, "read_access": 120, "write_access": 40 },
+      { "device": "nvme0n1", "display_name": "M.2 Drive 1", "type": "internal", "utilization": "n/a", "read_byte": 0, "write_byte": 0, "read_access": 0, "write_access": 0 }
+    ]
+  },
+  "space": {
+    "total": { "device": "total", "utilization": 40, "read_byte": 52428800, "write_byte": 10485760, "read_access": 320, "write_access": 80 },
+    "volume": [
+      { "device": "dm-1", "display_name": "volume1", "utilization": 96, "read_byte": "52428800", "write_byte": "10485760", "read_access": "320", "write_access": "80" }
+    ]
+  },
+  "time": 1761955200
+}

@@ -1,4 +1,4 @@
-//! The ten actions. They differ only in which metric they show, so one
+//! The eleven actions. They differ only in which metric they show, so one
 //! generic `MetricAction` is instantiated per metric through a marker type;
 //! everything metric-specific lives in `metrics`.
 
@@ -50,7 +50,7 @@ macro_rules! kinds {
 }
 
 kinds!(
-    Cpu, Ram, Network, SysTemp, DiskTemp, DiskHealth, Volume, Pool, Health, Update
+    Cpu, Ram, Network, SysTemp, DiskTemp, DiskHealth, Volume, Pool, Health, StorageIo, Update
 );
 
 pub struct MetricAction<K> {

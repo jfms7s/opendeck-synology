@@ -9,5 +9,12 @@ Every value is made up. `update_*.json` follow the flat shape that NAS
 answered `SYNO.Core.Upgrade.Server check` with (`{"available": false}`); the
 `version` field of a pending update has not been seen from a real NAS yet.
 
+`utilization_io.json` copies the shape of a `SYNO.Core.System.Utilization get`
+reply from the same NAS: its `disk { total, disk[] }` and `space { total,
+volume[] }` blocks (`device`, `display_name`, `utilization`, `read_byte`,
+`write_byte`, `read_access`, `write_access`; a volume's `display_name` is its
+`vol_path` without the slash). One disk's `utilization` is unreadable on
+purpose, and the volume's numbers are strings, as DSM sometimes sends them.
+
 The recordings themselves stay out of git (see `.gitignore`): even redacted,
 they describe one real NAS.

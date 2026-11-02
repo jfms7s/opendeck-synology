@@ -25,12 +25,14 @@ keyring again even on an *Open DSM* key.
 | Volume | how full, as % or used of total | each volume |
 | Storage Pool | Normal / Degraded / Rebuild 43 % | each pool |
 | NAS Health | `OK` and `1 pool · 3 disks · 1 volume`, or the worst problem by name (`Failing` · `Drive 2`) | each problem (doesn't move when all is well) |
+| Storage I/O | how busy the disks are: busy %, read or write rate, or IOPS (read + write), for all disks, one disk or one volume | busy → read → write → IOPS |
 | DSM Update | up to date, or the pending version | - |
 
 Numeric actions have **warn** and **critical** thresholds (the key turns amber or red).
 The defaults are CPU 70/90 %, RAM 80/95 %, system temperature 60/70 °C, disk temperature
-50/60 °C and volume 80/90 %; network thresholds are off until you set them, in MB/s. Keys
-reading the same data share one request to the NAS, every 5 s for CPU, RAM and network,
+50/60 °C, volume 80/90 % and Storage I/O 80/95 % busy (the colour and the dial's bar follow
+busy % in every view); network thresholds are off until you set them, in MB/s. Keys
+reading the same data share one request to the NAS, every 5 s for CPU, RAM, network and Storage I/O,
 30 s for system temperature, 60 s for disks, volumes, pools and NAS Health, and 6 h for
 DSM Update; pressing a key refreshes it at once.
 
@@ -213,9 +215,12 @@ pass against a NAS with a publicly trusted one.
       a key brings the prompt back, and unlocking connects.
 - [ ] A wrong password shows *Wrong account or password* and DSM's log shows exactly one
       failed login, not one per refresh.
-- [ ] Each of the ten actions shows a sensible value on a key and on a dial; rotating each
+- [ ] Each of the eleven actions shows a sensible value on a key and on a dial; rotating each
       dial cycles as described above and the subject line shows `‹ … n/m ›`.
 - [ ] Setting a CPU warn threshold below the current load turns the key amber.
+- [ ] Storage I/O: while a large file copies to the NAS, a key on its volume shows the
+      write rate rising and busy % above idle; the rates roughly match DSM's Resource
+      Monitor › Disk / Volume (confirms the units: bytes and operations per second).
 - [ ] A key, and a dial (push and touch), set to **On press: Open DSM** opens the DSM
       login page of the saved NAS in the browser and does not refresh; a key left on
       *Refresh* still refreshes.
