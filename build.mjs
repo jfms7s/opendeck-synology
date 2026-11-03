@@ -9,18 +9,32 @@
 //   node build.mjs --require-all      fail unless every CodePaths target was built (releases)
 //   node build.mjs --tag v1.2.3       also check the release tag against the version
 //   node build.mjs --check-version    only check that Cargo.toml and manifest.json agree (CI)
+//
+// The binary name comes from Cargo.toml and each target's file name from the
+// manifest's CodePaths; every run (--check-version too) checks them against
+// each other and every action UUID against UUID, so the bundle can't disagree
+// with the manifest that launches it.
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, cpSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+// The bundle directory is <UUID>.sdPlugin; every action UUID is UUID.<name>.
 const UUID = "com.jfms7s.synology";
-const BIN_NAME = "opendeck-synology";
 
 function fail(msg) {
 	console.error(msg);
 	process.exit(1);
 }
+
+const cargoToml = readFileSync("Cargo.toml", "utf8");
+// The first `field = "..."` line: [package] comes first in Cargo.toml.
+const cargoField = (field) => {
+	const match = cargoToml.match(new RegExp(`^${field}\\s*=\\s*"([^"]+)"`, "m"));
+	if (!match) fail(`could not find \`${field} = "..."\` in Cargo.toml`);
+	return match[1];
+};
+const BIN_NAME = cargoField("name");
 
 const args = process.argv.slice(2);
 const flag = (name) => {
@@ -46,9 +60,7 @@ if (unknown) fail(`unknown option ${unknown}`);
 // Cargo.toml's [package] version and manifest.json's "Version" have nothing
 // keeping them in sync - catch drift here rather than shipping a plugin
 // whose crate version and Elgato-facing manifest version disagree.
-const cargoToml = readFileSync("Cargo.toml", "utf8");
-const cargoVersion = cargoToml.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
-if (!cargoVersion) fail('could not find `version = "..."` in Cargo.toml');
+const cargoVersion = cargoField("version");
 const manifest = JSON.parse(readFileSync("assets/manifest.json", "utf8"));
 if (cargoVersion !== manifest.Version) {
 	fail(`version mismatch: Cargo.toml is ${cargoVersion} but assets/manifest.json is ${manifest.Version} - bump them together`);
@@ -56,17 +68,26 @@ if (cargoVersion !== manifest.Version) {
 if (tag !== null && tag.replace(/^v/, "") !== cargoVersion) {
 	fail(`release tag ${tag} does not match version ${cargoVersion}`);
 }
-if (checkOnly) {
-	console.log(`version ${cargoVersion} matches in Cargo.toml and assets/manifest.json`);
-	process.exit(0);
-}
 
+for (const action of manifest.Actions ?? []) {
+	if (!action.UUID?.startsWith(`${UUID}.`)) fail(`assets/manifest.json action ${action.UUID} is not under ${UUID}`);
+}
 const codePaths = manifest.CodePaths || {};
+for (const [triple, file] of Object.entries(codePaths)) {
+	if (file !== `${BIN_NAME}-${triple}`) {
+		fail(`assets/manifest.json CodePaths[${triple}] is ${file}, expected ${BIN_NAME}-${triple}`);
+	}
+}
 for (const key of ["CodePathLin", "CodePathMac"]) {
 	if (manifest[key] && !Object.values(codePaths).includes(manifest[key])) {
 		fail(`assets/manifest.json ${key} ${manifest[key]} is not one of its CodePaths`);
 	}
 }
+if (checkOnly) {
+	console.log(`version ${cargoVersion} matches in Cargo.toml and assets/manifest.json`);
+	process.exit(0);
+}
+
 const host = execFileSync("rustc", ["-vV"], { encoding: "utf8" }).match(/^host: (\S+)/m)?.[1];
 
 // The newest release binary for a target: `--target <triple>` builds land in
