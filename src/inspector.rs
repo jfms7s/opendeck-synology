@@ -747,14 +747,19 @@ mod tests {
         assert_eq!(msg["defaults"], json!({ "warn": 50.0, "crit": 60.0 }));
         assert_eq!(
             msg["fields"],
-            json!({ "target": "Disk", "cpuView": false, "direction": false, "amount": false, "ioView": false, "thresholdUnit": "°C" })
+            json!({ "target": "Disk", "cpuView": false, "direction": false, "amount": false, "thresholdBasis": false, "ioView": false, "thresholdUnit": "°C" })
         );
         assert_eq!(msg["connection"]["host"], "nas.lan");
         assert_eq!(msg["notice"], "hello");
         let io = serde_json::to_value(Metric::StorageIo.fields()).unwrap();
         assert_eq!(
             io,
-            json!({ "target": "Disk or volume", "cpuView": false, "direction": false, "amount": false, "ioView": true, "thresholdUnit": "%" })
+            json!({ "target": "Disk or volume", "cpuView": false, "direction": false, "amount": false, "thresholdBasis": false, "ioView": true, "thresholdUnit": "%" })
+        );
+        let volume = serde_json::to_value(Metric::Volume.fields()).unwrap();
+        assert_eq!(
+            volume,
+            json!({ "target": "Volume", "cpuView": false, "direction": false, "amount": true, "thresholdBasis": true, "ioView": false, "thresholdUnit": "%" })
         );
     }
 

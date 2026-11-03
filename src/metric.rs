@@ -14,6 +14,8 @@ pub struct Fields {
     pub cpu_view: bool,
     pub direction: bool,
     pub amount: bool,
+    /// Whether the thresholds can be GB free instead of percent used.
+    pub threshold_basis: bool,
     pub io_view: bool,
     /// Unit of the warn/critical thresholds, if the metric has them.
     pub threshold_unit: Option<&'static str>,
@@ -154,6 +156,7 @@ impl Metric {
             Self::Volume => Fields {
                 target: Some("Volume"),
                 amount: true,
+                threshold_basis: true,
                 dial: Some(Axis::Target),
                 threshold_unit: Some("%"),
                 ..none

@@ -44,6 +44,17 @@ pub fn used_of_total(used: u64, total: u64) -> String {
     format!("{}/{} {}", number(u, i), number(t, i), UNITS[i])
 }
 
+/// "1.9 TB free": the free amount in its own largest unit.
+pub fn free(bytes: u64) -> String {
+    let (v, i) = scale(bytes);
+    format!("{} {} free", number(v, i), UNITS[i])
+}
+
+/// Bytes as the GB the thresholds are typed in (binary, like the labels).
+pub fn gigabytes(bytes: u64) -> f64 {
+    bytes as f64 / 1024f64.powi(3)
+}
+
 pub fn rate(bytes_per_sec: u64) -> String {
     let (v, i) = scale(bytes_per_sec);
     let n = if i == 0 || v >= 99.95 {
@@ -85,6 +96,15 @@ mod tests {
             "5.0/7.0 TB"
         );
         assert_eq!(used_of_total(512 * 1024 * 1024, 2 * TIB), "0.0/2.0 TB");
+    }
+
+    #[test]
+    fn free_space_uses_its_own_unit() {
+        assert_eq!(free(2_227_200_000_000), "2.0 TB free");
+        assert_eq!(free(10 * GIB), "10 GB free");
+        assert_eq!(free(512 * 1024 * 1024), "512 MB free");
+        assert_eq!(free(0), "0 B free");
+        assert_eq!(gigabytes(49 * GIB), 49.0);
     }
 
     #[test]

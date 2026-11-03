@@ -8,7 +8,9 @@ use crate::dsm::model::{
 use crate::format;
 use crate::metric::{Axis, Metric};
 use crate::poller::PollState;
-use crate::settings::{ActionSettings, Amount, CpuView, Direction, IoView, TempUnit};
+use crate::settings::{
+    ActionSettings, Amount, CpuView, Direction, IoView, TempUnit, ThresholdBasis,
+};
 use crate::status::ConnStatus;
 use std::cmp::Ordering;
 
@@ -74,7 +76,7 @@ const CPU_VIEWS: [CpuView; 4] = [
     CpuView::Load5,
     CpuView::Load15,
 ];
-const AMOUNTS: [Amount; 2] = [Amount::Percent, Amount::Used];
+const AMOUNTS: [Amount; 3] = [Amount::Percent, Amount::Used, Amount::Free];
 const DIRECTIONS: [Direction; 3] = [Direction::In, Direction::Out, Direction::Combined];
 const IO_VIEWS: [IoView; 4] = [IoView::Busy, IoView::Read, IoView::Write, IoView::Iops];
 
@@ -197,6 +199,18 @@ fn level_for(value: f64, (warn, crit): (Option<f64>, Option<f64>)) -> Level {
     }
 }
 
+/// The downward twin of [`level_for`], for headroom: the less is left, the
+/// worse (a free amount at or below `crit` is critical).
+fn level_below(value: f64, (warn, crit): (Option<f64>, Option<f64>)) -> Level {
+    if crit.is_some_and(|c| value <= c) {
+        Level::Crit
+    } else if warn.is_some_and(|w| value <= w) {
+        Level::Warn
+    } else {
+        Level::Normal
+    }
+}
+
 fn index_of<T: PartialEq>(list: &[T], x: &T) -> usize {
     list.iter().position(|y| y == x).unwrap_or(0)
 }
@@ -249,6 +263,7 @@ fn ram(u: &Utilization, v: &ActionSettings) -> Reading {
     let value = match v.amount {
         Amount::Percent => format::percent(m.used_pct),
         Amount::Used => format::used_of_total(m.used_bytes, m.total_bytes),
+        Amount::Free => format::free(m.total_bytes.saturating_sub(m.used_bytes)),
     };
     Reading::new(
         Metric::Ram,
@@ -505,11 +520,18 @@ fn volume(s: &Storage, v: &ActionSettings) -> Reading {
             .pager(pos, count);
     }
     let pct = vol.used_bytes as f64 / vol.total_bytes as f64 * 100.0;
+    let free = vol.total_bytes.saturating_sub(vol.used_bytes);
     let value = match v.amount {
         Amount::Percent => format::percent(pct),
         Amount::Used => format::used_of_total(vol.used_bytes, vol.total_bytes),
+        Amount::Free => format::free(free),
     };
-    let level = level_for(pct, thresholds(Metric::Volume, v)).max(state_level(&vol.status));
+    let fill = match v.threshold_basis {
+        ThresholdBasis::UsedPct => level_for(pct, thresholds(Metric::Volume, v)),
+        // No default in GB: the 80/90 defaults are percentages.
+        ThresholdBasis::FreeGb => level_below(format::gigabytes(free), (v.warn, v.crit)),
+    };
+    let level = fill.max(state_level(&vol.status));
     Reading::new(Metric::Volume, value, level)
         .subject(vol.name.clone())
         .bar(pct)
@@ -953,7 +975,7 @@ mod tests {
         let r = read_as(Metric::Ram, p(), &view());
         assert_eq!(
             (r.value.as_str(), r.subject.as_str(), r.level, r.pager),
-            ("Missing", "Used", Level::Crit, Some((0, 2)))
+            ("Missing", "Used", Level::Crit, Some((0, 3)))
         );
         assert_eq!(read_as(Metric::Cpu, p(), &view()).value, "37%");
         assert_eq!(
@@ -1091,14 +1113,101 @@ mod tests {
     }
 
     #[test]
-    fn ram_shows_percent_or_used_of_total() {
+    fn ram_shows_percent_used_of_total_or_free() {
         let r = read_as(Metric::Ram, util(), &view());
-        assert_eq!((r.value.as_str(), r.pager), ("37%", Some((0, 2))));
+        assert_eq!((r.value.as_str(), r.pager), ("37%", Some((0, 3))));
         let v = ActionSettings {
             amount: Amount::Used,
             ..view()
         };
         assert_eq!(read_as(Metric::Ram, util(), &v).value, "6.0/16 GB");
+        let v = ActionSettings {
+            amount: Amount::Free,
+            ..view()
+        };
+        let r = read_as(Metric::Ram, util(), &v);
+        assert_eq!(
+            (r.value.as_str(), r.level, r.pager),
+            ("10 GB free", Level::Normal, Some((2, 3)))
+        );
+        assert_eq!(
+            r.bar,
+            read_as(Metric::Ram, util(), &view()).bar,
+            "bar stays % used"
+        );
+    }
+
+    #[test]
+    fn headroom_alarms_downwards() {
+        let t = (Some(100.0), Some(50.0));
+        assert_eq!(level_below(49.0, t), Level::Crit);
+        assert_eq!(level_below(50.0, t), Level::Crit);
+        assert_eq!(level_below(75.0, t), Level::Warn);
+        assert_eq!(level_below(200.0, t), Level::Normal);
+        assert_eq!(level_below(0.0, (None, None)), Level::Normal);
+        assert_eq!(level_below(80.0, (Some(100.0), None)), Level::Warn);
+    }
+
+    #[test]
+    fn volume_shows_free_space_with_the_bar_still_used() {
+        let v = ActionSettings {
+            amount: Amount::Free,
+            ..view()
+        };
+        let r = read_as(Metric::Volume, storage("storage.json"), &v);
+        let pct = read_as(Metric::Volume, storage("storage.json"), &view());
+        assert_eq!(
+            (r.value.as_str(), r.subject.as_str(), r.level, r.bar),
+            ("2.0 TB free", "Volume 1", Level::Normal, pct.bar)
+        );
+    }
+
+    /// The fixture's volume has about 2074 GB free (71 % used).
+    #[test]
+    fn volume_thresholds_in_gb_free() {
+        let gb = |warn, crit| ActionSettings {
+            threshold_basis: ThresholdBasis::FreeGb,
+            warn,
+            crit,
+            ..view()
+        };
+        let level = |v: &ActionSettings| read_as(Metric::Volume, storage("storage.json"), v).level;
+        assert_eq!(level(&gb(Some(3000.0), Some(2500.0))), Level::Crit);
+        assert_eq!(level(&gb(Some(3000.0), Some(1000.0))), Level::Warn);
+        assert_eq!(level(&gb(Some(100.0), Some(50.0))), Level::Normal);
+        // The state still counts.
+        let Payload::Storage(mut s) = storage("storage.json") else {
+            unreachable!()
+        };
+        s.volumes[0].status = "degraded".into();
+        assert_eq!(
+            read_as(Metric::Volume, Payload::Storage(s), &gb(Some(100.0), None)).level,
+            Level::Crit
+        );
+    }
+
+    /// GB-free thresholds have no default: the 80/90 defaults are percent,
+    /// and a nearly full volume stays normal until a GB value is set.
+    #[test]
+    fn gb_free_thresholds_are_off_until_set_and_percent_keys_are_unchanged() {
+        let Payload::Storage(mut s) = storage("storage.json") else {
+            unreachable!()
+        };
+        s.volumes[0].used_bytes = s.volumes[0].total_bytes / 100 * 95;
+        let full = || Payload::Storage(s.clone());
+        assert_eq!(read_as(Metric::Volume, full(), &view()).level, Level::Crit);
+        let gb = ActionSettings {
+            threshold_basis: ThresholdBasis::FreeGb,
+            ..view()
+        };
+        assert_eq!(read_as(Metric::Volume, full(), &gb).level, Level::Normal);
+        // Percent keys with their own thresholds read as before (71 % used).
+        let pct = ActionSettings {
+            warn: Some(70.0),
+            ..view()
+        };
+        let r = read_as(Metric::Volume, storage("storage.json"), &pct);
+        assert_eq!((r.value.as_str(), r.level), ("71%", Level::Warn));
     }
 
     #[test]
@@ -1539,6 +1648,10 @@ mod tests {
         assert_eq!(v.direction, Direction::Out);
         rotate(Metric::Ram, &mut v, None, 1);
         assert_eq!(v.amount, Amount::Used);
+        rotate(Metric::Ram, &mut v, None, 1);
+        assert_eq!(v.amount, Amount::Free);
+        rotate(Metric::Ram, &mut v, None, 1);
+        assert_eq!(v.amount, Amount::Percent);
     }
 
     #[test]
