@@ -123,14 +123,11 @@ async fn render_loop(
                 unit,
             },
         );
-        if last.as_ref() != Some(&reading)
+        let frames = frames(last.as_ref(), &reading, is_key);
+        if frames != Frames::Nothing
             && let Some(instance) = openaction::get_instance(id.clone()).await
         {
-            // The native title only needs clearing on a first draw or an
-            // explicit redraw (appear, settings re-sent, dial turned): a
-            // steady-state change sends one frame.
-            let clear_title = last.is_none();
-            match draw(&instance, metric, &reading, is_key, clear_title).await {
+            match draw(&instance, metric, &reading, frames).await {
                 Ok(()) => last = Some(reading),
                 Err(e) => log::warn!("drawing {} failed: {e}", metric.uuid()),
             }
@@ -145,24 +142,53 @@ async fn render_loop(
     }
 }
 
+/// What a redraw sends to OpenDeck.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Frames {
+    /// The reading didn't change: ten keys don't flood OpenDeck with
+    /// identical images every 5 s.
+    Nothing,
+    /// A key's image, after clearing its native title when `clear_title`.
+    KeyImage { clear_title: bool },
+    /// A dial's touch-strip feedback.
+    DialFeedback,
+}
+
+/// Whether and what to send for `next`, given what was last drawn (`None`:
+/// nothing yet, or an explicit redraw - appear, settings re-sent, dial
+/// turned - which always draws). The native title only needs clearing then:
+/// a steady-state change is one frame.
+fn frames(last: Option<&Reading>, next: &Reading, is_key: bool) -> Frames {
+    if last == Some(next) {
+        Frames::Nothing
+    } else if is_key {
+        Frames::KeyImage {
+            clear_title: last.is_none(),
+        }
+    } else {
+        Frames::DialFeedback
+    }
+}
+
 async fn draw(
     instance: &Instance,
     metric: Metric,
     r: &Reading,
-    is_key: bool,
-    clear_title: bool,
+    frames: Frames,
 ) -> OpenActionResult<()> {
-    if is_key {
-        // The text is inside the image; clear the native title so OpenDeck
-        // doesn't paint a second copy on top.
-        if clear_title {
-            instance.set_title(Some(String::new()), None).await?;
+    match frames {
+        Frames::Nothing => Ok(()),
+        Frames::KeyImage { clear_title } => {
+            // The text is inside the image; clear the native title so
+            // OpenDeck doesn't paint a second copy on top.
+            if clear_title {
+                instance.set_title(Some(String::new()), None).await?;
+            }
+            instance
+                .set_image(Some(key::key_image(metric, r)), None)
+                .await
         }
-        instance
-            .set_image(Some(key::key_image(metric, r)), None)
-            .await
-    } else {
-        instance.set_feedback(&dial::feedback(metric, r)).await
+        Frames::DialFeedback => instance.set_feedback(&dial::feedback(metric, r)).await,
     }
 }
 
@@ -174,6 +200,28 @@ mod tests {
     use crate::services::testing::{conn, eventually, healthy_nas, services_with};
     use crate::settings::GlobalSettings;
     use std::time::Duration as StdDuration;
+
+    #[test]
+    fn only_a_changed_reading_is_sent_and_a_key_title_is_cleared_once() {
+        use crate::metrics::Level;
+        let a = Reading::new(Metric::Cpu, "37%", Level::Normal);
+        let b = Reading::new(Metric::Cpu, "38%", Level::Normal);
+        // Unchanged: nothing, key or dial.
+        assert_eq!(frames(Some(&a), &a, true), Frames::Nothing);
+        assert_eq!(frames(Some(&a), &a, false), Frames::Nothing);
+        // Changed: one frame, the title left alone.
+        assert_eq!(
+            frames(Some(&a), &b, true),
+            Frames::KeyImage { clear_title: false }
+        );
+        assert_eq!(frames(Some(&a), &b, false), Frames::DialFeedback);
+        // First draw or explicit redraw: always drawn, a key's title cleared.
+        assert_eq!(
+            frames(None, &a, true),
+            Frames::KeyImage { clear_title: true }
+        );
+        assert_eq!(frames(None, &a, false), Frames::DialFeedback);
+    }
 
     async fn connected_services() -> Arc<Services> {
         let (s, _) = services_with(healthy_nas(), Arc::new(MemoryStore::default()));

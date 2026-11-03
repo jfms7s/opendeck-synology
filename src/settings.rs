@@ -23,7 +23,7 @@ impl Default for Connection {
     fn default() -> Self {
         Self {
             host: String::new(),
-            port: 5001,
+            port: Connection::DEFAULT_PORT,
             https: true,
             account: String::new(),
             pinned_sha256: None,
@@ -32,6 +32,9 @@ impl Default for Connection {
 }
 
 impl Connection {
+    /// DSM's HTTPS port (the settings panel gets it too).
+    pub const DEFAULT_PORT: u16 = 5001;
+
     /// The bare host from whatever was typed: drops a scheme, a path and a
     /// `:port` suffix ("https://nas.lan:5001/" -> "nas.lan"). The port always
     /// comes from the separate port field.

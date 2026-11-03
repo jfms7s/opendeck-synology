@@ -150,6 +150,9 @@
 		let settings = {};
 		let pollTimer;
 		let connectionShown = false;
+		// Input rules, sent by the plugin in each state (`limits`); these
+		// fallbacks (today's values) only apply before the first state arrives.
+		let limits = { otpDigits: [6, 8], defaultPort: 5001 };
 
 		window.connectOpenActionSocketData.then(([inPort, inUUID, inRegisterEvent, _inInfo, inActionInfo]) => {
 			uuid = inUUID;
@@ -221,6 +224,8 @@
 		}
 
 		function applyState(st) {
+			if (st.limits) limits = st.limits;
+			$("port").placeholder = limits.defaultPort;
 			// Fill the connection fields once, so polling never overwrites typing.
 			if (!connectionShown) {
 				connectionShown = true;
@@ -292,7 +297,7 @@
 		}
 
 		$("save").addEventListener("click", () => {
-			const port = $("port").value.trim() === "" ? 5001 : Number($("port").value);
+			const port = $("port").value.trim() === "" ? limits.defaultPort : Number($("port").value);
 			if (!Number.isInteger(port) || port < 1 || port > 65535) {
 				// Keep what was typed (the password too) and say why.
 				$("notice").textContent = "The port must be a whole number from 1 to 65535.";
@@ -311,7 +316,8 @@
 		$("submit-otp").addEventListener("click", () => {
 			const code = $("otp").value.replace(/\s/g, "");
 			// An empty or malformed code would only count as a failed sign-in.
-			if (!/^[0-9]{6,8}$/.test(code)) {
+			const [fewest, most] = limits.otpDigits;
+			if (!/^[0-9]+$/.test(code) || code.length < fewest || code.length > most) {
 				$("notice").textContent = "Enter the 6-digit code from your authenticator app.";
 				return;
 			}
