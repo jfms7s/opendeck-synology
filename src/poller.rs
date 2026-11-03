@@ -202,6 +202,13 @@ impl<T: Send + Sync + 'static> Poller<T> {
         (!reg.subscribers.is_empty()).then_some(self.inner.default_interval)
     }
 
+    /// Whether a poll has something to call (a connection), as opposed to
+    /// idling with no session.
+    #[cfg(test)]
+    pub fn has_fetch(&self) -> bool {
+        self.inner.registry.lock().unwrap().fetch.is_some()
+    }
+
     pub fn latest(&self) -> PollState<T> {
         self.inner.tx.borrow().clone()
     }

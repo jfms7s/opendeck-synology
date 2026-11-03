@@ -1708,12 +1708,27 @@ mod tests {
             tokio::spawn(async move { s.save_connection(other, None).await })
         };
         wait_for(&s, |st| *st == ConnStatus::KeyringPending).await;
-        let before = nas.requests().iter().filter(|r| old_sid(r)).count();
-        s.poller(Endpoint::Utilization).refresh_now();
+        // The status flips just before the pollers let go of the old
+        // session, and a poll already on its way may still land: count
+        // only once they are idle and the log has settled, so a starved
+        // runtime can't move the count without a real poll in the prompt.
+        let poller = s.poller(Endpoint::Utilization);
+        eventually("the pollers left the old session", || !poller.has_fetch()).await;
+        let old_count = || nas.requests().iter().filter(|r| old_sid(r)).count();
+        let mut before = old_count();
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let now = old_count();
+            if now == before {
+                break;
+            }
+            before = now;
+        }
+        poller.refresh_now();
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let after = nas.requests().iter().filter(|r| old_sid(r)).count();
         assert_eq!(
-            after, before,
+            old_count(),
+            before,
             "the old session was polled during the prompt"
         );
         secrets.open_key(&other_pw);
