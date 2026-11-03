@@ -364,8 +364,15 @@ impl Vault {
                 continue;
             };
             if self.set(new_key, Some(v)).await.is_ok() {
-                let _ = self.set(old_key, None).await;
-                log::info!("moved the saved {which:?} to the new keyring entry name");
+                match self.set(old_key, None).await {
+                    Ok(()) => {
+                        log::info!("moved the saved {which:?} to the new keyring entry name")
+                    }
+                    Err(e) => log::warn!(
+                        "copied the saved {which:?} to the new keyring entry name, \
+                         but couldn't delete the old one: {e}"
+                    ),
+                }
             }
         }
         moved

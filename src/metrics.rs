@@ -243,7 +243,8 @@ fn network(u: &Utilization, v: &ActionSettings) -> Reading {
         Direction::Out => (nic.tx, "↑"),
         Direction::Combined => (nic.rx.saturating_add(nic.tx), "↕"),
     };
-    let mbps = bps as f64 / 1_048_576.0;
+    // The thresholds' "MB/s" are MiB/s (1 048 576 bytes), like `format::rate`.
+    let mib_per_sec = bps as f64 / 1_048_576.0;
     let subject = if device == "total" {
         "All interfaces"
     } else {
@@ -252,12 +253,12 @@ fn network(u: &Utilization, v: &ActionSettings) -> Reading {
     let r = Reading::new(
         Metric::Network,
         format!("{arrow}{}", format::rate(bps)),
-        level_for(mbps, (v.warn, v.crit)),
+        level_for(mib_per_sec, (v.warn, v.crit)),
     )
     .subject(subject)
     .pager(index_of(&DIRECTIONS, &v.direction), DIRECTIONS.len());
     match v.crit.filter(|c| *c > 0.0) {
-        Some(crit) => r.bar(mbps / crit * 100.0),
+        Some(crit) => r.bar(mib_per_sec / crit * 100.0),
         None => r,
     }
 }
