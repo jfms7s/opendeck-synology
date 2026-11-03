@@ -153,6 +153,9 @@ impl<K: MetricKind> Action for MetricAction<K> {
         _: &ActionSettings,
     ) -> OpenActionResult<()> {
         self.instances.hide(&self.services, &instance.instance_id);
+        // openaction drops a propertyInspectorDidDisappear for an instance
+        // already gone, so a key removed with its panel open stops here.
+        self.watchers.stop(&instance.instance_id);
         Ok(())
     }
 

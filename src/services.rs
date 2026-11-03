@@ -151,6 +151,12 @@ impl Services {
         self.status.borrow().clone()
     }
 
+    /// What the settings panel shows of the settings: no secrets cloned.
+    pub fn panel_settings(&self) -> (Connection, TempUnit) {
+        let g = self.global.lock().unwrap();
+        (g.connection.clone(), g.temp_unit)
+    }
+
     pub fn global(&self) -> GlobalSettings {
         self.global.lock().unwrap().clone()
     }
@@ -633,10 +639,16 @@ impl Services {
             let Ok(Payload::SystemInfo(info)) = Endpoint::SystemInfo.fetch(&session).await else {
                 return;
             };
-            if let Some(s) = this.upgrade()
-                && s.is_current(epoch)
-            {
-                s.firmware.send_replace(info.firmware);
+            // Checked under the watch's lock, which `reconnect`'s clear also
+            // takes: a lookup for an old epoch can't land after the clear.
+            if let Some(s) = this.upgrade() {
+                s.firmware.send_if_modified(|f| {
+                    let current = s.is_current(epoch);
+                    if current {
+                        *f = info.firmware;
+                    }
+                    current
+                });
             }
         });
     }

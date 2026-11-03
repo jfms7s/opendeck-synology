@@ -64,7 +64,8 @@ fn port(v: &Value) -> Option<u16> {
 }
 
 pub fn state_message(services: &Services, metric: Metric, notice: Option<&str>) -> Value {
-    let g = services.global();
+    // Not `global()`: that would clone the fallback secrets on every push.
+    let (connection, temp_unit) = services.panel_settings();
     let status = services.current_status();
     let targets: Vec<Value> = services
         .poller(metric.endpoint())
@@ -90,16 +91,16 @@ pub fn state_message(services: &Services, metric: Metric, notice: Option<&str>) 
     json!({
         "event": "state",
         "connection": {
-            "host": g.connection.host,
-            "port": g.connection.port,
-            "account": g.connection.account,
+            "host": connection.host,
+            "port": connection.port,
+            "account": connection.account,
         },
         "hasPassword": services.has_password(),
         // Where the password really is, so the panel never claims a keyring
         // it couldn't use.
         "passwordStorage": services.password_stored().map(Stored::name),
         "flatpak": in_flatpak(),
-        "tempUnit": g.temp_unit,
+        "tempUnit": temp_unit,
         "status": {
             "kind": status.kind(),
             "severity": status.severity(),
@@ -134,10 +135,17 @@ pub async fn send_state(
 /// metric's data (its target list). Builds the state on each wake-up and
 /// calls `send` only when it differs from the last one sent, so a CPU poll
 /// every 5 s doesn't resend an unchanged panel. Ends when aborted.
-pub async fn watch_panel<F, Fut>(services: Arc<Services>, metric: Metric, mut send: F)
+///
+/// Subscribes when called, not when the future first runs: a change between
+/// the panel's first state and the task starting must not be lost.
+pub fn watch_panel<F, Fut>(
+    services: Arc<Services>,
+    metric: Metric,
+    mut send: F,
+) -> impl Future<Output = ()> + Send + 'static
 where
-    F: FnMut(Value) -> Fut,
-    Fut: Future<Output = ()>,
+    F: FnMut(Value) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send,
 {
     let mut status = services.status();
     let mut display = services.display();
@@ -146,17 +154,19 @@ where
     let mut data = services.poller(metric.endpoint()).watch();
     // The panel asked for (and got) the current state when it opened.
     let mut last = Some(state_message(&services, metric, None));
-    loop {
-        tokio::select! {
-            r = status.changed() => if r.is_err() { return },
-            r = display.changed() => if r.is_err() { return },
-            r = firmware.changed() => if r.is_err() { return },
-            r = data.changed() => if r.is_err() { return },
-        }
-        let state = state_message(&services, metric, None);
-        if last.as_ref() != Some(&state) {
-            send(state.clone()).await;
-            last = Some(state);
+    async move {
+        loop {
+            tokio::select! {
+                r = status.changed() => if r.is_err() { return },
+                r = display.changed() => if r.is_err() { return },
+                r = firmware.changed() => if r.is_err() { return },
+                r = data.changed() => if r.is_err() { return },
+            }
+            let state = state_message(&services, metric, None);
+            if last.as_ref() != Some(&state) {
+                send(state.clone()).await;
+                last = Some(state);
+            }
         }
     }
 }
@@ -724,6 +734,19 @@ mod tests {
             m["status"]["firmware"] == "DSM 7.2.2-72806 Update 3"
         })
         .await;
+
+        // A new poll with nothing new for the panel pushes nothing.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        while rx.try_recv().is_ok() {}
+        let mut data = s.poller(Endpoint::Utilization).watch();
+        data.borrow_and_update();
+        s.poller(Endpoint::Utilization).refresh_now();
+        tokio::time::timeout(std::time::Duration::from_secs(5), data.changed())
+            .await
+            .expect("polled again")
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(rx.try_recv().is_err(), "an unchanged state is not resent");
 
         watcher.abort();
         assert!(watcher.await.unwrap_err().is_cancelled());
