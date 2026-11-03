@@ -83,6 +83,9 @@ redact='walk(if type == "object" then with_entries(
   then .value = "REDACTED" else . end) else . end)'
 
 apis="SYNO.API.Auth,SYNO.Core.System.Utilization,SYNO.Core.System,SYNO.Storage.CGI.Storage,SYNO.Core.Upgrade.Server"
+# Not used by the plugin yet: recorded so a planned action can be built
+# against real field names (whether the NAS offers it, its versions).
+apis+=",SYNO.Core.SecurityScan.Status"
 post query.cgi --data-urlencode "api=SYNO.API.Info" --data-urlencode "version=1" \
 	--data-urlencode "method=query" --data-urlencode "query=$apis" | jq '.data' >"$out/api_info.json"
 echo "wrote $out/api_info.json"
@@ -125,3 +128,6 @@ capture utilization SYNO.Core.System.Utilization 1 get
 capture system SYNO.Core.System 1 info
 capture storage SYNO.Storage.CGI.Storage 1 load_info
 capture update SYNO.Core.Upgrade.Server 1 check
+# Security Advisor's last scan (read only; a planned action). A non-admin
+# account may get error 105 here: the script reports it and carries on.
+capture security SYNO.Core.SecurityScan.Status 1 system_get
