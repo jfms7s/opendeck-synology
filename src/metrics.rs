@@ -37,7 +37,7 @@ pub struct Reading {
 }
 
 impl Reading {
-    fn new(metric: Metric, value: impl Into<String>, level: Level) -> Self {
+    pub(crate) fn new(metric: Metric, value: impl Into<String>, level: Level) -> Self {
         Self {
             title: metric.title(),
             value: value.into(),

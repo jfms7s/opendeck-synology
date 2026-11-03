@@ -5,8 +5,8 @@
 //!
 //! Payloads are never logged: they can carry the password.
 
-use crate::dsm::session::is_otp_code;
-use crate::metric::Metric;
+use crate::dsm::session::{OTP_MAX_DIGITS, OTP_MIN_DIGITS, is_otp_code};
+use crate::metric::{Fields, Metric};
 use crate::metrics;
 use crate::secrets::{Stored, in_flatpak};
 use crate::services::Services;
@@ -14,8 +14,8 @@ use crate::settings::{Connection, TempUnit};
 use crate::status::ConnStatus;
 use futures::FutureExt;
 use openaction::{Instance, OpenActionResult};
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -63,11 +63,77 @@ fn port(v: &Value) -> Option<u16> {
         .filter(|p| *p != 0)
 }
 
+/// The `state` message the settings panel renders. The JSON shape is the
+/// panel's contract (`assets/propertyInspector/index.html`).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StateMessage<'a> {
+    event: &'static str,
+    connection: PanelConnection,
+    has_password: bool,
+    /// Where the password really is, so the panel never claims a keyring
+    /// it couldn't use (`Stored::name`).
+    password_storage: Option<&'static str>,
+    flatpak: bool,
+    temp_unit: TempUnit,
+    status: PanelStatus,
+    notice: Option<&'a str>,
+    fields: Fields,
+    targets: Vec<PanelTarget>,
+    defaults: PanelDefaults,
+    limits: PanelLimits,
+}
+
+#[derive(Serialize)]
+struct PanelConnection {
+    host: String,
+    port: u16,
+    account: String,
+}
+
+#[derive(Serialize)]
+struct PanelStatus {
+    /// `ConnStatus::kind`; the panel switches on some of these.
+    kind: &'static str,
+    severity: &'static str,
+    text: String,
+    fingerprint: Option<String>,
+    changed: bool,
+    firmware: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PanelTarget {
+    id: Option<String>,
+    label: String,
+}
+
+#[derive(Serialize)]
+struct PanelDefaults {
+    warn: Option<f64>,
+    crit: Option<f64>,
+}
+
+/// The rules the panel checks input against before sending it, from the
+/// same constants the plugin checks with.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PanelLimits {
+    /// [fewest, most] digits of a 2FA code (`is_otp_code`).
+    otp_digits: [usize; 2],
+    /// The port an empty port field means.
+    default_port: u16,
+}
+
 pub fn state_message(services: &Services, metric: Metric, notice: Option<&str>) -> Value {
+    serde_json::to_value(state(services, metric, notice)).expect("the state message serialises")
+}
+
+fn state<'a>(services: &Services, metric: Metric, notice: Option<&'a str>) -> StateMessage<'a> {
     // Not `global()`: that would clone the fallback secrets on every push.
     let (connection, temp_unit) = services.panel_settings();
     let status = services.current_status();
-    let targets: Vec<Value> = services
+    let targets = services
         .poller(metric.endpoint())
         .latest()
         .value
@@ -75,7 +141,7 @@ pub fn state_message(services: &Services, metric: Metric, notice: Option<&str>) 
         .map(|p| metrics::target_options(metric, p))
         .unwrap_or_default()
         .into_iter()
-        .map(|(id, label)| json!({ "id": id, "label": label }))
+        .map(|(id, label)| PanelTarget { id, label })
         .collect();
     let (fingerprint, changed) = match &status {
         ConnStatus::Certificate {
@@ -88,35 +154,37 @@ pub fn state_message(services: &Services, metric: Metric, notice: Option<&str>) 
         .then(|| services.firmware())
         .flatten();
     let defaults = metric.default_thresholds();
-    json!({
-        "event": "state",
-        "connection": {
-            "host": connection.host,
-            "port": connection.port,
-            "account": connection.account,
+    StateMessage {
+        event: "state",
+        connection: PanelConnection {
+            host: connection.host,
+            port: connection.port,
+            account: connection.account,
         },
-        "hasPassword": services.has_password(),
-        // Where the password really is, so the panel never claims a keyring
-        // it couldn't use.
-        "passwordStorage": services.password_stored().map(Stored::name),
-        "flatpak": in_flatpak(),
-        "tempUnit": temp_unit,
-        "status": {
-            "kind": status.kind(),
-            "severity": status.severity(),
-            "text": status.describe(),
-            "fingerprint": fingerprint,
-            "changed": changed,
-            "firmware": firmware,
+        has_password: services.has_password(),
+        password_storage: services.password_stored().map(Stored::name),
+        flatpak: in_flatpak(),
+        temp_unit,
+        status: PanelStatus {
+            kind: status.kind(),
+            severity: status.severity(),
+            text: status.describe(),
+            fingerprint,
+            changed,
+            firmware,
         },
-        "notice": notice,
-        "fields": metric.fields(),
-        "targets": targets,
-        "defaults": {
-            "warn": defaults.map(|d| d.0),
-            "crit": defaults.map(|d| d.1),
+        notice,
+        fields: metric.fields(),
+        targets,
+        defaults: PanelDefaults {
+            warn: defaults.map(|d| d.0),
+            crit: defaults.map(|d| d.1),
         },
-    })
+        limits: PanelLimits {
+            otp_digits: [OTP_MIN_DIGITS, OTP_MAX_DIGITS],
+            default_port: Connection::DEFAULT_PORT,
+        },
+    }
 }
 
 pub async fn send_state(
@@ -364,6 +432,7 @@ mod tests {
     use crate::secrets::MemoryStore;
     use crate::services::testing::{eventually, healthy_nas, services_with};
     use crate::settings::GlobalSettings;
+    use serde_json::json;
 
     fn req(v: Value) -> Request {
         serde_json::from_value(v).unwrap()
@@ -687,6 +756,48 @@ mod tests {
             io,
             json!({ "target": "Disk or volume", "cpuView": false, "direction": false, "amount": false, "ioView": true, "thresholdUnit": "%" })
         );
+    }
+
+    /// The panel switches on these values as string literals; renaming one
+    /// in Rust must fail here, not silently hide the 2FA or certificate box.
+    #[test]
+    fn the_panel_knows_every_status_kind_and_storage_name_it_switches_on() {
+        use crate::dsm::error::AuthError;
+        const PANEL: &str = include_str!("../assets/propertyInspector/index.html");
+        let kinds = [
+            ConnStatus::Auth(AuthError::NeedOtp),
+            ConnStatus::Certificate {
+                fingerprint: String::new(),
+                changed: false,
+            },
+            ConnStatus::Keyring(String::new()),
+            ConnStatus::KeyringRefused(String::new()),
+        ]
+        .map(|s| s.kind());
+        let storage = [Stored::Keyring, Stored::SettingsFile, Stored::Memory].map(Stored::name);
+        for kind in kinds {
+            assert!(
+                PANEL.contains(&format!("\"{kind}\"")),
+                "the panel lacks {kind:?}"
+            );
+        }
+        for name in storage {
+            assert!(
+                PANEL.contains(&format!("\"{name}\"")) || PANEL.contains(&format!("{name}: ")),
+                "the panel lacks {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_state_carries_the_input_limits() {
+        let (s, _) = services_with(healthy_nas(), Arc::new(MemoryStore::default()));
+        let msg = state_message(&s, Metric::Cpu, None);
+        assert_eq!(
+            msg["limits"],
+            json!({ "otpDigits": [6, 8], "defaultPort": 5001 })
+        );
+        assert!(is_otp_code("123456") && is_otp_code("12345678") && !is_otp_code("1234567890"));
     }
 
     /// An open panel is pushed the status and the DSM version as they

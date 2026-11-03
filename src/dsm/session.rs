@@ -328,9 +328,14 @@ impl Session {
     }
 }
 
+/// How many digits a TOTP code has (the settings panel gets these too).
+pub const OTP_MIN_DIGITS: usize = 6;
+pub const OTP_MAX_DIGITS: usize = 8;
+
 /// What a TOTP code can look like once whitespace is gone: 6-8 digits.
 pub fn is_otp_code(code: &str) -> bool {
-    (6..=8).contains(&code.len()) && code.chars().all(|c| c.is_ascii_digit())
+    (OTP_MIN_DIGITS..=OTP_MAX_DIGITS).contains(&code.len())
+        && code.chars().all(|c| c.is_ascii_digit())
 }
 
 #[cfg(test)]
