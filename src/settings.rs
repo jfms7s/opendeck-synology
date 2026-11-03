@@ -235,6 +235,19 @@ pub enum Amount {
     #[default]
     Percent,
     Used,
+    /// Free space or memory (`1.9 TB free`).
+    Free,
+}
+
+/// What a Volume key's warn/critical thresholds measure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThresholdBasis {
+    /// Percent used, alarming upwards (80/90 % by default).
+    #[default]
+    UsedPct,
+    /// GB free, alarming downwards; off until the user sets a value.
+    FreeGb,
 }
 
 /// What a Storage I/O key shows.
@@ -279,6 +292,7 @@ pub struct ActionSettings {
     pub cpu_view: CpuView,
     pub direction: Direction,
     pub amount: Amount,
+    pub threshold_basis: ThresholdBasis,
     pub io_view: IoView,
     pub press: PressAction,
 }
@@ -302,6 +316,7 @@ impl ActionSettings {
             cpu_view: field(v, "cpu_view", &mut bad),
             direction: field(v, "direction", &mut bad),
             amount: field(v, "amount", &mut bad),
+            threshold_basis: field(v, "threshold_basis", &mut bad),
             io_view: field(v, "io_view", &mut bad),
             press: field(v, "press", &mut bad),
         };
@@ -507,10 +522,12 @@ mod tests {
             cpu_view: CpuView::Load15,
             direction: Direction::Combined,
             amount: Amount::Used,
+            threshold_basis: ThresholdBasis::FreeGb,
             io_view: IoView::Iops,
             press: PressAction::Dsm,
         };
         let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["threshold_basis"], "free_gb");
         assert_eq!(v["press"], "dsm");
         assert_eq!(v["io_view"], "iops");
         assert_eq!(v["cpu_view"], "load15");
@@ -598,5 +615,31 @@ mod tests {
             (CpuView::Load5, Direction::Combined, Amount::Used)
         );
         assert_eq!(ActionSettings::default().cpu_view, CpuView::Total);
+        let s: ActionSettings =
+            serde_json::from_value(json!({ "amount": "free", "threshold_basis": "free_gb" }))
+                .unwrap();
+        assert_eq!(
+            (s.amount, s.threshold_basis),
+            (Amount::Free, ThresholdBasis::FreeGb)
+        );
+    }
+
+    /// A key saved before headroom existed reads exactly as it did: no new
+    /// field is dropped as unreadable and the basis stays percent used.
+    #[test]
+    fn a_key_saved_before_headroom_reads_as_before() {
+        let saved = json!({ "amount": "used", "warn": 85, "crit": null, "target": "volume_1" });
+        let (s, bad) = ActionSettings::from_value_lenient(&saved);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(
+            s,
+            ActionSettings {
+                warn: Some(85.0),
+                amount: Amount::Used,
+                target: Some("volume_1".into()),
+                ..ActionSettings::default()
+            }
+        );
+        assert_eq!(s.threshold_basis, ThresholdBasis::UsedPct);
     }
 }

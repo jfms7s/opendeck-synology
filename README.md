@@ -17,12 +17,12 @@ keyring again even on an *Open DSM* key.
 | Action | Shows | Turning the dial |
 |---|---|---|
 | CPU | usage % | usage → 1 / 5 / 15 min load average |
-| RAM | memory in use | percent → used of total |
+| RAM | memory in use, as %, used of total or free | percent → used of total → free |
 | Network | throughput of all interfaces or one | in → out → combined |
 | System Temperature | the NAS's system sensor | - |
 | Disk Temperature | one disk, or the hottest | each disk → hottest |
 | Disk Health | S.M.A.R.T. OK / Warning / Failing, one disk or the worst | each disk → worst |
-| Volume | how full, as % or used of total | each volume |
+| Volume | how full, as %, used of total or free space (`2.0 TB free`) | each volume |
 | Storage Pool | Normal / Degraded / Rebuild 43 % | each pool |
 | NAS Health | `OK` and `1 pool · 3 disks · 1 volume`, or the worst problem by name (`Failing` · `Drive 2`) | each problem (doesn't move when all is well) |
 | Storage I/O | how busy the disks are: busy %, read or write rate, or IOPS (read + write), for all disks, one disk or one volume | busy → read → write → IOPS |
@@ -31,7 +31,11 @@ keyring again even on an *Open DSM* key.
 Numeric actions have **warn** and **critical** thresholds (the key turns amber or red).
 The defaults are CPU 70/90 %, RAM 80/95 %, system temperature 60/70 °C, disk temperature
 50/60 °C, volume 80/90 % and Storage I/O 80/95 % busy (the colour and the dial's bar follow
-busy % in every view); network thresholds are off until you set them, in MB/s. Keys
+busy % in every view); network thresholds are off until you set them, in MB/s. In the
+*Free* view the bar still shows % used. A Volume key can instead alarm on **GB free**
+(*Thresholds: GB free*): it turns amber or red when free space drops to the warn or
+critical value, and these thresholds are off until you set them (switching between
+% and GB clears the values typed for the other). Keys
 reading the same data share one request to the NAS, every 5 s for CPU, RAM, network and Storage I/O,
 30 s for system temperature, 60 s for disks, volumes, pools and NAS Health, and 6 h for
 DSM Update; pressing a key refreshes it at once.
@@ -218,6 +222,9 @@ pass against a NAS with a publicly trusted one.
 - [ ] Each of the eleven actions shows a sensible value on a key and on a dial; rotating each
       dial cycles as described above and the subject line shows `‹ … n/m ›`.
 - [ ] Setting a CPU warn threshold below the current load turns the key amber.
+- [ ] A Volume key set to *Show as: Free* shows the same free space as DSM's Storage
+      Manager; with *Thresholds: GB free* and a warn value above that free space it turns
+      amber, and the panel's labels read *Warn below (GB free)*.
 - [ ] Storage I/O: while a large file copies to the NAS, a key on its volume shows the
       write rate rising and busy % above idle; the rates roughly match DSM's Resource
       Monitor › Disk / Volume (confirms the units: bytes and operations per second).

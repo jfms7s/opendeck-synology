@@ -113,6 +113,14 @@
 				<select id="amount">
 					<option value="percent">Percent</option>
 					<option value="used">Used of total</option>
+					<option value="free">Free</option>
+				</select>
+			</div>
+			<div id="basis-field" class="field hidden">
+				<label for="threshold_basis">Thresholds</label>
+				<select id="threshold_basis">
+					<option value="used_pct">Percent used</option>
+					<option value="free_gb">GB free (alarm below)</option>
 				</select>
 			</div>
 			<div class="field">
@@ -153,6 +161,9 @@
 		// Input rules, sent by the plugin in each state (`limits`); these
 		// fallbacks (today's values) only apply before the first state arrives.
 		let limits = { otpDigits: [6, 8], defaultPort: 5001 };
+		// The current key's panel fields and default thresholds, from the plugin.
+		let currentFields = {};
+		let defaults = {};
 
 		window.connectOpenActionSocketData.then(([inPort, inUUID, inRegisterEvent, _inInfo, inActionInfo]) => {
 			uuid = inUUID;
@@ -188,9 +199,22 @@
 			$("direction-field").classList.toggle("hidden", !fields.direction);
 			$("amount-field").classList.toggle("hidden", !fields.amount);
 			$("io-field").classList.toggle("hidden", !fields.ioView);
+			$("basis-field").classList.toggle("hidden", !fields.thresholdBasis);
 			$("threshold-field").classList.toggle("hidden", !fields.thresholdUnit);
-			$("warn-label").textContent = `Warn at (${fields.thresholdUnit || ""})`;
-			$("crit-label").textContent = `Critical at (${fields.thresholdUnit || ""})`;
+			currentFields = fields;
+			applyThresholdLabels();
+		}
+
+		// A Volume key may alarm on GB free instead of percent used: then the
+		// thresholds count downwards and have no default.
+		function applyThresholdLabels() {
+			const free = currentFields.thresholdBasis && $("threshold_basis").value === "free_gb";
+			const unit = free ? "GB free" : currentFields.thresholdUnit || "";
+			const verb = free ? "below" : "at";
+			$("warn-label").textContent = `Warn ${verb} (${unit})`;
+			$("crit-label").textContent = `Critical ${verb} (${unit})`;
+			$("warn").placeholder = free ? "" : defaults.warn ?? "";
+			$("crit").placeholder = free ? "" : defaults.crit ?? "";
 		}
 
 		function toPlugin(payload) {
@@ -213,6 +237,11 @@
 			$("cpu_view").value = s.cpu_view || "total";
 			$("direction").value = s.direction || "in";
 			$("amount").value = s.amount || "percent";
+			// A choice this version doesn't know acts as the default: show it so.
+			if (!$("amount").value) $("amount").value = "percent";
+			$("threshold_basis").value = s.threshold_basis || "used_pct";
+			if (!$("threshold_basis").value) $("threshold_basis").value = "used_pct";
+			applyThresholdLabels();
 			$("io_view").value = s.io_view || "busy";
 			if (!$("io_view").value) $("io_view").value = "busy";
 			$("press").value = s.press || "refresh";
@@ -270,8 +299,8 @@
 			$("trust").textContent = st.status.changed ? "Trust the new certificate anyway" : "Trust this certificate";
 			$("fingerprint").textContent = st.status.fingerprint || "";
 
-			$("warn").placeholder = st.defaults.warn ?? "";
-			$("crit").placeholder = st.defaults.crit ?? "";
+			defaults = st.defaults || {};
+			applyThresholdLabels();
 			fillTargets(st.targets);
 		}
 
@@ -336,6 +365,17 @@
 
 		$("target").addEventListener("change", () => {
 			settings.target = $("target").value || null;
+			sendSettings();
+		});
+		// A percentage is no GB amount: switching the basis starts the
+		// thresholds afresh (percent falls back to its defaults).
+		$("threshold_basis").addEventListener("change", () => {
+			settings.threshold_basis = $("threshold_basis").value;
+			settings.warn = null;
+			settings.crit = null;
+			$("warn").value = "";
+			$("crit").value = "";
+			applyThresholdLabels();
 			sendSettings();
 		});
 		for (const id of ["cpu_view", "direction", "amount", "io_view", "press"]) {
