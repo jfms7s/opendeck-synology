@@ -161,9 +161,10 @@
 				websocket.send(JSON.stringify({ event: inRegisterEvent, uuid: inUUID }));
 				applySettings(actionInfo.payload.settings || {});
 				toPlugin({ event: "getState" });
-				// The status changes on its own (a login finishing, the NAS
-				// going offline), so keep asking while the panel is open.
-				pollTimer = setInterval(() => toPlugin({ event: "getState" }), 2000);
+				// The plugin pushes a new state whenever something shown here
+				// changes (a login finishing, the NAS going offline, the DSM
+				// version arriving); this slow poll is only a safety net.
+				pollTimer = setInterval(() => toPlugin({ event: "getState" }), 15000);
 			};
 			websocket.onclose = () => clearInterval(pollTimer);
 			websocket.onmessage = (event) => {
@@ -251,7 +252,7 @@
 							: st.status.kind === "keyring"
 								? "The system keyring can't be reached right now; the plugin tries again a few times. Start or unlock it - or, if this computer has no keyring, type the password again to store it in OpenDeck's settings file instead." + flatpakHint
 								: "";
-			// A notice answers one request; the 2 s refreshes don't clear it.
+			// A notice answers one request; pushed states and the safety poll don't clear it.
 			if (st.notice) $("notice").textContent = st.notice;
 
 			const kind = st.status.kind;

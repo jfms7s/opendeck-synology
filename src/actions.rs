@@ -2,7 +2,7 @@
 //! generic `MetricAction` is instantiated per metric through a marker type;
 //! everything metric-specific lives in `metrics`.
 
-use crate::inspector::{self, PanelInbox};
+use crate::inspector::{self, PanelInbox, PanelWatchers};
 use crate::instances::Instances;
 use crate::metric::Metric;
 use crate::services::Services;
@@ -57,6 +57,8 @@ pub struct MetricAction<K> {
     services: Arc<Services>,
     instances: Arc<Instances>,
     panel: PanelInbox,
+    /// Pushes state to this action's open settings panels.
+    watchers: PanelWatchers,
     _kind: PhantomData<fn() -> K>,
 }
 
@@ -66,6 +68,7 @@ impl<K: MetricKind> MetricAction<K> {
             services,
             instances,
             panel,
+            watchers: PanelWatchers::default(),
             _kind: PhantomData,
         }
     }
@@ -150,6 +153,9 @@ impl<K: MetricKind> Action for MetricAction<K> {
         _: &ActionSettings,
     ) -> OpenActionResult<()> {
         self.instances.hide(&self.services, &instance.instance_id);
+        // openaction drops a propertyInspectorDidDisappear for an instance
+        // already gone, so a key removed with its panel open stops here.
+        self.watchers.stop(&instance.instance_id);
         Ok(())
     }
 
@@ -191,7 +197,18 @@ impl<K: MetricKind> Action for MetricAction<K> {
         instance: &Instance,
         _: &ActionSettings,
     ) -> OpenActionResult<()> {
+        self.watchers
+            .start(&self.services, K::METRIC, &instance.instance_id);
         inspector::send_state(&self.services, K::METRIC, instance, None).await
+    }
+
+    async fn property_inspector_did_disappear(
+        &self,
+        instance: &Instance,
+        _: &ActionSettings,
+    ) -> OpenActionResult<()> {
+        self.watchers.stop(&instance.instance_id);
+        Ok(())
     }
 
     async fn send_to_plugin(

@@ -128,6 +128,13 @@ impl<T: Send + Sync + 'static> Poller<T> {
         rx
     }
 
+    /// A receiver of every result, without subscribing: it neither starts
+    /// the poll loop nor changes the interval (the settings panel watches
+    /// the data the keys already poll).
+    pub fn watch(&self) -> watch::Receiver<PollState<T>> {
+        self.inner.tx.subscribe()
+    }
+
     pub fn unsubscribe(&self, id: &str) {
         let running = {
             let mut reg = self.inner.registry.lock().unwrap();
