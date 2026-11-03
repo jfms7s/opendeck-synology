@@ -339,8 +339,8 @@ impl Services {
                 if !matches!(e, DsmError::Auth(_)) {
                     // The session still wants a code; let the (paused)
                     // pollers report that, so the 2FA box comes back.
-                    for e in Endpoint::ALL {
-                        self.poller(e).refresh_now();
+                    for endpoint in Endpoint::ALL {
+                        self.poller(endpoint).refresh_now();
                     }
                 }
             }

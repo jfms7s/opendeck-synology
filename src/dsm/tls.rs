@@ -91,9 +91,18 @@ impl PinningVerifier {
         let roots = if roots.is_empty() {
             None
         } else {
-            WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+            match WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
                 .build()
-                .ok()
+            {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    log::warn!(
+                        "can't build the CA certificate verifier: {e}; \
+                         only a pinned certificate will be accepted"
+                    );
+                    None
+                }
+            }
         };
         Self {
             roots,
