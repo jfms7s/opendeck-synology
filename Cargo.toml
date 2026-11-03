@@ -41,3 +41,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc
 lto = true
 codegen-units = 1
 strip = true
+# Size over speed: 8 935 696 -> 5 815 320 bytes (-35 %) for the Linux x86_64
+# build, measured 2026-11-03; the plugin's work is a few HTTP polls a minute.
+# No `panic = "abort"`: a panic in a spawned render task or a poller fetch
+# must stay contained (the poller's `Running` guard relies on unwinding).
+opt-level = "s"
