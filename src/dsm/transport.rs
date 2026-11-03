@@ -44,7 +44,10 @@ impl HttpTransport {
         let mut builder = reqwest::Client::builder()
             .timeout(TIMEOUT)
             .no_proxy()
-            .redirect(reqwest::redirect::Policy::none());
+            .redirect(reqwest::redirect::Policy::none())
+            // The pollers take turns on one NAS: one idle connection is
+            // enough, and the NAS isn't left holding a socket per endpoint.
+            .pool_max_idle_per_host(1);
         if target.https {
             let v = Arc::new(PinningVerifier::with_system_roots(
                 target.pinned_sha256.clone(),

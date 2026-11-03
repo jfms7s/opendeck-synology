@@ -144,6 +144,10 @@ pub struct Vault {
     memory_did: Mutex<Option<(String, String)>>,
     /// (scope, password) when the keyring refused it.
     memory_password: Mutex<Option<(String, String)>>,
+    /// Scopes whose pre-0.3 keyring entries `migrate` has settled this run
+    /// (moved, or found nothing to move): not looked up again on every
+    /// connect, since each keyring read may be a macOS prompt.
+    legacy_checked: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Vault {
@@ -152,6 +156,7 @@ impl Vault {
             store,
             memory_did: Mutex::new(None),
             memory_password: Mutex::new(None),
+            legacy_checked: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -348,22 +353,40 @@ impl Vault {
                 });
             }
         }
-        if !g.connection.https {
+        if !g.connection.https || self.legacy_checked.lock().unwrap().contains(&scope) {
             return moved;
         }
         let legacy = g.connection.legacy_secret_scope();
+        // Only a lookup that got an answer for both secrets is settled; an
+        // unreadable keyring is asked again on the next connect.
+        let mut settled = true;
         for which in [Secret::Password, Secret::Did] {
             let (new_key, old_key) = (which.key(&scope), which.key(&legacy));
-            // A memory copy replaced whatever the old entry holds.
-            if self.in_memory(which, &scope).is_some()
-                || self.get(new_key.clone()).await != Ok(None)
-            {
+            // A memory copy replaced whatever the old entry holds (for this
+            // run only: not settled).
+            if self.in_memory(which, &scope).is_some() {
+                settled = false;
                 continue;
             }
-            let Ok(Some(v)) = self.get(old_key.clone()).await else {
-                continue;
+            match self.get(new_key.clone()).await {
+                Ok(None) => {}
+                Ok(Some(_)) => continue,
+                Err(_) => {
+                    settled = false;
+                    continue;
+                }
+            }
+            let v = match self.get(old_key.clone()).await {
+                Ok(Some(v)) => v,
+                Ok(None) => continue,
+                Err(_) => {
+                    settled = false;
+                    continue;
+                }
             };
-            if self.set(new_key, Some(v)).await.is_ok() {
+            if self.set(new_key, Some(v)).await.is_err() {
+                settled = false;
+            } else {
                 match self.set(old_key, None).await {
                     Ok(()) => {
                         log::info!("moved the saved {which:?} to the new keyring entry name")
@@ -374,6 +397,9 @@ impl Vault {
                     ),
                 }
             }
+        }
+        if settled {
+            self.legacy_checked.lock().unwrap().insert(scope);
         }
         moved
     }

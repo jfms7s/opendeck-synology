@@ -287,6 +287,13 @@ async fn run<T: Send + Sync + 'static>(inner: Arc<Inner<T>>) {
         if reg.generation != generation {
             continue; // the connection changed mid-request; discard
         }
+        // A press while this request was in flight is answered by it, if it
+        // succeeded: don't poll again right away. A press during a failed or
+        // discarded request keeps its `force`, so it retries at once instead
+        // of waiting out the backoff.
+        if result.is_ok() {
+            reg.force = false;
+        }
         if result.is_ok() {
             reg.last_ok = Some(Instant::now());
         }
@@ -359,6 +366,73 @@ mod tests {
         // No extra poll for the new subscriber (the data is fresh): at 10
         // and 20 s.
         assert_eq!(n.load(SeqCst), 3);
+    }
+
+    /// A press while a request is in flight is answered by that request:
+    /// it doesn't poll again right after.
+    #[tokio::test(start_paused = true)]
+    async fn a_press_during_a_request_does_not_poll_twice() {
+        let p = Poller::new(S(60));
+        let n = Arc::new(AtomicU32::new(0));
+        let gate = Arc::new(Notify::new());
+        let fetch: Fetch<u32> = {
+            let (n, gate) = (n.clone(), gate.clone());
+            Arc::new(move || {
+                let (n, gate) = (n.clone(), gate.clone());
+                Box::pin(async move {
+                    let k = n.fetch_add(1, SeqCst) + 1;
+                    gate.notified().await;
+                    Ok(k)
+                })
+            })
+        };
+        p.set_fetch(Some(fetch));
+        let _a = p.subscribe("a");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(n.load(SeqCst), 1, "the first request is in flight");
+        p.refresh_now();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        gate.notify_one();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            n.load(SeqCst),
+            1,
+            "the in-flight request answered the press"
+        );
+        // A press after it lands still polls.
+        p.refresh_now();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(n.load(SeqCst), 2);
+        gate.notify_one();
+    }
+
+    /// A press during a request that fails still retries at once, not
+    /// after the error backoff.
+    #[tokio::test(start_paused = true)]
+    async fn a_press_during_a_failing_request_retries_at_once() {
+        let p = Poller::new(S(60));
+        let n = Arc::new(AtomicU32::new(0));
+        let gate = Arc::new(Notify::new());
+        let fetch: Fetch<u32> = {
+            let (n, gate) = (n.clone(), gate.clone());
+            Arc::new(move || {
+                let (n, gate) = (n.clone(), gate.clone());
+                Box::pin(async move {
+                    n.fetch_add(1, SeqCst);
+                    gate.notified().await;
+                    Err(DsmError::Transport("down".into()))
+                })
+            })
+        };
+        p.set_fetch(Some(fetch));
+        let _a = p.subscribe("a");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        p.refresh_now();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        gate.notify_one();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(n.load(SeqCst), 2, "the press retried after the failure");
+        gate.notify_one();
     }
 
     #[tokio::test(start_paused = true)]

@@ -32,6 +32,13 @@ const KEYRING_RETRY: Duration = if cfg!(test) {
 /// Retries before waiting for the user (each read may show an unlock prompt).
 const KEYRING_RETRIES: u32 = 5;
 /// A keyring call taking longer than this is taken to wait on a prompt.
+/// How long after a DSM version lookup that never reached DSM the next
+/// poll may try again: at most one extra request per minute.
+const FIRMWARE_RETRY: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(60)
+};
 const KEYRING_PATIENCE: Duration = if cfg!(test) {
     Duration::from_millis(50)
 } else {
@@ -608,6 +615,15 @@ impl Services {
                 None => return,
             },
         };
+        // The SystemInfo poller's own answer carries the DSM version: no
+        // separate request for it.
+        // (A poll without a version doesn't overwrite a known one.)
+        if let Ok(Payload::SystemInfo(info)) = result
+            && info.firmware.is_some()
+        {
+            self.firmware_epoch.store(epoch, SeqCst);
+            self.set_firmware(epoch, info.firmware.clone());
+        }
         if matches!(next, ConnStatus::Connected { .. }) {
             self.look_up_firmware(epoch, session);
         }
@@ -629,27 +645,43 @@ impl Services {
     }
 
     /// The DSM version belongs to the connection, not to whichever keys are
-    /// on screen: look it up once per connection.
+    /// on screen: look it up once per connection, unless a SystemInfo poll
+    /// already brought it (`observe`). A lookup that didn't reach DSM may be
+    /// tried again by a poll result `FIRMWARE_RETRY` later; one DSM answered
+    /// (no permission, an API error) is not, so it can't cost a request per
+    /// poll.
     fn look_up_firmware(self: &Arc<Self>, epoch: u64, session: &Arc<Session>) {
         if self.firmware_epoch.swap(epoch, SeqCst) == epoch {
             return;
         }
         let (this, session) = (Arc::downgrade(self), session.clone());
         tokio::spawn(async move {
-            let Ok(Payload::SystemInfo(info)) = Endpoint::SystemInfo.fetch(&session).await else {
-                return;
-            };
-            // Checked under the watch's lock, which `reconnect`'s clear also
-            // takes: a lookup for an old epoch can't land after the clear.
-            if let Some(s) = this.upgrade() {
-                s.firmware.send_if_modified(|f| {
-                    let current = s.is_current(epoch);
-                    if current {
-                        *f = info.firmware;
+            let result = Endpoint::SystemInfo.fetch(&session).await;
+            let Some(s) = this.upgrade() else { return };
+            match result {
+                Ok(Payload::SystemInfo(info)) => s.set_firmware(epoch, info.firmware),
+                Err(e) if !endpoint_answered(&e) => {
+                    drop(s);
+                    tokio::time::sleep(FIRMWARE_RETRY).await;
+                    if let Some(s) = this.upgrade() {
+                        // Only if this connection is still the one marked.
+                        let _ = s.firmware_epoch.compare_exchange(epoch, 0, SeqCst, SeqCst);
                     }
-                    current
-                });
+                }
+                _ => {}
             }
+        });
+    }
+
+    /// Checked under the watch's lock, which `reconnect`'s clear also takes:
+    /// a version for an old epoch can't land after the clear.
+    fn set_firmware(&self, epoch: u64, firmware: Option<String>) {
+        self.firmware.send_if_modified(|f| {
+            let changed = self.is_current(epoch) && *f != firmware;
+            if changed {
+                *f = firmware;
+            }
+            changed
         });
     }
 
@@ -1349,6 +1381,34 @@ mod tests {
         assert_eq!(nas.count("login"), 1, "no 2FA code needed");
     }
 
+    /// The legacy-entry lookup runs once per scope and run: a second
+    /// connect to the same NAS reads only the entries it uses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_legacy_keyring_lookup_runs_once_per_connection_scope() {
+        let secrets = Arc::new(MemoryStore::default());
+        secrets.set("jf@nas.lan/password", Some("pw")).unwrap();
+        let (pw, legacy_pw) = (password_key(&scope()), "jf@nas.lan/password");
+        let (s, _) = services_with(healthy_nas(), secrets.clone());
+        s.load_global(GlobalSettings {
+            connection: conn(),
+            ..GlobalSettings::default()
+        })
+        .await;
+        assert_eq!(secrets.get(&pw).unwrap().as_deref(), Some("pw"), "moved");
+        let (pw_reads, legacy_reads) = (secrets.reads_of(&pw), secrets.reads_of(legacy_pw));
+        s.save_connection(conn(), None).await;
+        assert_eq!(
+            secrets.reads_of(legacy_pw),
+            legacy_reads,
+            "no legacy lookup"
+        );
+        assert_eq!(
+            secrets.reads_of(&pw),
+            pw_reads + 1,
+            "only the connect's own read"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn secrets_from_before_v0_3_are_never_sent_over_plain_http() {
         let secrets = Arc::new(MemoryStore::default());
@@ -1731,10 +1791,9 @@ mod tests {
         let before = secrets.reads_of(&pw);
         s.save_connection(conn(), None).await;
         tokio::time::sleep(PAST_THE_SCHEDULE).await;
-        assert_eq!(
-            secrets.reads_of(&pw) - before,
-            PW_READS_PER_ATTEMPT * (1 + KEYRING_RETRIES as usize)
-        );
+        // One read per attempt now: the first connect settled `migrate`'s
+        // legacy lookup for this scope.
+        assert_eq!(secrets.reads_of(&pw) - before, 1 + KEYRING_RETRIES as usize);
     }
 
     /// Mutant V: the old session is logged out only once `connect` has
@@ -2499,6 +2558,83 @@ mod tests {
             }
             r
         }
+    }
+
+    /// With a System key on screen, its own poll brings the DSM version:
+    /// no separate `info` request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_system_key_poll_brings_the_dsm_version_without_a_second_request() {
+        let nas = healthy_nas();
+        let (s, _) = services_with(nas.clone(), Arc::new(MemoryStore::default()));
+        s.load_global(GlobalSettings::default()).await;
+        s.save_connection(conn(), Some("pw".into())).await;
+        let mut rx = s.poller(Endpoint::SystemInfo).subscribe("key-1");
+        wait_for_value(&mut rx).await;
+        eventually("firmware known", || s.firmware().is_some()).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(nas.count("info"), 1, "only the poller's own request");
+    }
+
+    /// A lookup DSM answered with an error is not tried again: it would
+    /// cost a request on every poll.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dsm_version_lookup_dsm_refused_is_not_retried() {
+        let nas = FakeDsm::new(|r| match r.get("method").map(String::as_str) {
+            Some("login") => Ok(json!({ "sid": "s1" })),
+            Some("get") => Ok(fixture("utilization.json")),
+            Some("info") => Err(117),
+            _ => Ok(json!({})),
+        });
+        let (s, _) = services_with(nas.clone(), Arc::new(MemoryStore::default()));
+        s.load_global(GlobalSettings::default()).await;
+        s.save_connection(conn(), Some("pw".into())).await;
+        let mut rx = s.poller(Endpoint::Utilization).subscribe("key-1");
+        wait_for_value(&mut rx).await;
+        eventually("looked up once", || nas.count("info") == 1).await;
+        for _ in 0..3 {
+            tokio::time::sleep(FIRMWARE_RETRY).await;
+            s.poller(Endpoint::Utilization).refresh_now();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(nas.count("info"), 1);
+    }
+
+    /// A lookup that never reached DSM is tried again on a later poll.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_dsm_version_lookup_is_tried_again() {
+        struct FirstInfoDropped(Arc<FakeDsm>, AtomicBool);
+        #[async_trait]
+        impl Transport for FirstInfoDropped {
+            async fn call(
+                &self,
+                path: &str,
+                form: &[(&str, &str)],
+            ) -> Result<Result<Value, i64>, DsmError> {
+                if form.contains(&("method", "info")) && !self.1.swap(true, SeqCst) {
+                    return Err(DsmError::Transport("connection reset".into()));
+                }
+                self.0.call(path, form).await
+            }
+        }
+        let nas = healthy_nas();
+        let t: Arc<dyn Transport> = Arc::new(FirstInfoDropped(nas.clone(), AtomicBool::new(false)));
+        let transports: TransportFactory = Arc::new(move |_| Ok(t.clone()));
+        let (s, _) = services_over(transports, Arc::new(MemoryStore::default()));
+        s.load_global(GlobalSettings::default()).await;
+        s.save_connection(conn(), Some("pw".into())).await;
+        let mut rx = s.poller(Endpoint::Utilization).subscribe("key-1");
+        wait_for_value(&mut rx).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(s.firmware(), None, "the first lookup failed");
+        s.poller(Endpoint::Utilization).refresh_now();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(nas.count("info"), 0, "not retried before FIRMWARE_RETRY");
+        tokio::time::sleep(FIRMWARE_RETRY).await;
+        s.poller(Endpoint::Utilization).refresh_now();
+        eventually("firmware known after a later poll", || {
+            s.firmware().is_some()
+        })
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
