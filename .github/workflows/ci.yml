@@ -56,25 +56,21 @@ jobs:
           include-hidden-files: true
           retention-days: 7
 
-  # The oldest Rust that Cargo.toml's `rust-version` promises.
+  # The oldest Rust that Cargo.toml's `rust-version` promises, on Linux and
+  # macOS. One job, two legs: the explicit `name:` keeps the check names the
+  # "Protect master" ruleset requires (`msrv`, `msrv-macos`); a matrix with the
+  # default name would report `msrv (ubuntu-24.04)` and block every PR.
   msrv:
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: 1.88.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo check --all-targets --locked
-
-  # The same MSRV check on macOS, as its own job: the master ruleset requires
-  # a check named exactly `msrv`, which a matrix would rename.
-  msrv-macos:
-    runs-on: macos-15
+    name: ${{ matrix.check }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - check: msrv
+            os: ubuntu-24.04
+          - check: msrv-macos
+            os: macos-15
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: read
     steps:
