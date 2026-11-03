@@ -20,6 +20,7 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 // Debug only in tests: a derived Debug would print the password.
 #[derive(Deserialize, PartialEq)]
@@ -126,6 +127,76 @@ pub async fn send_state(
     instance
         .send_to_property_inspector(state_message(services, metric, notice))
         .await
+}
+
+/// Pushes the panel's state whenever something it shows may have changed:
+/// the connection status, the temperature unit, the DSM version, or the
+/// metric's data (its target list). Builds the state on each wake-up and
+/// calls `send` only when it differs from the last one sent, so a CPU poll
+/// every 5 s doesn't resend an unchanged panel. Ends when aborted.
+pub async fn watch_panel<F, Fut>(services: Arc<Services>, metric: Metric, mut send: F)
+where
+    F: FnMut(Value) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let mut status = services.status();
+    let mut display = services.display();
+    let mut firmware = services.firmware_changes();
+    // `watch`, not `subscribe`: the panel must not start or speed up a poll.
+    let mut data = services.poller(metric.endpoint()).watch();
+    // The panel asked for (and got) the current state when it opened.
+    let mut last = Some(state_message(&services, metric, None));
+    loop {
+        tokio::select! {
+            r = status.changed() => if r.is_err() { return },
+            r = display.changed() => if r.is_err() { return },
+            r = firmware.changed() => if r.is_err() { return },
+            r = data.changed() => if r.is_err() { return },
+        }
+        let state = state_message(&services, metric, None);
+        if last.as_ref() != Some(&state) {
+            send(state.clone()).await;
+            last = Some(state);
+        }
+    }
+}
+
+/// One `watch_panel` task per open settings panel, by instance id.
+#[derive(Default)]
+pub struct PanelWatchers(std::sync::Mutex<std::collections::HashMap<String, JoinHandle<()>>>);
+
+impl PanelWatchers {
+    /// Starts pushing state to the panel of `instance_id`, replacing (and
+    /// stopping) a watcher it already had.
+    pub fn start(&self, services: &Arc<Services>, metric: Metric, instance_id: &str) {
+        let id = instance_id.to_string();
+        let task = tokio::spawn(watch_panel(services.clone(), metric, move |state| {
+            let id = id.clone();
+            async move {
+                if let Some(instance) = openaction::get_instance(id).await
+                    && let Err(e) = instance.send_to_property_inspector(state).await
+                {
+                    log::warn!("updating the settings panel failed: {e}");
+                }
+            }
+        }));
+        let old = self.0.lock().unwrap().insert(instance_id.to_string(), task);
+        if let Some(old) = old {
+            old.abort();
+        }
+    }
+
+    /// The panel closed: stop pushing to it.
+    pub fn stop(&self, instance_id: &str) {
+        if let Some(task) = self.0.lock().unwrap().remove(instance_id) {
+            task.abort();
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
 }
 
 /// Answers `getState` (and anything unrecognised) at once; every other
@@ -606,6 +677,74 @@ mod tests {
             io,
             json!({ "target": "Disk or volume", "cpuView": false, "direction": false, "amount": false, "ioView": true, "thresholdUnit": "%" })
         );
+    }
+
+    /// An open panel is pushed the status and the DSM version as they
+    /// change, without polling anything itself, and stops once aborted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_open_panel_is_pushed_changes_until_it_closes() {
+        let (s, _) = services_with(healthy_nas(), Arc::new(MemoryStore::default()));
+        s.load_global(GlobalSettings::default()).await;
+        let opened = state_message(&s, Metric::Cpu, None);
+        assert_eq!(opened["status"]["kind"], "notConfigured");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+        let watcher = tokio::spawn(watch_panel(s.clone(), Metric::Cpu, move |state| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(state);
+            }
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err(), "nothing changed, nothing sent");
+        assert_eq!(
+            s.poller(Endpoint::Utilization).effective_interval(),
+            None,
+            "the panel doesn't start a poll"
+        );
+
+        // Waits for a pushed state that passes `check`.
+        async fn pushed(
+            rx: &mut mpsc::UnboundedReceiver<Value>,
+            what: &str,
+            check: impl Fn(&Value) -> bool,
+        ) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !check(&rx.recv().await.unwrap()) {}
+            })
+            .await
+            .unwrap_or_else(|_| panic!("never pushed: {what}"));
+        }
+        apply(&s, save(Some("pw"))).await;
+        pushed(&mut rx, "the new status", |m| {
+            m["status"]["kind"] != "notConfigured"
+        })
+        .await;
+        let _key = s.poller(Endpoint::Utilization).subscribe("k");
+        pushed(&mut rx, "the DSM version", |m| {
+            m["status"]["firmware"] == "DSM 7.2.2-72806 Update 3"
+        })
+        .await;
+
+        watcher.abort();
+        assert!(watcher.await.unwrap_err().is_cancelled());
+        // The watcher (and its sender) is gone: the channel drains and ends.
+        while let Ok(Some(_)) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await
+        {}
+        assert!(rx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn reopening_a_panel_replaces_its_watcher_and_closing_stops_it() {
+        let (s, _) = services_with(healthy_nas(), Arc::new(MemoryStore::default()));
+        let w = PanelWatchers::default();
+        w.start(&s, Metric::Cpu, "k1");
+        w.start(&s, Metric::Cpu, "k1");
+        w.start(&s, Metric::Cpu, "k2");
+        assert_eq!(w.len(), 2);
+        w.stop("k1");
+        w.stop("k1");
+        assert_eq!(w.len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

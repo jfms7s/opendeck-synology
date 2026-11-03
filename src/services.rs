@@ -87,8 +87,8 @@ pub struct Services {
     /// Saves of the connection block in progress; each reconnects itself.
     saving: AtomicU32,
     /// The DSM version of the current connection, and the epoch it was
-    /// looked up for.
-    firmware: Mutex<Option<String>>,
+    /// looked up for. A watch, so an open settings panel learns it at once.
+    firmware: watch::Sender<Option<String>>,
     firmware_epoch: AtomicU64,
     status: watch::Sender<ConnStatus>,
     /// Display settings every key draws with; separate from the connection
@@ -123,7 +123,7 @@ impl Services {
             keyring_retries: AtomicU32::new(0),
             asking_keyring: AtomicBool::new(false),
             saving: AtomicU32::new(0),
-            firmware: Mutex::new(None),
+            firmware: watch::Sender::new(None),
             firmware_epoch: AtomicU64::new(0),
             // Until OpenDeck hands over the saved settings, keys show "…".
             status: watch::Sender::new(ConnStatus::Connecting),
@@ -192,7 +192,12 @@ impl Services {
 
     /// The connected NAS's DSM version, once looked up.
     pub fn firmware(&self) -> Option<String> {
-        self.firmware.lock().unwrap().clone()
+        self.firmware.borrow().clone()
+    }
+
+    /// Changes of `firmware()`.
+    pub fn firmware_changes(&self) -> watch::Receiver<Option<String>> {
+        self.firmware.subscribe()
     }
 
     /// Hands settings from OpenDeck over without waiting for them to be
@@ -407,7 +412,7 @@ impl Services {
     async fn reconnect_locked(self: &Arc<Self>, _c: tokio::sync::MutexGuard<'_, ()>) {
         let old = self.session.lock().unwrap().take();
         let epoch = self.epoch.fetch_add(1, SeqCst) + 1;
-        *self.firmware.lock().unwrap() = None;
+        self.firmware.send_replace(None);
         self.connect(epoch).await;
         // Only now that no poller uses the old session can it be logged out:
         // a poller still on it would just log it in again.
@@ -603,10 +608,18 @@ impl Services {
         self.set_status(next);
     }
 
+    /// Runs on every poll result: copies only the account, not the whole
+    /// settings (`global()` would clone the fallback secrets too).
     fn connected(&self) -> ConnStatus {
-        ConnStatus::Connected {
-            account: self.global().connection.account.trim().to_string(),
-        }
+        let account = self
+            .global
+            .lock()
+            .unwrap()
+            .connection
+            .account
+            .trim()
+            .to_string();
+        ConnStatus::Connected { account }
     }
 
     /// The DSM version belongs to the connection, not to whichever keys are
@@ -623,7 +636,7 @@ impl Services {
             if let Some(s) = this.upgrade()
                 && s.is_current(epoch)
             {
-                *s.firmware.lock().unwrap() = info.firmware;
+                s.firmware.send_replace(info.firmware);
             }
         });
     }

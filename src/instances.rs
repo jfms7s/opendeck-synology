@@ -126,7 +126,11 @@ async fn render_loop(
         if last.as_ref() != Some(&reading)
             && let Some(instance) = openaction::get_instance(id.clone()).await
         {
-            match draw(&instance, metric, &reading, is_key).await {
+            // The native title only needs clearing on a first draw or an
+            // explicit redraw (appear, settings re-sent, dial turned): a
+            // steady-state change sends one frame.
+            let clear_title = last.is_none();
+            match draw(&instance, metric, &reading, is_key, clear_title).await {
                 Ok(()) => last = Some(reading),
                 Err(e) => log::warn!("drawing {} failed: {e}", metric.uuid()),
             }
@@ -146,11 +150,14 @@ async fn draw(
     metric: Metric,
     r: &Reading,
     is_key: bool,
+    clear_title: bool,
 ) -> OpenActionResult<()> {
     if is_key {
         // The text is inside the image; clear the native title so OpenDeck
         // doesn't paint a second copy on top.
-        instance.set_title(Some(String::new()), None).await?;
+        if clear_title {
+            instance.set_title(Some(String::new()), None).await?;
+        }
         instance
             .set_image(Some(key::key_image(metric, r)), None)
             .await
