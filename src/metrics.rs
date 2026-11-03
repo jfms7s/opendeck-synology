@@ -6,7 +6,7 @@ use crate::dsm::model::{
     Disk, Payload, Pool, Storage, SystemInfo, UpdateStatus, Utilization, Volume,
 };
 use crate::format;
-use crate::metric::Metric;
+use crate::metric::{Axis, Metric};
 use crate::poller::PollState;
 use crate::settings::{ActionSettings, Amount, CpuView, Direction, IoView, TempUnit};
 use crate::status::ConnStatus;
@@ -138,21 +138,48 @@ fn error_reading(metric: Metric, e: &DsmError) -> Reading {
     Reading::new(metric, value, Level::Error).subject(subject)
 }
 
-fn value_reading(metric: Metric, p: &Payload, v: &ActionSettings, unit: TempUnit) -> Reading {
-    match (metric, p) {
-        (Metric::Cpu, Payload::Utilization(u)) => cpu(u, v),
-        (Metric::Ram, Payload::Utilization(u)) => ram(u, v),
-        (Metric::Network, Payload::Utilization(u)) => network(u, v),
-        (Metric::StorageIo, Payload::Utilization(u)) => storage_io(u, v),
-        (Metric::SysTemp, Payload::SystemInfo(s)) => sys_temp(s, v, unit),
-        (Metric::DiskTemp, Payload::Storage(s)) => disk_temp(s, v, unit),
-        (Metric::DiskHealth, Payload::Storage(s)) => disk_health(s, v),
-        (Metric::Volume, Payload::Storage(s)) => volume(s, v),
-        (Metric::Pool, Payload::Storage(s)) => pool(s, v),
-        (Metric::Health, Payload::Storage(s)) => health(s, v, unit),
-        (Metric::Update, Payload::Update(u)) => update(u),
-        _ => Reading::new(metric, "Error", Level::Error),
+fn as_utilization(p: &Payload) -> Option<&Utilization> {
+    match p {
+        Payload::Utilization(u) => Some(u),
+        _ => None,
     }
+}
+fn as_system_info(p: &Payload) -> Option<&SystemInfo> {
+    match p {
+        Payload::SystemInfo(s) => Some(s),
+        _ => None,
+    }
+}
+fn as_storage(p: &Payload) -> Option<&Storage> {
+    match p {
+        Payload::Storage(s) => Some(s),
+        _ => None,
+    }
+}
+fn as_update(p: &Payload) -> Option<&UpdateStatus> {
+    match p {
+        Payload::Update(u) => Some(u),
+        _ => None,
+    }
+}
+
+/// Every metric has its own arm (no wildcard, so a new metric is a compile
+/// error here); a payload from another endpoint reads "Error".
+fn value_reading(metric: Metric, p: &Payload, v: &ActionSettings, unit: TempUnit) -> Reading {
+    let reading = match metric {
+        Metric::Cpu => as_utilization(p).map(|u| cpu(u, v)),
+        Metric::Ram => as_utilization(p).map(|u| ram(u, v)),
+        Metric::Network => as_utilization(p).map(|u| network(u, v)),
+        Metric::StorageIo => as_utilization(p).map(|u| storage_io(u, v)),
+        Metric::SysTemp => as_system_info(p).map(|s| sys_temp(s, v, unit)),
+        Metric::DiskTemp => as_storage(p).map(|s| disk_temp(s, v, unit)),
+        Metric::DiskHealth => as_storage(p).map(|s| disk_health(s, v)),
+        Metric::Volume => as_storage(p).map(|s| volume(s, v)),
+        Metric::Pool => as_storage(p).map(|s| pool(s, v)),
+        Metric::Health => as_storage(p).map(|s| health(s, v, unit)),
+        Metric::Update => as_update(p).map(update),
+    };
+    reading.unwrap_or_else(|| Reading::new(metric, "Error", Level::Error))
 }
 
 fn thresholds(metric: Metric, v: &ActionSettings) -> (Option<f64>, Option<f64>) {
@@ -323,7 +350,13 @@ fn rotation_targets(metric: Metric, s: &Storage) -> Vec<Option<String>> {
         Metric::Pool => s.pools.iter().map(|x| Some(x.id.clone())).collect(),
         // Problems only, worst first; with none there is nothing to turn to.
         Metric::Health => problems(s).into_iter().map(|p| Some(p.id)).collect(),
-        _ => Vec::new(),
+        // Their dial turns a view, not a storage target (`Fields::dial`).
+        Metric::Cpu
+        | Metric::Ram
+        | Metric::Network
+        | Metric::SysTemp
+        | Metric::StorageIo
+        | Metric::Update => Vec::new(),
     }
 }
 
@@ -657,26 +690,30 @@ fn step(i: usize, n: usize, ticks: i16) -> usize {
 }
 
 /// Applies a dial turn to an instance's in-memory view, wrapping at the ends.
+/// Which setting it turns is the catalogue's `Fields::dial`.
 pub fn rotate(metric: Metric, view: &mut ActionSettings, latest: Option<&Payload>, ticks: i16) {
-    match metric {
-        Metric::Cpu => {
+    let Some(axis) = metric.fields().dial else {
+        return;
+    };
+    match axis {
+        Axis::CpuView => {
             view.cpu_view =
                 CPU_VIEWS[step(index_of(&CPU_VIEWS, &view.cpu_view), CPU_VIEWS.len(), ticks)]
         }
-        Metric::Ram => {
+        Axis::Amount => {
             view.amount = AMOUNTS[step(index_of(&AMOUNTS, &view.amount), AMOUNTS.len(), ticks)]
         }
-        Metric::Network => {
+        Axis::Direction => {
             view.direction = DIRECTIONS[step(
                 index_of(&DIRECTIONS, &view.direction),
                 DIRECTIONS.len(),
                 ticks,
             )]
         }
-        Metric::StorageIo => {
+        Axis::IoView => {
             view.io_view = IO_VIEWS[step(index_of(&IO_VIEWS, &view.io_view), IO_VIEWS.len(), ticks)]
         }
-        Metric::DiskTemp | Metric::DiskHealth | Metric::Volume | Metric::Pool | Metric::Health => {
+        Axis::Target | Axis::Problem => {
             let Some(Payload::Storage(s)) = latest else {
                 return;
             };
@@ -687,7 +724,6 @@ pub fn rotate(metric: Metric, view: &mut ActionSettings, latest: Option<&Payload
             let i = index_of(&cycle, &resolved_target(metric, s, view));
             view.target = cycle[step(i, cycle.len(), ticks)].clone();
         }
-        Metric::SysTemp | Metric::Update => {}
     }
 }
 
@@ -699,8 +735,8 @@ pub fn target_options(metric: Metric, p: &Payload) -> Vec<(Option<String>, Strin
             .chain(s.disks.iter().map(|d| (Some(d.id.clone()), d.name.clone())))
             .collect()
     };
-    match (metric, p) {
-        (Metric::Network, Payload::Utilization(u)) => {
+    let options = match metric {
+        Metric::Network => as_utilization(p).map(|u| {
             std::iter::once((None, "All interfaces".to_string()))
                 .chain(
                     u.network
@@ -709,8 +745,8 @@ pub fn target_options(metric: Metric, p: &Payload) -> Vec<(Option<String>, Strin
                         .map(|n| (Some(n.device.clone()), n.device.clone())),
                 )
                 .collect()
-        }
-        (Metric::StorageIo, Payload::Utilization(u)) => {
+        }),
+        Metric::StorageIo => as_utilization(p).map(|u| {
             std::iter::once((None, "All disks".to_string()))
                 .chain(
                     u.io.disks
@@ -719,21 +755,25 @@ pub fn target_options(metric: Metric, p: &Payload) -> Vec<(Option<String>, Strin
                         .map(|x| (Some(x.id.clone()), x.name.clone())),
                 )
                 .collect()
-        }
-        (Metric::DiskTemp, Payload::Storage(s)) => disks(s, "Hottest disk"),
-        (Metric::DiskHealth, Payload::Storage(s)) => disks(s, "Worst disk"),
-        (Metric::Volume, Payload::Storage(s)) => s
-            .volumes
-            .iter()
-            .map(|x| (Some(x.id.clone()), x.name.clone()))
-            .collect(),
-        (Metric::Pool, Payload::Storage(s)) => s
-            .pools
-            .iter()
-            .map(|x| (Some(x.id.clone()), x.name.clone()))
-            .collect(),
-        _ => Vec::new(),
-    }
+        }),
+        Metric::DiskTemp => as_storage(p).map(|s| disks(s, "Hottest disk")),
+        Metric::DiskHealth => as_storage(p).map(|s| disks(s, "Worst disk")),
+        Metric::Volume => as_storage(p).map(|s| {
+            s.volumes
+                .iter()
+                .map(|x| (Some(x.id.clone()), x.name.clone()))
+                .collect()
+        }),
+        Metric::Pool => as_storage(p).map(|s| {
+            s.pools
+                .iter()
+                .map(|x| (Some(x.id.clone()), x.name.clone()))
+                .collect()
+        }),
+        // No `target` field (`Fields::target`): no dropdown.
+        Metric::Cpu | Metric::Ram | Metric::SysTemp | Metric::Health | Metric::Update => None,
+    };
+    options.unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -779,6 +819,57 @@ mod tests {
     }
     fn view() -> ActionSettings {
         ActionSettings::default()
+    }
+
+    /// The fixture payload of each endpoint.
+    fn fixture_for(e: crate::metric::Endpoint) -> Payload {
+        use crate::metric::Endpoint;
+        match e {
+            Endpoint::Utilization => util(),
+            Endpoint::SystemInfo => system(fixture("system.json")),
+            Endpoint::Storage => storage("storage.json"),
+            Endpoint::Update => Payload::Update(parse_update(&fixture("update.json")).unwrap()),
+        }
+    }
+
+    /// Each metric's reading, dial axis, dropdown and manifest `Rotate`
+    /// text agree, so adding or changing one can't leave the others behind.
+    #[test]
+    fn every_metric_agrees_with_its_catalogue_entry() {
+        let manifest: Value =
+            serde_json::from_str(include_str!("../assets/manifest.json")).unwrap();
+        for metric in Metric::ALL {
+            let p = fixture_for(metric.endpoint());
+            let fields = metric.fields();
+            let r = read_as(metric, p.clone(), &view());
+            assert_ne!(r.value, "Error", "{metric:?} reads its own endpoint");
+            let action = manifest["Actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["UUID"] == metric.uuid())
+                .unwrap();
+            let rotate_text = &action["Encoder"]["TriggerDescription"]["Rotate"];
+            assert_eq!(
+                fields.dial.is_some(),
+                rotate_text.is_string(),
+                "{metric:?}: a dial axis exactly when the manifest describes Rotate"
+            );
+            if fields.dial == Some(Axis::Target) {
+                assert!(fields.target.is_some(), "{metric:?} turns a target it has");
+            }
+            assert_eq!(
+                fields.target.is_some(),
+                !target_options(metric, &p).is_empty(),
+                "{metric:?}: a target field exactly when it has dropdown options"
+            );
+            // The dial does something with the fixture.
+            if fields.dial.is_some() && fields.dial != Some(Axis::Problem) {
+                let mut turned = view();
+                rotate(metric, &mut turned, Some(&p), 1);
+                assert_ne!(turned, view(), "{metric:?}'s dial changed nothing");
+            }
+        }
     }
 
     #[test]

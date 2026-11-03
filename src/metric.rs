@@ -17,6 +17,25 @@ pub struct Fields {
     pub io_view: bool,
     /// Unit of the warn/critical thresholds, if the metric has them.
     pub threshold_unit: Option<&'static str>,
+    /// What turning a dial changes (`metrics::rotate`); `None` = nothing.
+    /// Not part of the panel's JSON.
+    #[serde(skip)]
+    pub dial: Option<Axis>,
+}
+
+/// The one setting a dial steps through. Declared once per metric in
+/// `Metric::fields`; `metrics::rotate` dispatches on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Axis {
+    CpuView,
+    Amount,
+    Direction,
+    IoView,
+    /// The `target` dropdown's entries (disks, volumes, pools).
+    Target,
+    /// The current storage problems, worst first: a target the panel has
+    /// no dropdown for (NAS Health).
+    Problem,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -100,17 +119,20 @@ impl Metric {
         match self {
             Self::Cpu => Fields {
                 cpu_view: true,
+                dial: Some(Axis::CpuView),
                 threshold_unit: Some("%"),
                 ..none
             },
             Self::Ram => Fields {
                 amount: true,
+                dial: Some(Axis::Amount),
                 threshold_unit: Some("%"),
                 ..none
             },
             Self::Network => Fields {
                 target: Some("Interface"),
                 direction: true,
+                dial: Some(Axis::Direction),
                 threshold_unit: Some("MB/s"),
                 ..none
             },
@@ -120,32 +142,42 @@ impl Metric {
             },
             Self::DiskTemp => Fields {
                 target: Some("Disk"),
+                dial: Some(Axis::Target),
                 threshold_unit: Some("°C"),
                 ..none
             },
             Self::DiskHealth => Fields {
                 target: Some("Disk"),
+                dial: Some(Axis::Target),
                 ..none
             },
             Self::Volume => Fields {
                 target: Some("Volume"),
                 amount: true,
+                dial: Some(Axis::Target),
                 threshold_unit: Some("%"),
                 ..none
             },
             Self::Pool => Fields {
                 target: Some("Pool"),
+                dial: Some(Axis::Target),
                 ..none
             },
             Self::StorageIo => Fields {
                 target: Some("Disk or volume"),
                 io_view: true,
+                dial: Some(Axis::IoView),
                 threshold_unit: Some("%"),
                 ..none
             },
             // Health reads every pool, disk and volume at the Disk
-            // Temperature and Volume defaults: no target, no thresholds.
-            Self::Update | Self::Health => none,
+            // Temperature and Volume defaults: no target, no thresholds;
+            // its dial steps through the current problems.
+            Self::Health => Fields {
+                dial: Some(Axis::Problem),
+                ..none
+            },
+            Self::Update => none,
         }
     }
 
@@ -160,7 +192,7 @@ impl Metric {
             Self::Volume => Some((80.0, 90.0)),
             // Busy %: a disk pinned near 100 % is what makes I/O latency climb.
             Self::StorageIo => Some((80.0, 95.0)),
-            _ => None,
+            Self::Network | Self::DiskHealth | Self::Pool | Self::Health | Self::Update => None,
         }
     }
 }
@@ -209,7 +241,13 @@ mod tests {
         assert_eq!(Metric::Network.fields().threshold_unit, Some("MB/s"));
         assert_eq!(Metric::Pool.fields().target, Some("Pool"));
         assert_eq!(Metric::Update.fields(), Fields::default());
-        assert_eq!(Metric::Health.fields(), Fields::default());
+        assert_eq!(
+            Metric::Health.fields(),
+            Fields {
+                dial: Some(Axis::Problem),
+                ..Fields::default()
+            }
+        );
     }
 
     #[test]
