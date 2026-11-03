@@ -5,7 +5,10 @@
 //! One "connection epoch" ties it together: it moves on whenever the session
 //! is replaced, and every late callback (a poll result, a new device token,
 //! the firmware lookup) carries the epoch it was started in, so nothing from
-//! an old connection lands on the new one.
+//! an old connection lands on the new one. What belongs to one connection
+//! (epoch, session, where the password was found, keyring retries used) is
+//! one `ConnectionState`, which `reconnect` replaces whole; operations on all
+//! four pollers go through `Pollers`.
 
 use crate::dsm::api::{AUTH, INFO};
 use crate::dsm::endpoint::Endpoint;
@@ -62,8 +65,55 @@ pub fn target_for(conn: &Connection) -> Target {
     }
 }
 
+/// What belongs to one connection. `reconnect` replaces it whole, so nothing
+/// carries over to the next connection by accident.
+#[derive(Default)]
+struct ConnectionState {
+    epoch: u64,
+    session: Option<Arc<Session>>,
+    /// Where this connection's password was found, if anywhere.
+    password: Option<Stored>,
+    /// Keyring retries used so far (`retry_keyring_later`). A retry's own
+    /// reconnect carries the count forward; every other reconnect (a save,
+    /// a key press, new settings) starts a fresh budget.
+    keyring_retries: u32,
+}
+
+/// The four endpoint pollers, one per `Endpoint`.
+pub struct Pollers([Poller<Payload>; 4]);
+
+impl Pollers {
+    fn new() -> Self {
+        Self(Endpoint::ALL.map(|e| Poller::new(e.default_interval())))
+    }
+
+    pub fn get(&self, e: Endpoint) -> &Poller<Payload> {
+        &self.0[e.index()]
+    }
+
+    /// Gives each poller the fetch `fetch` returns for its endpoint (`None`:
+    /// nothing to poll).
+    fn retarget(&self, fetch: impl Fn(Endpoint) -> Option<Fetch<Payload>>) {
+        for e in Endpoint::ALL {
+            self.get(e).set_fetch(fetch(e));
+        }
+    }
+
+    fn refresh_all(&self) {
+        for e in Endpoint::ALL {
+            self.get(e).refresh_now();
+        }
+    }
+
+    fn clear_errors(&self) {
+        for e in Endpoint::ALL {
+            self.get(e).clear_error();
+        }
+    }
+}
+
 pub struct Services {
-    pollers: [Poller<Payload>; 4],
+    pollers: Pollers,
     global: Mutex<GlobalSettings>,
     /// Serialises keyring writes (and the settings changes recording their
     /// outcome), so secret writes never reorder against each other. Held
@@ -85,10 +135,9 @@ pub struct Services {
     settings_gen: AtomicU64,
     connected_gen: AtomicU64,
     loaded: AtomicBool,
-    session: Mutex<Option<Arc<Session>>>,
-    epoch: AtomicU64,
-    password: Mutex<Option<Stored>>,
-    keyring_retries: AtomicU32,
+    /// The current connection. Only `reconnect` replaces it; `connect`
+    /// (under `connecting`) fills in its session and password.
+    conn: Mutex<ConnectionState>,
     /// A key press is asking a refusing keyring again.
     asking_keyring: AtomicBool,
     /// Saves of the connection block in progress; each reconnects itself.
@@ -115,7 +164,7 @@ impl Services {
         device_name: String,
     ) -> Arc<Self> {
         Arc::new(Self {
-            pollers: Endpoint::ALL.map(|e| Poller::new(e.default_interval())),
+            pollers: Pollers::new(),
             global: Mutex::new(GlobalSettings::default()),
             secrets: tokio::sync::Mutex::new(()),
             writing: tokio::sync::Mutex::new(()),
@@ -124,10 +173,7 @@ impl Services {
             settings_gen: AtomicU64::new(0),
             connected_gen: AtomicU64::new(0),
             loaded: AtomicBool::new(false),
-            session: Mutex::new(None),
-            epoch: AtomicU64::new(0),
-            password: Mutex::new(None),
-            keyring_retries: AtomicU32::new(0),
+            conn: Mutex::new(ConnectionState::default()),
             asking_keyring: AtomicBool::new(false),
             saving: AtomicU32::new(0),
             firmware: watch::Sender::new(None),
@@ -143,7 +189,7 @@ impl Services {
     }
 
     pub fn poller(&self, e: Endpoint) -> &Poller<Payload> {
-        &self.pollers[e.index()]
+        self.pollers.get(e)
     }
 
     pub fn status(&self) -> watch::Receiver<ConnStatus> {
@@ -170,7 +216,7 @@ impl Services {
 
     /// Where the current connection's password was found, if anywhere.
     pub fn password_stored(&self) -> Option<Stored> {
-        *self.password.lock().unwrap()
+        self.conn.lock().unwrap().password
     }
 
     pub fn has_password(&self) -> bool {
@@ -188,7 +234,7 @@ impl Services {
         if self.saving.load(SeqCst) > 0 || self.asking_keyring.swap(true, SeqCst) {
             return;
         }
-        let epoch = self.epoch.load(SeqCst);
+        let epoch = self.epoch();
         let this = self.clone();
         tokio::spawn(async move {
             let c = this.connecting.lock().await;
@@ -197,7 +243,7 @@ impl Services {
                 && this.saving.load(SeqCst) == 0
                 && matches!(this.current_status(), ConnStatus::KeyringRefused(_))
             {
-                this.reconnect_locked(c).await;
+                this.reconnect_locked(c, false).await;
             }
             this.asking_keyring.store(false, SeqCst);
         });
@@ -232,7 +278,7 @@ impl Services {
                         tokio::spawn(async move {
                             let c = s.connecting.lock().await;
                             if s.connected_gen.load(SeqCst) < generation {
-                                s.reconnect_locked(c).await;
+                                s.reconnect_locked(c, false).await;
                             }
                         });
                     }
@@ -331,24 +377,17 @@ impl Services {
     }
 
     pub async fn submit_otp(&self, code: &str) -> Result<(), DsmError> {
-        let session = self
-            .session
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or(DsmError::NotConfigured)?;
+        let session = self.session().ok_or(DsmError::NotConfigured)?;
         let result = session.submit_otp(code).await;
         match &result {
             Ok(()) => {
                 if matches!(self.current_status(), ConnStatus::Auth(_)) {
                     self.set_status(ConnStatus::Connecting);
                 }
-                for e in Endpoint::ALL {
-                    // The keys' "Login" error is solved; don't show it
-                    // until the next poll lands.
-                    self.poller(e).clear_error();
-                    self.poller(e).refresh_now();
-                }
+                // The keys' "Login" error is solved; don't show it until the
+                // next poll lands.
+                self.pollers.clear_errors();
+                self.pollers.refresh_all();
             }
             Err(e) => {
                 if let Some(s) = ConnStatus::from_error(e) {
@@ -357,9 +396,7 @@ impl Services {
                 if !matches!(e, DsmError::Auth(_)) {
                     // The session still wants a code; let the (paused)
                     // pollers report that, so the 2FA box comes back.
-                    for endpoint in Endpoint::ALL {
-                        self.poller(endpoint).refresh_now();
-                    }
+                    self.pollers.refresh_all();
                 }
             }
         }
@@ -392,8 +429,7 @@ impl Services {
     }
 
     pub async fn logout(&self) {
-        let session = self.session.lock().unwrap().clone();
-        if let Some(s) = session {
+        if let Some(s) = self.session() {
             s.logout().await;
         }
     }
@@ -412,24 +448,54 @@ impl Services {
     }
 
     fn is_current(&self, epoch: u64) -> bool {
-        self.epoch.load(SeqCst) == epoch
+        self.epoch() == epoch
+    }
+
+    fn epoch(&self) -> u64 {
+        self.conn.lock().unwrap().epoch
+    }
+
+    fn session(&self) -> Option<Arc<Session>> {
+        self.conn.lock().unwrap().session.clone()
+    }
+
+    fn set_password(&self, stored: Option<Stored>) {
+        self.conn.lock().unwrap().password = stored;
     }
 
     /// Replaces the session and points every poller at it.
     async fn reconnect(self: &Arc<Self>) {
         let c = self.connecting.lock().await;
-        self.reconnect_locked(c).await;
+        self.reconnect_locked(c, false).await;
     }
 
-    /// `reconnect`, for a caller already holding `connecting`.
-    async fn reconnect_locked(self: &Arc<Self>, _c: tokio::sync::MutexGuard<'_, ()>) {
-        let old = self.session.lock().unwrap().take();
-        let epoch = self.epoch.fetch_add(1, SeqCst) + 1;
+    /// `reconnect`, for a caller already holding `connecting`. Starts a new
+    /// `ConnectionState`; only a keyring retry (`retrying`) carries over the
+    /// retries its chain has used.
+    async fn reconnect_locked(
+        self: &Arc<Self>,
+        _c: tokio::sync::MutexGuard<'_, ()>,
+        retrying: bool,
+    ) {
+        let (old, epoch) = {
+            let mut conn = self.conn.lock().unwrap();
+            let next = ConnectionState {
+                epoch: conn.epoch + 1,
+                keyring_retries: if retrying { conn.keyring_retries } else { 0 },
+                // Until `connect` reads it again, the panel keeps saying
+                // where the password was (every path through `connect`
+                // that reads the keyring sets it).
+                password: conn.password,
+                ..ConnectionState::default()
+            };
+            let epoch = next.epoch;
+            (std::mem::replace(&mut *conn, next), epoch)
+        };
         self.firmware.send_replace(None);
         self.connect(epoch).await;
         // Only now that no poller uses the old session can it be logged out:
         // a poller still on it would just log it in again.
-        if let Some(old) = old {
+        if let Some(old) = old.session {
             tokio::spawn(async move { old.logout().await });
         }
     }
@@ -463,14 +529,14 @@ impl Services {
             })
             .await;
         if !g.connection.is_complete() {
-            *self.password.lock().unwrap() = None;
+            self.set_password(None);
             return self.go_idle(ConnStatus::NotConfigured);
         }
         // Only settings from before 0.7.0 can say `https: false`. Refuse them
         // before the keyring or the NAS is asked anything: no password
         // ever crosses the network in the clear.
         if !g.connection.https {
-            *self.password.lock().unwrap() = None;
+            self.set_password(None);
             return self.go_idle(ConnStatus::HttpsRequired);
         }
         let password = match self
@@ -478,25 +544,26 @@ impl Services {
             .await
         {
             Ok(Some((p, stored))) if !p.is_empty() => {
-                *self.password.lock().unwrap() = Some(stored);
-                self.keyring_retries.store(0, SeqCst);
+                let mut conn = self.conn.lock().unwrap();
+                conn.password = Some(stored);
+                drop(conn);
                 p
             }
             Ok(_) => {
-                *self.password.lock().unwrap() = None;
+                self.set_password(None);
                 return self.go_idle(ConnStatus::NotConfigured);
             }
             Err(StoreError::Refused(e)) => {
                 // Asking again by itself would show the prompt again and
                 // train the user to allow it: wait for a key press or a save.
                 log::warn!("the system keyring refused to hand over the password: {e}");
-                *self.password.lock().unwrap() = None;
+                self.set_password(None);
                 return self.go_idle(ConnStatus::KeyringRefused(e));
             }
             Err(StoreError::Unavailable(e)) => {
                 // Not "no password": the keyring may well hold it.
                 log::warn!("can't read the password from the system keyring: {e}");
-                *self.password.lock().unwrap() = None;
+                self.set_password(None);
                 self.go_idle(ConnStatus::Keyring(e));
                 return self.retry_keyring_later(epoch);
             }
@@ -526,12 +593,10 @@ impl Services {
         };
         let listener = self.did_listener(epoch, g.connection.secret_scope());
         let session = Arc::new(Session::new(transport, creds, listener));
-        *self.session.lock().unwrap() = Some(session.clone());
+        self.conn.lock().unwrap().session = Some(session.clone());
         self.set_status(ConnStatus::Connecting);
-        for e in Endpoint::ALL {
-            self.poller(e)
-                .set_fetch(Some(self.fetch_for(e, &session, epoch)));
-        }
+        self.pollers
+            .retarget(|e| Some(self.fetch_for(e, &session, epoch)));
     }
 
     /// Awaits a step that calls the keyring. If it takes long - a prompt
@@ -550,7 +615,11 @@ impl Services {
     /// Reads the keyring again after a while (it may not have been up yet,
     /// e.g. right after login), a few times before leaving it to the user.
     fn retry_keyring_later(self: &Arc<Self>, epoch: u64) {
-        let attempt = self.keyring_retries.fetch_add(1, SeqCst);
+        let attempt = {
+            let mut conn = self.conn.lock().unwrap();
+            conn.keyring_retries += 1;
+            conn.keyring_retries - 1
+        };
         if attempt >= KEYRING_RETRIES {
             return;
         }
@@ -558,20 +627,20 @@ impl Services {
         let delay = KEYRING_RETRY.saturating_mul(1 << attempt);
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            if let Some(s) = this.upgrade()
-                && s.is_current(epoch)
-                && matches!(s.current_status(), ConnStatus::Keyring(_))
-            {
-                s.reconnect().await;
+            let Some(s) = this.upgrade() else { return };
+            let c = s.connecting.lock().await;
+            // Checked under `connecting`, so no reconnect slips in between.
+            // (Settings saved meanwhile are read by this reconnect; their own
+            // queued reconnect then starts a fresh budget.)
+            if s.is_current(epoch) && matches!(s.current_status(), ConnStatus::Keyring(_)) {
+                s.reconnect_locked(c, true).await;
             }
         });
     }
 
     fn go_idle(&self, status: ConnStatus) {
         self.set_status(status);
-        for e in Endpoint::ALL {
-            self.poller(e).set_fetch(None);
-        }
+        self.pollers.retarget(|_| None);
     }
 
     fn fetch_for(
@@ -1071,7 +1140,7 @@ mod tests {
         })
         .await;
         assert!(matches!(s.current_status(), ConnStatus::KeyringRefused(_)));
-        let before = s.epoch.load(SeqCst);
+        let before = s.epoch();
         let save = {
             let s = s.clone();
             tokio::spawn(async move { s.save_connection(conn(), Some("new".into())).await })
@@ -1082,11 +1151,7 @@ mod tests {
         s.refresh(Endpoint::Utilization);
         save.await.unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
-        assert_eq!(
-            s.epoch.load(SeqCst),
-            before + 1,
-            "one reconnect, the save's"
-        );
+        assert_eq!(s.epoch(), before + 1, "one reconnect, the save's");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1733,12 +1798,43 @@ mod tests {
         assert!(matches!(s.current_status(), ConnStatus::Keyring(_)));
     }
 
+    /// The keyring retry budget belongs to the connection: one that used
+    /// it up doesn't leave a later, different connection without retries.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_connection_gets_its_own_keyring_retries() {
+        let other = Connection {
+            account: "admin".into(),
+            ..conn()
+        };
+        let other_pw = password_key(&other.secret_scope());
+        let secrets = Arc::new(MemoryStore::unreadable(&[]));
+        let (s, _) = services_with(healthy_nas(), secrets.clone());
+        s.load_global(GlobalSettings {
+            connection: conn(),
+            ..GlobalSettings::default()
+        })
+        .await;
+        tokio::time::sleep(PAST_THE_SCHEDULE).await;
+        assert_eq!(
+            secrets.reads_of(&password_key(&scope())),
+            PW_READS_PER_ATTEMPT * (1 + KEYRING_RETRIES as usize),
+            "the first connection used up its retries"
+        );
+        s.save_connection(other, None).await;
+        tokio::time::sleep(PAST_THE_SCHEDULE).await;
+        assert_eq!(
+            secrets.reads_of(&other_pw),
+            PW_READS_PER_ATTEMPT * (1 + KEYRING_RETRIES as usize),
+            "the new connection got the full schedule"
+        );
+    }
+
     /// Mutant D2: a retry scheduled for a connection the user has since
     /// replaced must not reconnect the new one. The first connection's
-    /// failure takes attempt 0 and schedules a retry at +20 ms; the new
-    /// connection is saved before it fires and takes attempts 1-5. With the
-    /// epoch guard the old retry is dropped, so the new connection fails 5
-    /// times; without it the old retry reconnects it once more (6).
+    /// failure schedules a retry at +20 ms; the new connection is saved
+    /// before it fires and has its own budget: one attempt plus
+    /// `KEYRING_RETRIES` retries. With the epoch guard the old retry is
+    /// dropped; without it the old retry reconnects the new one once more.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_retry_for_a_replaced_connection_is_dropped() {
         let other = Connection {
@@ -1762,7 +1858,7 @@ mod tests {
         tokio::time::sleep(PAST_THE_SCHEDULE).await;
         assert_eq!(
             secrets.reads_of(&other_pw),
-            PW_READS_PER_ATTEMPT * KEYRING_RETRIES as usize
+            PW_READS_PER_ATTEMPT * (1 + KEYRING_RETRIES as usize)
         );
         assert_eq!(
             secrets.reads_of(&password_key(&scope())),
@@ -1771,8 +1867,9 @@ mod tests {
         );
     }
 
-    /// Mutant P: a successful read resets the retry budget, so a later
-    /// keyring outage gets the full schedule again.
+    /// Mutant P: after a successful read, a later keyring outage (here on
+    /// a re-save) gets the full schedule again: every reconnect but a
+    /// retry's own starts a fresh budget.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_successful_read_resets_the_retry_budget() {
         let pw = password_key(&scope());
@@ -1921,7 +2018,7 @@ mod tests {
         let (s, _) = services_with(healthy_nas(), secrets.clone());
         s.load_global(GlobalSettings::default()).await;
         s.save_connection(conn(), Some("pw".into())).await;
-        let old_epoch = s.epoch.load(SeqCst);
+        let old_epoch = s.epoch();
         let other = Connection {
             host: "other.lan".into(),
             ..conn()
@@ -2325,7 +2422,7 @@ mod tests {
         let secrets = Arc::new(MemoryStore::broken().with_write_delay(Duration::from_millis(300)));
         let (s, sink) = services_with(healthy_nas(), secrets);
         s.load_global(with_file_password("pw")).await;
-        let epoch = s.epoch.load(SeqCst);
+        let epoch = s.epoch();
         let storing = {
             let s = s.clone();
             tokio::spawn(async move { s.store_did(epoch, scope(), Some("dev-1".into())).await })
@@ -2422,7 +2519,7 @@ mod tests {
         let (s, _) = services_with(healthy_nas(), secrets.clone());
         s.load_global(GlobalSettings::default()).await;
         s.save_connection(conn(), Some("pw".into())).await;
-        let epoch = s.epoch.load(SeqCst);
+        let epoch = s.epoch();
         let listener = s.did_listener(epoch, scope());
         // OpenDeck's switch to another NAS is adopted; its reconnect has not
         // run yet when the old session hands over its token.
