@@ -79,13 +79,13 @@ post() {
 }
 
 redact='walk(if type == "object" then with_entries(
-  if (.key | test("serial|uuid|wwn|(^|_)(mac|ip|ipv6|hostname|server_name)(_|$)"; "i"))
+  if (.key | test("serial|uuid|wwn|iqn|(^|_)(mac|ip|ipv6|hostname|server_name)(_|$)|^(description|desc|lun_path)$"; "i"))
   then .value = "REDACTED" else . end) else . end)'
 
 apis="SYNO.API.Auth,SYNO.Core.System.Utilization,SYNO.Core.System,SYNO.Storage.CGI.Storage,SYNO.Core.Upgrade.Server"
 # Not used by the plugin yet: recorded so a planned action can be built
 # against real field names (whether the NAS offers it, its versions).
-apis+=",SYNO.Core.SecurityScan.Status"
+apis+=",SYNO.Core.SecurityScan.Status,SYNO.Core.ISCSI.LUN"
 post query.cgi --data-urlencode "api=SYNO.API.Info" --data-urlencode "version=1" \
 	--data-urlencode "method=query" --data-urlencode "query=$apis" | jq '.data' >"$out/api_info.json"
 echo "wrote $out/api_info.json"
@@ -112,11 +112,22 @@ jq '.data | keys' <<<"$login" >"$out/login_keys.json"
 unset login
 echo "wrote $out/login_keys.json"
 
+# capture <name> <api> <version> <method> [key=value | key@file ...]: extra
+# arguments are sent as further form fields (curl's --data-urlencode forms;
+# a literal value shows in the process list, so anything else goes as
+# key@file). The unredacted reply stays in the private directory as <name>.raw,
+# for a later capture that needs a value from it; it goes with the trap.
 capture() {
 	local name=$1 api=$2 version=$3 method=$4 resp
+	shift 4
+	local extra=()
+	for pair in "$@"; do
+		extra+=(--data-urlencode "$pair")
+	done
 	resp=$(post entry.cgi --data-urlencode "api=$api" --data-urlencode "version=$version" \
-		--data-urlencode "method=$method" --data-urlencode "_sid@$private/sid")
+		--data-urlencode "method=$method" ${extra[@]+"${extra[@]}"} --data-urlencode "_sid@$private/sid")
 	if jq -e '.success' <<<"$resp" >/dev/null; then
+		(umask 077 && printf %s "$resp" >"$private/$name.raw")
 		jq "$redact | .data" <<<"$resp" >"$out/$name.json"
 		echo "wrote $out/$name.json"
 	else
@@ -131,3 +142,20 @@ capture update SYNO.Core.Upgrade.Server 1 check
 # Security Advisor's last scan (read only; a planned action). A non-admin
 # account may get error 105 here: the script reports it and carries on.
 capture security SYNO.Core.SecurityScan.Status 1 system_get
+# iSCSI LUNs and the first LUN's snapshots (read only; a planned action).
+# Sent as form POST like everything else: whether DSM accepts that for
+# these methods is one of the things this capture finds out.
+capture lun_list SYNO.Core.ISCSI.LUN 1 list \
+	'types=["BLOCK","FILE","THIN","ADV","SINK","CINDER","CINDER_BLUN","CINDER_BLUN_THICK","BLUN","BLUN_THICK","BLUN_SINK","BLUN_THICK_SINK"]'
+lun_uuid=""
+if [[ -s $private/lun_list.raw ]]; then
+	lun_uuid=$(jq -r 'first(.data.luns[]? | .uuid | strings) // empty' "$private/lun_list.raw")
+fi
+if [[ -n $lun_uuid ]]; then
+	# Through a private file, like the sid: no LUN id on a command line.
+	(umask 077 && jq -cn --arg u "$lun_uuid" '$u' | tr -d '\n' >"$private/lun_uuid")
+	unset lun_uuid
+	capture lun_snapshots SYNO.Core.ISCSI.LUN 1 list_snapshot "src_lun_uuid@$private/lun_uuid"
+else
+	echo "no LUN uuid in lun_list: skipping lun_snapshots" >&2
+fi
