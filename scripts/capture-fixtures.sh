@@ -79,7 +79,7 @@ post() {
 }
 
 redact='walk(if type == "object" then with_entries(
-  if (.key | test("serial|uuid|wwn|(^|_)(mac|ip|ipv6|hostname|server_name)(_|$)"; "i"))
+  if (.key | test("serial|uuid|wwn|iqn|(^|_)(mac|ip|ipv6|hostname|server_name)(_|$)|^(description|desc|lun_path)$"; "i"))
   then .value = "REDACTED" else . end) else . end)'
 
 apis="SYNO.API.Auth,SYNO.Core.System.Utilization,SYNO.Core.System,SYNO.Storage.CGI.Storage,SYNO.Core.Upgrade.Server"
@@ -112,9 +112,10 @@ jq '.data | keys' <<<"$login" >"$out/login_keys.json"
 unset login
 echo "wrote $out/login_keys.json"
 
-# capture <name> <api> <version> <method> [key=value ...]: extra arguments
-# are sent as further form fields (never secrets: they show in the process
-# list). The unredacted reply stays in the private directory as <name>.raw,
+# capture <name> <api> <version> <method> [key=value | key@file ...]: extra
+# arguments are sent as further form fields (curl's --data-urlencode forms;
+# a literal value shows in the process list, so anything else goes as
+# key@file). The unredacted reply stays in the private directory as <name>.raw,
 # for a later capture that needs a value from it; it goes with the trap.
 capture() {
 	local name=$1 api=$2 version=$3 method=$4 resp
@@ -148,11 +149,13 @@ capture lun_list SYNO.Core.ISCSI.LUN 1 list \
 	'types=["BLOCK","FILE","THIN","ADV","SINK","CINDER","CINDER_BLUN","CINDER_BLUN_THICK","BLUN","BLUN_THICK","BLUN_SINK","BLUN_THICK_SINK"]'
 lun_uuid=""
 if [[ -s $private/lun_list.raw ]]; then
-	lun_uuid=$(jq -r 'first(.data | .. | objects | select(has("uuid")) | .uuid | strings) // empty' \
-		"$private/lun_list.raw")
+	lun_uuid=$(jq -r 'first(.data.luns[]? | .uuid | strings) // empty' "$private/lun_list.raw")
 fi
 if [[ -n $lun_uuid ]]; then
-	capture lun_snapshots SYNO.Core.ISCSI.LUN 1 list_snapshot "src_lun_uuid=$(jq -cn --arg u "$lun_uuid" '$u')"
+	# Through a private file, like the sid: no LUN id on a command line.
+	(umask 077 && jq -cn --arg u "$lun_uuid" '$u' | tr -d '\n' >"$private/lun_uuid")
+	unset lun_uuid
+	capture lun_snapshots SYNO.Core.ISCSI.LUN 1 list_snapshot "src_lun_uuid@$private/lun_uuid"
 else
 	echo "no LUN uuid in lun_list: skipping lun_snapshots" >&2
 fi
