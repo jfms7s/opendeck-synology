@@ -99,7 +99,7 @@ jobs:
           tar -xf macos-bin.tar -C target/aarch64-apple-darwin/release
           # On Linux only the format can be checked (signature and start: build-macos).
           scripts/check-binary.sh aarch64-apple-darwin target/aarch64-apple-darwin/release/opendeck-synology
-      - run: node build.mjs --require-all --tag "$GITHUB_REF_NAME"
+      - run: node build.mjs --release --tag "$GITHUB_REF_NAME"
       - name: Check the bundle holds an executable macOS binary
         run: unzip -Z dist/opendeck-synology.streamDeckPlugin | grep -E '^-rwx.*opendeck-synology-aarch64-apple-darwin$'
       # Written after build.mjs (which empties dist/), so it is in neither the

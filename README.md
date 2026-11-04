@@ -173,7 +173,7 @@ cargo fmt --check                                  # the same checks CI runs
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked                                # unit tests, no NAS needed
 cargo +1.88.0 check --all-targets --locked         # MSRV (CI: msrv, msrv-macos); needs the 1.88.0 toolchain
-cargo build --release --locked && node build.mjs   # dist/opendeck-synology.streamDeckPlugin
+cargo build --release --locked && node build.mjs --zip   # ./opendeck-synology.streamDeckPlugin
 cargo test keyring_round_trip -- --ignored         # check the system keyring works (CI does this on macOS)
 scripts/render-icons.sh                            # regenerate icons (needs ImageMagick 7)
 
@@ -256,7 +256,7 @@ On a Mac (Apple Silicon), with the release bundle installed through OpenDeck:
       `com.apple.quarantine`.
 - [ ] On a fresh install, saving the connection stores the password in the Keychain
       (note whether a prompt appears); the panel says the password is in the keyring.
-- [ ] Update path: build the plugin locally (`cargo build --release && node build.mjs`),
+- [ ] Update path: build the plugin locally (`cargo build --release && node build.mjs --zip`),
       install that, save the connection, then install the draft over it and restart
       OpenDeck. One Keychain prompt per saved secret appears; until it is answered keys
       show `Keyring` / `Allow access` and the settings panel still opens. After **Always

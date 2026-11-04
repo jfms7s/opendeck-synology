@@ -12,8 +12,8 @@ A Rust [OpenDeck](https://github.com/nekename/OpenDeck) plugin (Linux x86_64 + a
 cargo fmt --check                                   # CI gate
 cargo clippy --all-targets --locked -- -D warnings  # CI gate
 cargo test --locked                                 # no NAS, no OpenDeck, no keyring needed
-cargo build --release --locked && node build.mjs    # dist/opendeck-synology.streamDeckPlugin + SHA256SUMS
-node build.mjs --check-version                      # Cargo.toml and manifest.json versions agree
+cargo build --release --locked && node build.mjs --zip  # ./opendeck-synology.streamDeckPlugin (a release runs --release: dist/ + SHA256SUMS)
+node build.mjs --check-only                         # Cargo.toml and manifest.json versions agree
 cargo +1.88.0 check --all-targets --locked          # MSRV (CI: msrv, msrv-macos); needs the 1.88.0 toolchain
 REQUIRE_REAL_FIXTURES=1 cargo test recorded         # parsers vs. local real NAS captures
 ```
