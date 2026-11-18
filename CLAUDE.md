@@ -38,7 +38,7 @@ CI also cross-builds aarch64 and starts it under qemu (`aarch64`), runs the macO
 
 ## Conventions
 
-- Conventional Commits; PRs squash-merged to `master`; CI actions are pinned to commit SHAs.
+- Conventional Commits; PRs squash-merged to `main`; CI actions are pinned to commit SHAs.
 - Project docs (specs, plans, reviews, issues) live in the Obsidian vault at `~/git/obsidian-vault/personal/projects/opendeck-synology/`, not in this repo; follow the vault's `CLAUDE.md`.
 - Behaviour bugs get a failing test first (fake NAS: `dsm::fake::FakeDsm`, fake keyring: `secrets::MemoryStore`; never the real keyring or a real NAS in tests). The one exception is the `#[ignore]`d `keyring_round_trip`, which CI runs on its throwaway macOS runner to prove secrets really persist.
 - User-visible changes go in the README (actions, setup, smoke-test checklist).
