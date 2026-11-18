@@ -3,7 +3,7 @@ name: CI
 # `msrv` must match rust-version in Cargo.toml. Scheduled runs only run `audit`.
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
   schedule:
     - cron: "17 6 * * 1"
